@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+torch==2.3.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
+skorch==0.15.*
+kafka-python
+joblib

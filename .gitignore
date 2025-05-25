@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.so
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Model files
+*.pt
+*.pth
+*.h5
+*.onnx
+*.joblib
+*.pkl
+
+# Logs and outputs
+*.log
+*.tsv
+*.json
+*.npy
+*.npz
+*.pkl
+*.zip
+
+# Data
+data/
+dataset/
+output/
+checkpoints/
+models/
+
+# Others
+.env
+.DS_Store
+
