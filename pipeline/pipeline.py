@@ -1,41 +1,44 @@
-import kfp.dsl as dsl
+# pipeline.py
 
-MINIO_SECRET = "minio-secret"
+from kfp import dsl
+from kfp.dsl import container_component, ContainerSpec
 
-def env_from_secret(var):
-    return dsl.EnvVar(name=var, value_from=dsl.EnvVarSource(
-        secret_key_ref=dsl.SecretKeySelector(name=MINIO_SECRET, key=var)))
+@container_component
+def offline_train_op() -> ContainerSpec:
+    return ContainerSpec(
+        image="hirschazer/offline:latest",
+        command=["python", "-m", "ml.train_offline"],
+    )
 
-MINIO_ENVS = [env_from_secret(k) for k in
-              ("MINIO_ENDPOINT","MINIO_ACCESS_KEY",
-               "MINIO_SECRET_KEY","MINIO_BUCKET")]
+@container_component
+def producer_op() -> ContainerSpec:
+    return ContainerSpec(
+        image="hirschazer/producer:latest",
+        command=["python", "-m", "kafka_streaming.producer"],
+    )
 
-@dsl.container_component
-def offline_train_op():
-    return dsl.ContainerSpec(
-        image='hirschazer/offline:latest',
-        command=['python','-m','ml.train_offline'],
-        env=MINIO_ENVS)
+@container_component
+def consumer_op() -> ContainerSpec:
+    return ContainerSpec(
+        image="hirschazer/consumer:latest",
+        command=["python", "-m", "kafka_streaming.consumer"],
+    )
 
-@dsl.container_component
-def producer_op():
-    return dsl.ContainerSpec(
-        image='hirschazer/producer:latest',
-        command=['python','kafka_streaming/producer.py'],
-        env=MINIO_ENVS)
+@container_component
+def plot_final_op() -> ContainerSpec:
+    return ContainerSpec(
+        image="hirschazer/consumer:latest",
+        command=["python", "-m", "kafka_streaming.plot_final"],
+    )
 
-@dsl.container_component
-def consumer_op():
-    return dsl.ContainerSpec(
-        image='hirschazer/consumer:latest',
-        command=['python','kafka_streaming/consumer.py'],
-        env=MINIO_ENVS)
-
-@dsl.pipeline(name="drift-detect-demo")
+@dsl.pipeline(name="drift-detect-demo-v2")
 def drift_demo_pipeline():
+    # 1) 离线训练（模型 & PCA 等）
     offline = offline_train_op()
-    _prod   = producer_op().after(offline)
-    _cons   = consumer_op().after(offline)   # 与 prod 并行
 
-if __name__ == "__main__":
-    dsl.Compiler().compile(drift_demo_pipeline, "drift_demo.yaml")
+    # 2) 生产者 & 消费者 并行运行
+    prod = producer_op().after(offline)
+    cons = consumer_op().after(offline)
+
+    # 3) 最终绘图 依赖 两者完成
+    _ = plot_final_op().after(prod, cons)

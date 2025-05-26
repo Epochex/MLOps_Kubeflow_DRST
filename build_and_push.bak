@@ -1,0 +1,17 @@
+#!/bin/bash
+
+set -e  # 一旦出错就终止脚本
+set -x  # 打印每一条命令（调试用）
+
+# 构建并推送 Producer 镜像
+docker build --target producer -t hirschazer/producer:latest .
+docker push hirschazer/producer:latest
+
+# 构建并推送 Offline Train 镜像
+docker build --target offline -t hirschazer/offline:latest .
+docker push hirschazer/offline:latest
+
+# 构建并推送 Consumer 镜像
+docker build --target consumer -t hirschazer/consumer:latest .
+docker push hirschazer/consumer:latest
+

@@ -1,0 +1,38 @@
+########################  base layer  ########################
+FROM python:3.11-slim AS base
+WORKDIR /app
+
+# 安装系统依赖（C++ 编译器 + git）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制源代码
+COPY . /app
+
+# 安装 Python 依赖（含 PyTorch CPU 源 + pip 缓存清理）
+RUN pip install --no-cache-dir -U \
+        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -U \
+        numpy pandas scikit-learn matplotlib seaborn \
+        kafka-python s3fs minio boto3 \
+        kubeflow-katib \
+        kfp==2.* \
+        pyyaml==6.* \
+    && pip cache purge
+
+# 设置 PYTHONPATH（修复 warning）
+ENV PYTHONPATH=/app
+
+########################  producer  ########################
+FROM base AS producer
+ENTRYPOINT ["python", "-m", "kafka_streaming.producer"]
+
+########################  offline-train  ##################
+FROM base AS offline
+ENTRYPOINT ["python", "-m", "ml.train_offline"]
+
+########################  consumer  #######################
+FROM base AS consumer
+ENTRYPOINT ["python", "-m", "kafka_streaming.consumer"]
+

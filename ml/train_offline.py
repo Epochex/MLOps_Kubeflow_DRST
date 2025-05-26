@@ -15,6 +15,7 @@ from ml.model        import train_mlp
 from shared.config   import DATA_DIR, MODEL_DIR, TARGET_COL
 from shared.features import FEATURE_COLS
 from shared.utils    import calculate_accuracy_within_threshold
+from shared.utils import save_pkl, save_np
 
 from shared.minio_helper import load_csv, save_bytes
 
@@ -57,3 +58,4 @@ torch.save(model.state_dict(), buf)
 save_bytes(f"{MODEL_DIR}/mlp.pt", buf.read_bytes())
 buf.unlink()
 save_np(f"{MODEL_DIR}/base_acc.npy", np.array(base_acc))
+

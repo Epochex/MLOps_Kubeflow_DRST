@@ -1,3 +1,4 @@
+# shared/config.py
 # 全局路径 & Kafka
 DATA_DIR        = "datasets"
 MODEL_DIR       = "models"
