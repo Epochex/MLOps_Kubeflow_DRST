@@ -7,3 +7,5 @@ skorch==0.15.*
 kafka-python
 joblib
 boto3
+psutil
+prometheus-client

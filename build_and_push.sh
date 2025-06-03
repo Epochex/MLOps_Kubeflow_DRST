@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
+# 构建并推送所有组件镜像
 set -euo pipefail
 set -x
 
-# 你自己的 Docker Hub 或私有仓库前缀
-REPO=hirschazer
+REPO=hirschazer     # ⇠ 你的仓库
 
-# 构建并推送 Producer 镜像
-docker build --target producer -t ${REPO}/producer:latest .
-docker push ${REPO}/producer:latest
+build_push() {
+  local TARGET=$1
+  docker build --target "$TARGET" -t "${REPO}/${TARGET}:latest" .
+  docker push  "${REPO}/${TARGET}:latest"
+}
 
-# 构建并推送 Offline 镜像
-docker build --target offline  -t ${REPO}/offline:latest  .
-docker push ${REPO}/offline:latest
-
-# 构建并推送 Consumer 镜像
-docker build --target consumer -t ${REPO}/consumer:latest .
-docker push ${REPO}/consumer:latest
-
+build_push offline
+build_push producer
+build_push monitor
+build_push infer
+# build_push stage1
+# build_push stage2
+# build_push stage3
+build_push plot

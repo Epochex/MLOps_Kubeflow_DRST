@@ -1,49 +1,41 @@
-# kafka_streaming/plot_final.py
-import numpy as np
+#!/usr/bin/env python3
+"""
+kafka_streaming/plot_final.py
+────────────────────────────────────────────────────────────
+等待 inference_consumer 结束后 → 生成 report_final.png
+同时把图片上传 MinIO
+"""
+import os, time, numpy as np
+from shared.config  import RESULT_DIR
+from shared.minio_helper import save_bytes
 from ml.plot_report import generate_report
-from shared.minio_helper import load_np, save_bytes
-from shared.config import RESULT_DIR, CORRECTION_OFFSET
 
-def load_with_fallback(key: str) -> np.ndarray:
-    print(f"[read] loading from MinIO: {key}")
-    try:
-        return load_np(key)
-    except Exception as e:
-        print(f"[missing] {key} 不存在，使用空数组代替: {e}")
-        return np.empty((0,), dtype=np.float32)
+# 等待下游 .npy 写入
+time.sleep(35)      # CONSUME_IDLE_S(10) + 缓冲
 
-bridge_true    = load_with_fallback(f"{RESULT_DIR}/bridge_true.npy")
-bridge_pred    = load_with_fallback(f"{RESULT_DIR}/bridge_pred.npy")
-dag1_pred_orig = load_with_fallback(f"{RESULT_DIR}/dag1_pred_orig.npy")
-dag1_true      = load_with_fallback(f"{RESULT_DIR}/dag1_true.npy")
-idx            = load_with_fallback(f"{RESULT_DIR}/idx.npy")
+def _load(path):
+    try: return np.load(path)
+    except Exception: return np.empty((0,), np.float32)
 
-if any(arr.size == 0 for arr in [bridge_true, bridge_pred, dag1_pred_orig, dag1_true, idx]):
-    print("[skip] 缺少必要数据，跳过绘图")
-else:
-    tmp_path = "report_tmp.png"
-    print(f"[plot] generating report to {tmp_path}")
-    try:
-        generate_report(
-            bridge_true=bridge_true,
-            bridge_pred_orig=bridge_pred,
-            dag1_pred_orig=dag1_pred_orig,
-            y_pred_dag1_new=dag1_pred_orig,
-            yd1=dag1_true,
-            correction_offset=CORRECTION_OFFSET,
-            save_path=tmp_path
-        )
-    except Exception as e:
-        print(f"[error] generate_report 失败: {e}")
-    else:
-        key = f"{RESULT_DIR}/report_final.png"
-        print(f"[write] uploading to MinIO: {key}")
-        try:
-            with open(tmp_path, "rb") as f:
-                save_bytes(key, f.read(), content_type="image/png")
-        except Exception as e:
-            print(f"[error] failed to write {key}: {e}")
-        else:
-            print("[plot_final] report_final.png uploaded")
+root = f"/mnt/pvc/{RESULT_DIR}"
+br_true = _load(f"{root}/bridge_true.npy")
+br_pred = _load(f"{root}/bridge_pred.npy")
+dg_pred = _load(f"{root}/inference_pred.npy")
+dg_true = _load(f"{root}/inference_true.npy")
+dg_adj  = _load(f"{root}/inference_pred_adjusted.npy")
+if dg_adj.size == 0: dg_adj = dg_pred
 
-print("[plot_final] DONE")
+if any(a.size == 0 for a in (br_true, br_pred, dg_pred, dg_true)):
+    print("[plot] missing arrays – skip"); exit(0)
+
+tmp_png  = "/tmp/report_tmp.png"
+final_png= f"{root}/report_final.png"
+
+generate_report(br_true, br_pred, dg_pred, dg_adj, dg_true, tmp_png)
+os.replace(tmp_png, final_png)
+print(f"[plot] saved → {final_png}")
+
+# ───── 上传 MinIO ─────
+with open(final_png, "rb") as fp:
+    save_bytes(f"{RESULT_DIR}/report_final.png", fp.read(), "image/png")
+print("[plot] uploaded to MinIO")

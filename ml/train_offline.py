@@ -1,61 +1,105 @@
+#!/usr/bin/env python3
 """
-离线初训：4 个 CSV → 标准化 → PCA → 训练基线 MLP
-保存：
-  models/
-     ├─ scaler.pkl
-     ├─ pca.pkl
-     ├─ mlp.pt
-     └─ base_acc.npy   ← ★ 新增
+ml.train_offline – baseline 训练 + 产出基准预测 + 指标
 """
-import numpy as np, pandas as pd, pathlib, joblib, os, torch
+import os, datetime, io, time, json
+import joblib, numpy as np, pandas as pd, torch, torch.nn as nn
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split
-from ml.model        import train_mlp
-from shared.config   import DATA_DIR, MODEL_DIR, TARGET_COL
-from shared.features import FEATURE_COLS
-from shared.utils    import calculate_accuracy_within_threshold
-from shared.utils import save_pkl, save_np
 
-from shared.minio_helper import load_csv, save_bytes
+# -------- 项目内部工具 --------
+from shared.minio_helper import load_csv, save_np, save_bytes        # ✅ 这里不再引入 save_json
+from shared.utils        import save_json                           # ✅ 改为从 utils 导入
+from shared.config       import DATA_DIR, MODEL_DIR, RESULT_DIR, TARGET_COL
+from shared.features     import FEATURE_COLS
+from shared.utils        import calculate_accuracy_within_threshold
+from shared.metric_logger import log_metric
 
-def load_csv(rel_path):
-    return (pd.read_csv(rel_path, index_col=0)
-              .replace({'<not counted>': np.nan, ' ': np.nan})
-              .dropna())
+SEED = 42; np.random.seed(SEED); torch.manual_seed(SEED)
 
-from shared.config   import TARGET_COL
+class MLPBaseline(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.ReLU(),
+            nn.Linear(128, 64),  nn.ReLU(),
+            nn.Linear(64,  32),  nn.ReLU(),
+            nn.Linear(32,   1),
+        )
+    def forward(self, x): return self.net(x).squeeze(1)
 
-# ---------- 读 Bridge CSV ----------
-bridge = load_csv(f"{DATA_DIR}/total/resource_stimulus_global_A-B-C_modified.csv")
+# ---------- 1. 读取数据 ----------
+df   = load_csv(f"{DATA_DIR}/combined.csv")
+Xraw = df[FEATURE_COLS].astype(np.float32).values
+y    = df[TARGET_COL].astype(np.float32).values
 
-# ---------- 标准化 + PCA ----------
-scaler = StandardScaler().fit(bridge[FEATURE_COLS])
-Xp     = scaler.transform(bridge[FEATURE_COLS])
+# ---------- 2. 训练 ----------
+scaler = StandardScaler().fit(Xraw)
+Xs     = scaler.transform(Xraw)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model  = MLPBaseline(Xs.shape[1]).to(device)
+opt    = torch.optim.Adam(model.parameters(), lr=1e-3)
+lossfn = nn.SmoothL1Loss()
 
-pca_full = PCA().fit(Xp)
-n_components = np.where(np.cumsum(
-        pca_full.explained_variance_ratio_) >= .85)[0][0] + 1
-pca  = PCA(n_components=n_components).fit(Xp)
-Xp   = pca.transform(Xp).astype(np.float32)
-y    = bridge[TARGET_COL].values.astype(np.float32)
+Xts = torch.from_numpy(Xs).to(device)
+yts = torch.from_numpy(y).to(device)
 
-# ---------- 训练基线 MLP ----------
-X_tr, X_val, y_tr, y_val = train_test_split(
-        Xp, y, test_size=.3, random_state=40)
-model, y_pred_val = train_mlp(X_tr, y_tr, X_val, y_val)
+t0 = time.perf_counter()
+for _ in range(200):
+    model.train(); opt.zero_grad()
+    loss = lossfn(model(Xts), yts); loss.backward(); opt.step()
+train_time_s = round(time.perf_counter() - t0, 3)
 
-base_acc = calculate_accuracy_within_threshold(y_val, y_pred_val)
-print(f"[offline] val acc={base_acc:.2f}%  PCA n_components={n_components}")
+# ---------- 3. 预测 & 指标 ----------
+with torch.no_grad():
+    pred = model(Xts).cpu().numpy().astype(np.float32)
 
-# ---------- 保存 artefacts ----------
-# ---------- 保存 artefacts 到 MinIO ----------
-save_pkl(f"{MODEL_DIR}/scaler.pkl", scaler)
-save_pkl(f"{MODEL_DIR}/pca.pkl",    pca)
+mae  = float(mean_absolute_error(y, pred))
+rmse = float(np.sqrt(mean_squared_error(y, pred)))
+acc  = calculate_accuracy_within_threshold(y, pred, 0.15)
 
-buf = pathlib.Path("mlp.tmp")
-torch.save(model.state_dict(), buf)
-save_bytes(f"{MODEL_DIR}/mlp.pt", buf.read_bytes())
-buf.unlink()
-save_np(f"{MODEL_DIR}/base_acc.npy", np.array(base_acc))
+print(f"[offline] acc={acc:.2f}% | MAE={mae:.3f} | RMSE={rmse:.3f} | rows={len(y)}")
 
+# ---------- 4. 保存 artefacts ----------
+os.makedirs("/mnt/pvc/models", exist_ok=True)
+os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
+
+joblib.dump(scaler, "/mnt/pvc/models/scaler.pkl")
+torch.save(model.state_dict(), "/mnt/pvc/models/model.pt")
+
+np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy", y)
+np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy", pred)
+
+save_np(f"{RESULT_DIR}/bridge_true.npy", y)
+save_np(f"{RESULT_DIR}/bridge_pred.npy", pred)
+
+save_bytes(f"{MODEL_DIR}/scaler.pkl", open("/mnt/pvc/models/scaler.pkl","rb").read())
+save_bytes(f"{MODEL_DIR}/model.pt"  , open("/mnt/pvc/models/model.pt" ,"rb").read())
+
+# ---------- 5. 指标上报 ----------
+model_size_mb = round(os.path.getsize("/mnt/pvc/models/model.pt") / 2**20, 3)
+log_metric(
+    component="offline",
+    event="train_done",
+    train_rows=len(y),
+    train_time_s=train_time_s,
+    model_size_mb=model_size_mb,
+    accuracy=round(acc, 2),
+    mae=round(mae, 4),
+    rmse=round(rmse, 4),
+)
+
+# 旧 json（给别的脚本用）
+meta = dict(
+    component   ="offline_train",
+    rows        =int(len(y)),
+    baseline_acc=round(acc,2),
+    mae=round(mae,4),
+    rmse=round(rmse,4),
+    utc_end     =datetime.datetime.utcnow().isoformat()+"Z",
+    model_bytes =os.path.getsize("/mnt/pvc/models/model.pt"),
+    train_time_s=train_time_s,
+)
+save_json(f"{RESULT_DIR}/timing/offline_train.json", meta)
+
+print("[offline] artefacts & metrics uploaded")
