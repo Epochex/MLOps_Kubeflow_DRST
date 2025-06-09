@@ -1,40 +1,37 @@
 # shared/config.py
-
+# ------------------------------------------------------------
+# 全局常量 & 运行时环境变量
+# ------------------------------------------------------------
 import os
 
-# -------------- MinIO 配置 --------------
+# ---------- MinIO ----------
 ENDPOINT   = os.getenv("MINIO_ENDPOINT",  "45.149.207.13:9000")
-ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY","minio")
-SECRET_KEY = os.getenv("MINIO_SECRET_KEY","minio123")
-# 默认使用 onvm-demo2 桶
-BUCKET     = os.getenv("MINIO_BUCKET",    "onvm-demo2")
+ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
+SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
+BUCKET     = os.getenv("MINIO_BUCKET",     "onvm-demo2")
 
-# -------------- 数据、模型、结果 保存目录 --------------
-# (这些目录是相对于容器工作目录或挂载到 /mnt/pvc 的挂载点)
-DATA_DIR    = "datasets"
-MODEL_DIR   = "models"
-RESULT_DIR  = "results"
+# ---------- 项目目录 ----------
+DATA_DIR   = "datasets"
+MODEL_DIR  = "models"
+RESULT_DIR = "results"
 
-# -------------- Kafka 配置 --------------
+# ---------- Kafka ----------
 KAFKA_TOPIC        = "latencyTopic"
 KAFKA_SERVERS      = ["kafka.default.svc.cluster.local:9092"]
 
-# Consumer 从 latest offset 开始，跳过旧数据
 AUTO_OFFSET_RESET  = "latest"
 ENABLE_AUTO_COMMIT = True
-
-# Producer/Monitor 批次大小
 BATCH_SIZE         = 10
-
-# Consumer 空闲多久(秒)后自动退出
 CONSUME_IDLE_S     = 10
 
-# JS drift 阈值
-JS_DEFAULT_THRESH    = 0.2
-JS_LOW_THRESHOLD     = 0.4
-JS_MEDIUM_THRESHOLD  = 0.6
+# ---------- Drift 监控 ----------
+JS_DEFAULT_THRESH   = 0.20
+JS_LOW_THRESHOLD    = 0.40
+JS_MEDIUM_THRESHOLD = 0.60          # 这里只是参考值，真正分段逻辑在 dynamic_retrain.py
 
-# 其他常量
-TARGET_COL         = "output_rate"
-EXCLUDE_COLS       = ["Unnamed: 0", "input_rate", "output_rate", "latency"]
-MAPPING_KEY        = f"{RESULT_DIR}/js_accuracy_mapping.json"
+# ---------- 预测目标 ----------
+TARGET_COL   = "input_rate"         # ← 改成 input_rate
+EXCLUDE_COLS = ["Unnamed: 0", "output_rate", "latency"]  # 去掉 input_rate
+
+# ---------- 其他 ----------
+MAPPING_KEY  = f"{RESULT_DIR}/js_accuracy_mapping.json"

@@ -131,3 +131,51 @@ def generate_report(
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"[plot_report] saved figure → {save_path}")
+
+
+def generate_report_full(
+    bridge_true: np.ndarray,
+    bridge_pred_orig: np.ndarray,
+    dag_pred_orig: np.ndarray,
+    dag_pred_new: np.ndarray,
+    yd1: np.ndarray,
+    save_path: str
+):
+    """
+    画一张横坐标覆盖 “offline + online 全时序” 的总览：
+      • 蓝线  Real
+      • 红线  Original Prediction (offline 模型)
+      • 绿线  Adjusted Prediction (MLOps 自适应)
+    不画竖线，也不做筛选，纯粹对比三条曲线。
+    """
+    y_true = np.concatenate([bridge_true, yd1])
+    y_pred_orig_full = np.concatenate([bridge_pred_orig, dag_pred_orig])
+    y_pred_new_full  = np.concatenate([bridge_pred_orig, dag_pred_new])
+
+    x = np.arange(len(y_true))
+
+    plt.style.use("classic")
+    fig, ax = plt.subplots(facecolor="white", figsize=(16, 6))
+    ax.set_facecolor("white")
+
+    ax.plot(x, y_pred_new_full,
+            "g-", marker="o", markersize=3, linewidth=1.0,
+            label="Adjusted Prediction")
+    ax.plot(x, y_true,
+            "b-", linewidth=1.0,
+            label="Real data")
+    ax.plot(x, y_pred_orig_full,
+            "r--", marker="o", markersize=3, linewidth=1.0,
+            label="Original Prediction")
+
+    ax.set_xlabel("Time series index (full)", fontsize=14)
+    ax.set_ylabel("Throughput (Mbps)", fontsize=14)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{int(y)}"))
+    ax.set_xlim(0, len(x) - 1)
+    ax.grid(True, linestyle="--", linewidth=0.4)
+    ax.legend(loc="lower right", fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot_report] saved FULL figure → {save_path}")

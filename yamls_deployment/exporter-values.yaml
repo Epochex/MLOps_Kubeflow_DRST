@@ -1,0 +1,9 @@
+kafkaServer:
+  - kafka.default.svc.cluster.local:9092
+
+serviceMonitor:
+  enabled: true
+  namespace: monitoring
+  interval: 30s
+  labels:
+    release: monitoring
