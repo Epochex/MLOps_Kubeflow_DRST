@@ -59,7 +59,7 @@ def generate_report(
         corr_plot = int(corr_plot[0]) if corr_plot.size > 0 else None
 
     else:
-        right = min(full_len, 200)
+        right = min(full_len, 400)
         x_plot = np.arange(right)
         y_true_plot = y_true_full[:right]
         y_pred_orig_plot = y_pred_orig_full[:right]

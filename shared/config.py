@@ -9,7 +9,6 @@ SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
 BUCKET     = os.getenv("MINIO_BUCKET",     "onvm-demo2")
 
 # ---------- 项目目录配置 ----------
-# 本地代码里所有数据 / 模型 / 结果都挂在这几个路径下面
 DATA_DIR   = "datasets"
 MODEL_DIR  = "models"
 RESULT_DIR = "results"
@@ -23,17 +22,17 @@ BATCH_SIZE         = 5
 CONSUME_IDLE_S     = 5
 
 # ---------- 预测目标列名 ----------
-TARGET_COL   = "input_rate"
-EXCLUDE_COLS = ["Unnamed: 0", "output_rate", "latency"]
+TARGET_COL   = "output_rate"
+EXCLUDE_COLS = ["Unnamed: 0", "input_rate", "latency"]
 
-# ---------- Drift 监控 & Adaptation 阈值统一管理 ----------
-# 监控模块：只要 JS > 该阈值 就调用 retrain
-JS_TRIGGER_THRESH = 0.2  
+# ---------- Drift 监控 & Adaptation 阈值（可由环境变量覆盖） ----------
+JS_TRIGGER_THRESH = float(os.getenv("JS_TRIGGER_THRESH", "0.25"))  # 默认 0.25
+JS_SEV1_THRESH    = float(os.getenv("JS_SEV1_THRESH",    "0.4"))
+JS_SEV2_THRESH    = float(os.getenv("JS_SEV2_THRESH",    "0.6"))
 
-# Adaptation 模块：不同 js_val 区间对应不同网格
-JS_SEV1_THRESH    = 0.4   # ≤0.4 → 轻量网格 A
-JS_SEV2_THRESH    = 0.6   # ≤0.6 → 中等网格 B
-# >0.6 → 全网格 C
+# ---------- Plot 窗口大小（点数） ----------
+PLOT_WINDOW_BEFORE = int(os.getenv("PLOT_WINDOW_BEFORE", "100"))
+PLOT_WINDOW_AFTER  = int(os.getenv("PLOT_WINDOW_AFTER",  "100"))
 
 # ---------- 其他（用到 RESULT_DIR 的地方） ----------
 MAPPING_KEY  = f"{RESULT_DIR}/js_accuracy_mapping.json"

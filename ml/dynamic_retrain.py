@@ -23,14 +23,13 @@ param_grid_C = { "learning_rate":[1e-2,1e-3], "batch_size":[16,32,64],
                  "activation":["relu","gelu"], "loss":["Huber","mse"] }
 
 def grid(js_val: float):
-    if js_val <= JS_SEV1_THRESH / 3:       # 0.05 → 完全跳过
+    if js_val <= JS_SEV1_THRESH / 3:      
         return None
-    if js_val <= JS_SEV1_THRESH:           # ≤0.15 → A
+    if js_val <= JS_SEV1_THRESH:           
         return param_grid_A
-    if js_val <= JS_SEV2_THRESH:           # ≤0.30 → B
+    if js_val <= JS_SEV2_THRESH:           
         return param_grid_B
-    return param_grid_C                    # >0.30 → C
-
+    return param_grid_C                   
 def severity_tag(js_val: float) -> str:
     if js_val <= JS_SEV1_THRESH:
         return "Severity-1 Handler"

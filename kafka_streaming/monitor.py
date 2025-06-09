@@ -3,61 +3,82 @@
 kafka_streaming/monitor.py
 ────────────────────────────────────────────────────────────
 • Drift Detection 批量消费 + JS 计算
-• 每 BATCH_SIZE 做一次 Timer("Drift_Detection")
+• 缓存所有指标到本地，主循环结束后统一写出并上传到 MinIO
+• 异步触发 dynamic_retrain，避免阻塞主线程
 """
-import os, sys, json, queue, threading, time, pathlib
+import os
+import json
+import queue
+import threading
+import time
+import pathlib
 from datetime import datetime
 
-import psutil, numpy as np, pandas as pd
+import numpy as np
+import pandas as pd
+import psutil
 from kafka import KafkaConsumer
-
-# ← 补上这一行，否则 js() 中调用不了 jensenshannon
 from scipy.spatial.distance import jensenshannon
 
-from shared.metric_logger import log_metric
-from shared.profiler      import Timer
-
-# ─── 从 config 里导入阈值等 ─────────────────────────────────────
-sys.path.insert(0, os.path.dirname(__file__) + "/..")
-from shared.config import (
+from shared.config        import (
     DATA_DIR, KAFKA_TOPIC, KAFKA_SERVERS,
-    JS_TRIGGER_THRESH,  # ← 触发 retrain 的阈值
-    BATCH_SIZE, CONSUME_IDLE_S,
-    AUTO_OFFSET_RESET, ENABLE_AUTO_COMMIT
+    JS_TRIGGER_THRESH, BATCH_SIZE, CONSUME_IDLE_S,
+    AUTO_OFFSET_RESET, ENABLE_AUTO_COMMIT,
+    RESULT_DIR
 )
 from shared.features     import FEATURE_COLS
-from shared.minio_helper import load_csv
+from shared.minio_helper import load_csv, save_bytes
 
-# baseline 数据只计算一次
+# ─── 全局变量 ──────────────────────────────────────────────────────
+consumer = None                   # KafkaConsumer 对象
+q = queue.Queue()                 # 内存队列
+producer_done = threading.Event() # 收到 producer_done 标志后置位
+
+# ─── 预加载基线数据 ─────────────────────────────────────────────────
 baseline_df = load_csv(f"{DATA_DIR}/combined.csv")
 CPU_FEATS   = [
     c for c in FEATURE_COLS
     if any(x in c for x in ("instructions","cycles","cache","branches"))
 ]
 
-def js(a: np.ndarray, b: np.ndarray, bins: int=50, eps:float=1e-9) -> float:
+# ─── 本地缓存所有监测指标 ─────────────────────────────────────────────
+metrics_buffer: list[dict] = []
+
+def record_metric(component: str, event: str, **kwargs):
+    """缓存一次打点，不马上上传。"""
+    entry = {
+        "utc": datetime.utcnow().isoformat() + "Z",
+        "component": component,
+        "event": event,
+        **kwargs
+    }
+    metrics_buffer.append(entry)
+
+# ─── JS 计算函数 ──────────────────────────────────────────────────────
+def js(a: np.ndarray, b: np.ndarray, bins: int=50, eps: float=1e-9) -> float:
     a = a[~np.isnan(a)]; b = b[~np.isnan(b)]
-    if a.size==0 or b.size==0: return 0.0
-    comb = np.concatenate([a,b])
-    lo, hi = np.percentile(comb, [0.5,99.5])
-    if lo>=hi: return 0.0
-    p,_ = np.histogram(a, bins=bins, range=(lo,hi), density=True)
-    q,_ = np.histogram(b, bins=bins, range=(lo,hi), density=True)
-    p=(p+eps)/(p+eps).sum(); q=(q+eps)/(q+eps).sum()
-    # 这里就可以正常调用 jensenshannon 了
-    return float(jensenshannon(p, q)**2)
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    comb = np.concatenate([a, b])
+    lo, hi = np.percentile(comb, [0.5, 99.5])
+    if lo >= hi:
+        return 0.0
+    p, _ = np.histogram(a, bins=bins, range=(lo, hi), density=False)
+    q_, _ = np.histogram(b, bins=bins, range=(lo, hi), density=False)
+    p = p.astype(float) + eps; q_ = q_.astype(float) + eps
+    p /= p.sum(); q_ /= q_.sum()
+    val = jensenshannon(p, q_)**2
+    return float(val) if not np.isnan(val) else 0.0
 
 def avg_js(df: pd.DataFrame) -> float:
     feats = [f for f in CPU_FEATS if f in df.columns]
     vals = [js(baseline_df[f].values, df[f].values) for f in feats]
     return float(np.mean(vals)) if vals else 0.0
 
-# Kafka → 内存队列
-q = queue.Queue()
-_consumer_ready = threading.Event()
-
+# ─── Kafka 监听线程 ─────────────────────────────────────────────────
 def _listener():
-    cons = KafkaConsumer(
+    global consumer
+    consumer = KafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,
         group_id="cg-monitor",
@@ -65,26 +86,30 @@ def _listener():
         enable_auto_commit=ENABLE_AUTO_COMMIT,
         value_deserializer=lambda m: json.loads(m.decode()),
     )
-    global consumer
-    consumer = cons
-    cons.poll(timeout_ms=0)
-    _consumer_ready.set()
-    for msg in cons:
+
+    # 写就绪标志供 Producer 轮询
+    os.makedirs("/mnt/pvc/results", exist_ok=True)
+    with open("/mnt/pvc/results/monitor_ready.flag", "w"):
+        pass
+
+    for msg in consumer:
         data = msg.value
-        # 跳过结束标志
         if data.get("producer_done"):
+            producer_done.set()
             continue
-        q.put(msg)
+        q.put((msg.offset, data))
 
 threading.Thread(target=_listener, daemon=True).start()
-_consumer_ready.wait()
 
+# ─── 系统 / Kafka 辅助 ───────────────────────────────────────────────
 proc = psutil.Process()
-def _sys_metrics():
+
+def _sys_metrics() -> dict:
+    times = psutil.cpu_times_percent(interval=None)
     return {
-        "cpu_pct":    psutil.cpu_percent(interval=None),
-        "mem_pct":    psutil.virtual_memory().percent,
-        "io_wait_pct": getattr(psutil.cpu_times_percent(interval=None), "iowait", 0.0),
+        "cpu_pct":     psutil.cpu_percent(interval=None),
+        "mem_pct":     psutil.virtual_memory().percent,
+        "io_wait_pct": getattr(times, "iowait", 0.0),
     }
 
 def _take_batch():
@@ -96,68 +121,92 @@ def _take_batch():
             pass
     return buf
 
+# ─── 异步触发 retrain ────────────────────────────────────────────────
+def trigger_retrain(js_val: float):
+    """后台执行 dynamic_retrain，隔离主线程 I/O。"""
+    os.system(f"python -m ml.dynamic_retrain {js_val:.4f}")
+
+# ─── 主循环 ─────────────────────────────────────────────────────────
 print("[monitor] start …")
 last_retrain_ts = 0.0
 
 while True:
     batch = _take_batch()
     if not batch:
-        print("[monitor] idle → exit")
-        break
-
-    # 只保留带 features 的消息
-    rows   = [m.value for m in batch if "features" in m.value]
-    offsets= [m.offset for m in batch]
-    if not rows:
+        if producer_done.is_set() and q.empty():
+            print("[monitor] producer_done & queue empty → exit")
+            break
         continue
 
-    # —— Drift Detection 打点 ——  
-    with Timer("Drift_Detection", "monitor"):
-        df_sample = pd.DataFrame([r["features"] for r in rows])
-        js_val    = avg_js(df_sample)
+    offsets, rows = zip(*batch)
+    valid = [r for r in rows if "features" in r]
+    if not valid:
+        continue
 
-    # —— Kafka lag 打点 ——  
-    assigned = consumer.assignment()
+    # Drift Detection
+    t0 = time.time()
+    df_sample = pd.DataFrame([r["features"] for r in valid])
+    js_val = avg_js(df_sample)
+    js_time_ms = (time.time() - t0) * 1000
+
+    # Kafka lag
     kafka_lag = 0
-    if assigned:
-        tp = next(iter(assigned))
+    if consumer and consumer.assignment():
+        tp = next(iter(consumer.assignment()))
         kafka_lag = max(0, consumer.end_offsets([tp])[tp] - offsets[-1] - 1)
 
-    log_metric(
+    # 缓存 drift 打点
+    record_metric(
         component="monitor",
         event="drift_calc",
-        batch_size=len(rows),
-        js_val=round(js_val,4),
+        batch_size=len(valid),
+        js_val=round(js_val, 4),
         kafka_lag=kafka_lag,
-        **_sys_metrics()
+        **_sys_metrics(),
+        runtime_ms=round(js_time_ms, 3),
     )
 
-    # —— 用统一阈值触发 retrain ——  
-    if js_val > JS_TRIGGER_THRESH and time.time() - last_retrain_ts >= 120:
+    # 触发 retrain（阈值 + 最少 30s 间隔）
+    if js_val > JS_TRIGGER_THRESH and time.time() - last_retrain_ts >= 30:
         last_retrain_ts = time.time()
-        pathlib.Path("/mnt/pvc").mkdir(exist_ok=True)
-        np.save("/mnt/pvc/latest_batch.npy", rows)
+        # 缓存最新 batch 以供 retrain 使用
+        np.save("/mnt/pvc/latest_batch.npy", valid)
 
         print(f"[monitor] drift {js_val:.3f} → call dynamic_retrain")
-        import subprocess
-        subprocess.Popen(
-            ["python", "-m", "ml.dynamic_retrain", f"{js_val:.4f}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
+        threading.Thread(target=trigger_retrain, args=(js_val,), daemon=True).start()
 
-        delay = (time.time() - last_retrain_ts)
-        log_metric(
+        record_metric(
             component="monitor",
             event="retrain_trigger",
-            js_val=round(js_val,4),
-            update_trigger_delay_s=round(delay,3),
+            js_val=round(js_val, 4),
+            update_trigger_delay_s=round(0.0, 3),
         )
 
 print("[monitor] end")
 
-# 写出 Kubeflow V2 必需的 metadata.json
-import json, os
+# ─── 主循环结束后一次性写出并上传所有指标 ─────────────────────────────
+os.makedirs("/mnt/pvc/results", exist_ok=True)
+csv_path  = "/mnt/pvc/results/monitor_metrics.csv"
+jsonl_path = "/mnt/pvc/results/monitor_metrics.jsonl"
+
+# 写 CSV
+pd.DataFrame(metrics_buffer).to_csv(csv_path, index=False)
+
+# 写 JSONL
+with open(jsonl_path, "w") as fp:
+    for entry in metrics_buffer:
+        fp.write(json.dumps(entry) + "\n")
+
+# 上传至 MinIO
+with open(csv_path, "rb") as fp:
+    save_bytes(f"{RESULT_DIR}/monitor_metrics.csv", fp.read(), "text/csv")
+with open(jsonl_path, "rb") as fp:
+    save_bytes(f"{RESULT_DIR}/monitor_metrics.jsonl", fp.read(), "application/json")
+
+print("[monitor] uploaded metrics CSV/JSONL to MinIO")
+
+# ─── 输出 KFP V2 metadata.json ───────────────────────────────────────
 meta_dir = "/tmp/kfp_outputs"
 os.makedirs(meta_dir, exist_ok=True)
-with open(f"{meta_dir}/output_metadata.json","w") as f:
+with open(f"{meta_dir}/output_metadata.json", "w") as f:
     json.dump({}, f)
