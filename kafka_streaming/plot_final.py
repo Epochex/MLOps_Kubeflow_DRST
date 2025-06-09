@@ -60,3 +60,9 @@ with open(full_png, "rb") as fp:
     save_bytes(f"{RESULT_DIR}/overview_full.png", fp.read(), "image/png")
 
 print("[plot] uploaded both figures to MinIO")
+
+import json, os
+meta_dir = "/tmp/kfp_outputs"
+os.makedirs(meta_dir, exist_ok=True)
+with open(f"{meta_dir}/output_metadata.json","w") as f:
+    json.dump({}, f)
