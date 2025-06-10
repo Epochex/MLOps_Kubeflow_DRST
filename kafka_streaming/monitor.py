@@ -5,13 +5,13 @@ kafka_streaming/monitor.py
 • Drift Detection 批量消费 + JS 计算
 • 缓存所有指标到本地，主循环结束后统一写出并上传到 MinIO
 • 异步触发 dynamic_retrain，避免阻塞主线程
+• 同步所有指标到 metrics_summary.csv
 """
 import os
 import json
 import queue
 import threading
 import time
-import pathlib
 from datetime import datetime
 
 import numpy as np
@@ -28,6 +28,7 @@ from shared.config        import (
 )
 from shared.features     import FEATURE_COLS
 from shared.minio_helper import load_csv, save_bytes
+from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 # ─── 全局变量 ──────────────────────────────────────────────────────
 consumer = None                   # KafkaConsumer 对象
@@ -45,7 +46,9 @@ CPU_FEATS   = [
 metrics_buffer: list[dict] = []
 
 def record_metric(component: str, event: str, **kwargs):
-    """缓存一次打点，不马上上传。"""
+    """
+    缓存一次打点，并同步到 metrics_summary.csv。
+    """
     entry = {
         "utc": datetime.utcnow().isoformat() + "Z",
         "component": component,
@@ -53,6 +56,7 @@ def record_metric(component: str, event: str, **kwargs):
         **kwargs
     }
     metrics_buffer.append(entry)
+    log_metric(component=component, event=event, **kwargs)
 
 # ─── JS 计算函数 ──────────────────────────────────────────────────────
 def js(a: np.ndarray, b: np.ndarray, bins: int=50, eps: float=1e-9) -> float:
@@ -87,7 +91,6 @@ def _listener():
         value_deserializer=lambda m: json.loads(m.decode()),
     )
 
-    # 写就绪标志供 Producer 轮询
     os.makedirs("/mnt/pvc/results", exist_ok=True)
     with open("/mnt/pvc/results/monitor_ready.flag", "w"):
         pass
@@ -121,9 +124,8 @@ def _take_batch():
             pass
     return buf
 
-# ─── 异步触发 retrain ────────────────────────────────────────────────
 def trigger_retrain(js_val: float):
-    """后台执行 dynamic_retrain，隔离主线程 I/O。"""
+    # 调用已经修正好的 dynamic_retrain 模块
     os.system(f"python -m ml.dynamic_retrain {js_val:.4f}")
 
 # ─── 主循环 ─────────────────────────────────────────────────────────
@@ -149,13 +151,9 @@ while True:
     js_val = avg_js(df_sample)
     js_time_ms = (time.time() - t0) * 1000
 
-    # Kafka lag
-    kafka_lag = 0
-    if consumer and consumer.assignment():
-        tp = next(iter(consumer.assignment()))
-        kafka_lag = max(0, consumer.end_offsets([tp])[tp] - offsets[-1] - 1)
+    tp = next(iter(consumer.assignment())) if consumer and consumer.assignment() else None
+    kafka_lag = max(0, consumer.end_offsets([tp])[tp] - offsets[-1] - 1) if tp else 0
 
-    # 缓存 drift 打点
     record_metric(
         component="monitor",
         event="drift_calc",
@@ -169,7 +167,6 @@ while True:
     # 触发 retrain（阈值 + 最少 30s 间隔）
     if js_val > JS_TRIGGER_THRESH and time.time() - last_retrain_ts >= 30:
         last_retrain_ts = time.time()
-        # 缓存最新 batch 以供 retrain 使用
         np.save("/mnt/pvc/latest_batch.npy", valid)
 
         print(f"[monitor] drift {js_val:.3f} → call dynamic_retrain")
@@ -179,34 +176,32 @@ while True:
             component="monitor",
             event="retrain_trigger",
             js_val=round(js_val, 4),
-            update_trigger_delay_s=round(0.0, 3),
+            update_trigger_delay_s=0.0,
         )
 
 print("[monitor] end")
 
 # ─── 主循环结束后一次性写出并上传所有指标 ─────────────────────────────
 os.makedirs("/mnt/pvc/results", exist_ok=True)
-csv_path  = "/mnt/pvc/results/monitor_metrics.csv"
+csv_path   = "/mnt/pvc/results/monitor_metrics.csv"
 jsonl_path = "/mnt/pvc/results/monitor_metrics.jsonl"
 
-# 写 CSV
 pd.DataFrame(metrics_buffer).to_csv(csv_path, index=False)
-
-# 写 JSONL
 with open(jsonl_path, "w") as fp:
     for entry in metrics_buffer:
         fp.write(json.dumps(entry) + "\n")
 
-# 上传至 MinIO
 with open(csv_path, "rb") as fp:
     save_bytes(f"{RESULT_DIR}/monitor_metrics.csv", fp.read(), "text/csv")
 with open(jsonl_path, "rb") as fp:
     save_bytes(f"{RESULT_DIR}/monitor_metrics.jsonl", fp.read(), "application/json")
 
-print("[monitor] uploaded metrics CSV/JSONL to MinIO")
+# 同步所有组件的 summary.csv / JSONL / *_metrics.csv → MinIO
+sync_all_metrics_to_minio()
 
-# ─── 输出 KFP V2 metadata.json ───────────────────────────────────────
+# 输出 KFP V2 metadata.json
 meta_dir = "/tmp/kfp_outputs"
 os.makedirs(meta_dir, exist_ok=True)
 with open(f"{meta_dir}/output_metadata.json", "w") as f:
     json.dump({}, f)
+print("[monitor] uploaded metrics CSV/JSONL to MinIO")

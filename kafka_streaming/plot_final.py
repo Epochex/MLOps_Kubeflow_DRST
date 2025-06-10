@@ -4,14 +4,17 @@ kafka_streaming/plot_final.py
 ────────────────────────────────────────────────────────────
 • 合并所有副本／offline 输出
 • 生成三张图：
-    - report_full.png  （全时序总览）
-    - report_detail.png（原有过滤后 200 点）
-    - report_windowed.png（围绕校正完成点 ± window）
+    - overview_full.png   （全时序总览）
+    - report_detail.png   （原有过滤后 200 点）
+    - report_windowed.png （围绕校正完成点 ± window）
+• 额外：合并所有 inference pod 的 metrics CSV → all_infer_metrics.csv
 """
 import os
 import time
 import json
+import glob
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
@@ -21,32 +24,30 @@ from ml.plot_report      import generate_report, generate_report_full
 
 # ---------- 等待文件准备 & 确保目录存在 ----------
 root_mnt = f"/mnt/pvc/{RESULT_DIR}"
-# 新增：即使还没有任何文件，也要创建这个目录
 os.makedirs(root_mnt, exist_ok=True)
 
+# ---------- 1) 等待 offline 输出，就绪后拉取 bridge 数据 ----------
 timeout, t0 = 600, time.time()
-
 REQUIRED_OFF = {
     "br_true": f"{RESULT_DIR}/bridge_true.npy",
     "br_pred": f"{RESULT_DIR}/bridge_pred.npy",
 }
 while True:
     try:
-        offline = {k: load_np(v) for k, v in REQUIRED_OFF.items()}
+        offline = {k: load_np(path) for k, path in REQUIRED_OFF.items()}
         if all(arr.size > 0 for arr in offline.values()):
             break
-    except:
+    except Exception:
         pass
     if time.time() - t0 > timeout:
         print("[plot] timeout waiting for offline arrays – skip"); exit(0)
     time.sleep(5)
 print("[plot] fetched offline arrays")
 
-# ---------- 扫描所有 inference 副本 ----------
+# ---------- 2) 扫描所有 inference 副本目录，收集预测结果 ----------
 pods = [
     d for d in os.listdir(root_mnt)
-    if os.path.isdir(os.path.join(root_mnt, d))
-       and d not in ("timing",)
+    if os.path.isdir(os.path.join(root_mnt, d)) and d not in ("timing",)
 ]
 print(f"[plot] found inference pods: {pods}")
 
@@ -64,9 +65,8 @@ y_pred_adj  = np.concatenate(pred_adj_list)  if pred_adj_list  else np.array([])
 y_pred_orig = np.concatenate(pred_orig_list) if pred_orig_list else np.array([])
 y_true      = np.concatenate(true_list)      if true_list      else np.array([])
 
-# ---------- 1) 全量总览图 ----------
-os.makedirs(root_mnt, exist_ok=True)
-full_png = f"{root_mnt}/overview_full.png"
+# ---------- 3) 全量总览图（overview_full.png） ----------
+full_png = os.path.join(root_mnt, "overview_full.png")
 generate_report_full(
     bridge_true       = offline["br_true"],
     bridge_pred_orig  = offline["br_pred"],
@@ -78,8 +78,8 @@ generate_report_full(
 with open(full_png, "rb") as fp:
     save_bytes(f"{RESULT_DIR}/overview_full.png", fp.read(), "image/png")
 
-# ---------- 2) 原有过滤后细节（200 点） ----------
-detail_png = f"{root_mnt}/report_detail.png"
+# ---------- 4) 过滤后细节图（report_detail.png） ----------
+detail_png = os.path.join(root_mnt, "report_detail.png")
 generate_report(
     bridge_true       = offline["br_true"],
     bridge_pred_orig  = offline["br_pred"],
@@ -91,19 +91,20 @@ generate_report(
 with open(detail_png, "rb") as fp:
     save_bytes(f"{RESULT_DIR}/report_final.png", fp.read(), "image/png")
 
-# ---------- 3) 窗口图：围绕校正完成点 ± PLOT_WINDOW_* ----------
-# 重新拼 full-arrays
+# ---------- 5) 窗口图（report_windowed.png）、围绕校正完成点 ± window ----------
+# 重建全序列
 bt = offline["br_true"]
 bp = offline["br_pred"]
 y_true_full      = np.concatenate([bt, y_true])
 y_pred_orig_full = np.concatenate([bp, y_pred_orig])
 y_pred_adj_full  = np.concatenate([bp, y_pred_adj])
-full_len = len(y_true_full)
-bridge_len = len(bt)
-dag1_len   = len(y_true)
 
-# 计算 drift_index 与 correction_index（同 generate_report 逻辑）
-thr_drift = 0.15
+full_len    = len(y_true_full)
+bridge_len  = len(bt)
+dag1_len    = len(y_true)
+
+# 计算 drift_index 与 correction_index（与 generate_report 逻辑一致）
+thr_drift = 0.46
 if dag1_len > 0:
     err_ratio = np.abs(y_true - y_pred_orig) / np.maximum(y_true, 1e-8)
     if err_ratio.max() <= thr_drift:
@@ -132,9 +133,8 @@ ax.plot(x, y_true_full[start:end],
 ax.plot(x, y_pred_orig_full[start:end],
         "r--", marker="o", markersize=3, linewidth=1.0,
         label="Original Prediction")
-# 标记校正完成点
 ax.axvline(correction_index, color="magenta", ls="--", lw=2, label="Correction Point")
-ax.text(correction_index, ax.get_ylim()[1]*0.95,
+ax.text(correction_index, ax.get_ylim()[1] * 0.95,
         f"{correction_index}", ha="center", va="top", color="magenta")
 ax.set_xlabel("Time series index", fontsize=14)
 ax.set_ylabel("Throughput (Mbps)", fontsize=14)
@@ -143,7 +143,7 @@ ax.grid(True, linestyle="--", linewidth=0.4)
 ax.legend(loc="lower right", fontsize=12)
 plt.tight_layout()
 
-windowed_png = f"{root_mnt}/report_windowed.png"
+windowed_png = os.path.join(root_mnt, "report_windowed.png")
 plt.savefig(windowed_png, dpi=150)
 plt.close(fig)
 
@@ -152,8 +152,29 @@ with open(windowed_png, "rb") as fp:
 
 print("[plot] uploaded overview, detail and windowed reports to MinIO")
 
-# 写 KFP V2 metadata
+# ---------- 6) 合并所有 inference pod 的 metrics CSV → all_infer_metrics.csv ----------
+all_paths = glob.glob(os.path.join(root_mnt, "*_infer_metrics.csv"))
+if all_paths:
+    df_list = []
+    for p in all_paths:
+        df = pd.read_csv(p)
+        pod = os.path.basename(p).replace("_infer_metrics.csv", "")
+        df["pod_name"] = pod
+        df_list.append(df)
+    df_all = pd.concat(df_list, ignore_index=True)
+    df_all["utc"] = pd.to_datetime(df_all["utc"])
+    df_all.sort_values("utc", inplace=True)
+
+    merged_path = os.path.join(root_mnt, "all_infer_metrics.csv")
+    df_all.to_csv(merged_path, index=False)
+    with open(merged_path, "rb") as fp:
+        save_bytes(f"{RESULT_DIR}/all_infer_metrics.csv", fp.read(), "text/csv")
+    print(f"[plot] merged inference metrics → all_infer_metrics.csv")
+
+# ---------- 7) 写 KFP V2 metadata.json ----------
 meta_dir = "/tmp/kfp_outputs"
 os.makedirs(meta_dir, exist_ok=True)
-with open(f"{meta_dir}/output_metadata.json","w") as f:
+with open(f"{meta_dir}/output_metadata.json", "w") as f:
     json.dump({}, f)
+
+print("[plot] all tasks complete, metadata written.")
