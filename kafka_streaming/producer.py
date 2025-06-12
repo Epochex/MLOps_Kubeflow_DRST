@@ -28,8 +28,8 @@ from shared.features      import FEATURE_COLS
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 SLEEP = float(os.getenv("MSG_SLEEP", "0.1"))
-LIM1  = int(os.getenv("LIMIT_PHASE1", "3000"))
-LIM2  = int(os.getenv("LIMIT_PHASE2", "800"))
+LIM1  = int(os.getenv("LIMIT_PHASE1", "600"))
+LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
 
 STAGES = [
