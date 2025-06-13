@@ -28,15 +28,21 @@ from shared.features      import FEATURE_COLS
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 SLEEP = float(os.getenv("MSG_SLEEP", "0.1"))
-LIM1  = int(os.getenv("LIMIT_PHASE1", "600"))
+LIM1  = int(os.getenv("LIMIT_PHASE1", "1000"))
 LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
 
 STAGES = [
-    ("Phase-1", f"{DATA_DIR}/random_rates.csv",                         LIM1),
-    ("Phase-2", f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv", LIM2),
-    ("Phase-3", f"{DATA_DIR}/intervention_global.csv",                 LIM3),
+    ("Phase-1", f"{DATA_DIR}/random_rates.csv",LIM1),
+    ("Phase-2", f"{DATA_DIR}/random_rates.csv",LIM2),
+    ("Phase-3", f"{DATA_DIR}/random_rates.csv",LIM3),
 ]
+
+# STAGES = [
+#     ("Phase-1", f"{DATA_DIR}/random_rates.csv",                         LIM1),
+#     ("Phase-2", f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv", LIM2),
+#     ("Phase-3", f"{DATA_DIR}/intervention_global.csv",                 LIM3),
+# ]
 
 _START = datetime.datetime.utcnow()
 
