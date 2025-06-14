@@ -26,6 +26,8 @@ from shared.config import MODEL_DIR, RESULT_DIR, TARGET_COL, BUCKET, DATA_DIR
 from shared.metric_logger import log_metric
 from shared.features import FEATURE_COLS
 from shared.utils import calculate_accuracy_within_threshold, _bytes_to_model
+import shutil
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -41,6 +43,11 @@ if TRIGGER == 0:
         with open(local, "wb") as f:
             f.write(raw)
         print(f"[offline] downloaded {fname} → {local}")
+
+    # —— NEW: adaptive 初始 = baseline
+    shutil.copy("/mnt/pvc/models/baseline_model.pt",
+                "/mnt/pvc/models/model.pt")
+    print("[offline] copied baseline_model.pt ➜ model.pt (init adaptive)")
 
     # 2) 加载
     scaler = joblib.load("/mnt/pvc/models/scaler.pkl")
@@ -227,73 +234,45 @@ except Exception as e:
 
 
 # ---------- 8. 保存 artefacts ----------
-import os
-from datetime import datetime
-from shared.minio_helper import save_bytes
 
-# 确保路径存在
-os.makedirs("/mnt/pvc/models",        exist_ok=True)
-os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
+# 1) 本地持久化：scaler、pca、基线模型、adaptive 模型
+scaler_path   = "/mnt/pvc/models/scaler.pkl"
+pca_path      = "/mnt/pvc/models/pca.pkl"
+baseline_path = "/mnt/pvc/models/baseline_model.pt"
+adaptive_path = "/mnt/pvc/models/model.pt"      # adaptive 初始=baseline
 
-# 1) 本地持久化：保存 scaler、pca，以及完整的模型对象
-scaler_path = "/mnt/pvc/models/scaler.pkl"
-pca_path    = "/mnt/pvc/models/pca.pkl"
-model_path  = "/mnt/pvc/models/model.pt"
-true_path   = f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy"
-pred_path   = f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy"
-
-# 保存预处理对象
 joblib.dump(scaler, scaler_path)
 joblib.dump(pca,    pca_path)
 
-# ←—— 这里改为保存完整模型对象 ——→
-# model 已经用 best_state load 好了：
 model.load_state_dict(best_state)
-torch.save(model.eval().cpu(), model_path)
+torch.save(model.eval().cpu(), baseline_path)    # 保存基线
+torch.save(model.eval().cpu(), adaptive_path)    # 同内容，作 adaptive 初始
 
 # 保存测试集真值与预测
-np.save(true_path, y_te)
-np.save(pred_path, y_pred)
+np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy", y_te)
+np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy", y_pred)
 
-print(f"[offline] scaler saved to: {scaler_path}")
-print(f"[offline] pca    saved to: {pca_path}")
-print(f"[offline] model  saved to: {model_path}")
-print(f"[offline] bridge_true.npy → {true_path}")
-print(f"[offline] bridge_pred.npy → {pred_path}")
-
-# 2) 上传到 MinIO
-#   — scaler / pca / model.pt（完整模型）
-for fn, local in [
-    ("scaler.pkl", scaler_path),
-    ("pca.pkl",    pca_path),
-    ("model.pt",   model_path),
-]:
+# 2) 上传到 MinIO  -------------------------------------------
+for fn in ("scaler.pkl", "pca.pkl",
+           "baseline_model.pt", "model.pt"):
+    local = f"/mnt/pvc/models/{fn}"
     with open(local, "rb") as f:
-        save_bytes(f"{MODEL_DIR}/{fn}", f.read(), "application/octet-stream")
+        save_bytes(f"{MODEL_DIR}/{fn}", f.read(),
+                   "application/octet-stream")
 
-# 3) 上传 bridge_true / bridge_pred
 save_bytes(f"{RESULT_DIR}/bridge_true.npy",
-           open(true_path, "rb").read(),
+           open(f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy", "rb").read(),
            "application/npy")
 save_bytes(f"{RESULT_DIR}/bridge_pred.npy",
-           open(pred_path, "rb").read(),
+           open(f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy", "rb").read(),
            "application/npy")
 
-# 4) 上传配置（可选，保持原样）
-hidden_layers = tuple(
-    l.out_features for l in model.net if isinstance(l, nn.Linear)
-)[:-1]
-cfg = {"hidden_layers": hidden_layers, "activation": "relu"}
-save_bytes(f"{MODEL_DIR}/baseline_model_config.json",
-           json.dumps(cfg).encode(), "application/json")
-save_bytes(f"{MODEL_DIR}/last_model_config.json",
-           json.dumps(cfg).encode(), "application/json")
-
-# 5) 上传时间戳
+# 3) 上传时间戳
 save_bytes(f"{MODEL_DIR}/last_update_utc.txt",
            datetime.utcnow().isoformat().encode(), "text/plain")
 
 print("[offline] artefacts uploaded ✔")
+
 
 # ---------- 9. KFP metadata ----------
 os.makedirs("/tmp/kfp_outputs", exist_ok=True)

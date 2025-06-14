@@ -62,48 +62,52 @@ try:
 except Exception:
     pca, use_pca = None, False
 
-
-
-# ---------- baseline / adaptive 模型加载 ---------------------------------
-# 统一用 _bytes_to_model()，兼容 state_dict 和完整模型对象
-baseline_raw   = _fetch("baseline_model.pt")
-baseline_model = _bytes_to_model(baseline_raw)
+# -- baseline & adaptive 都是“完整模型对象” --
+baseline_model = torch.load(io.BytesIO(_fetch("baseline_model.pt")),
+                            map_location=device).eval()
 baseline_in_dim = baseline_model.net[0].in_features
 
-curr_raw       = _fetch("model.pt")
-current_model  = _bytes_to_model(curr_raw)
+curr_raw      = _fetch("model.pt")
+current_model = torch.load(io.BytesIO(curr_raw),
+                           map_location=device).eval()
 
 print(f"[infer:{pod_name}] baseline in_features = {baseline_in_dim}")
 print(f"[infer:{pod_name}] adaptive model       = {current_model}")
 
-# 用 md5 记录当前模型签名，后续热重载判断是否变化
+# —— 若 adaptive 权重“几乎空”，回退 baseline ——
+w_mean = current_model.net[0].weight.abs().mean().item()
+if w_mean < 1e-4:        # 阈值按需调整
+    print(f"[infer:{pod_name}] Detected un-trained adaptive "
+          f"( |w| mean={w_mean:.1e} ) → fallback to baseline")
+    current_model = baseline_model
+
 model_sig        = hashlib.md5(curr_raw).hexdigest()
 model_loading_ms = 0.0
 
+
 # ---------- 热重载 --------------------------------------------------------
 def _reload_model(force: bool = False):
-    """
-    如 model.pt 内容变化则重新加载；否则跳过。
-    """
     global current_model, curr_raw, model_sig, model_loading_ms
 
-    raw = _fetch("model.pt")
-    sig = hashlib.md5(raw).hexdigest()
+    raw = _fetch("model.pt"); sig = hashlib.md5(raw).hexdigest()
     if not force and sig == model_sig:
-        return                      # 未变化，直接返回
+        return
 
     t0 = time.perf_counter()
-    current_model = _bytes_to_model(raw)        # 关键：统一入口
-    # DEBUG: 打印第一层权重均值，确认成功加载
-    w0 = current_model.net[0].weight
-    print(f"[infer:{pod_name}] DEBUG first-layer |w| mean={w0.abs().mean().item():.6f}")
+    mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
 
+    # 健康检查
+    if mdl.net[0].weight.abs().mean().item() < 1e-4:
+        print(f"[infer:{pod_name}] hot-reload found un-trained model → ignore")
+        return                      # 不更新
+
+    current_model = mdl
     model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
     curr_raw, model_sig = raw, sig
-
     log_metric(component="infer", event="hot_reload_runtime",
                model_loading_ms=model_loading_ms)
-    print(f"[infer:{pod_name}] hot-reloaded, load={model_loading_ms} ms")
+    print(f"[infer:{pod_name}] hot-reloaded OK, load={model_loading_ms} ms")
+
 
 
 def hot_reload():
