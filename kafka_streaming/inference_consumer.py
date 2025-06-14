@@ -47,6 +47,7 @@ proc   = psutil.Process()
 pred_orig_hist: List[float] = []
 pred_adj_hist : List[float] = []
 true_hist     : List[float] = []
+ts_hist       : List[str]   = []     
 
 
 # ---------- scaler / PCA / baseline --------------------------------------
@@ -63,46 +64,47 @@ except Exception:
 
 
 
-# —— 加载离线 baseline 模型（自动匹配架构） ——  
-baseline_raw    = _fetch("baseline_model.pt")
-baseline_model  = _bytes_to_model(baseline_raw)
+# ---------- baseline / adaptive 模型加载 ---------------------------------
+# 统一用 _bytes_to_model()，兼容 state_dict 和完整模型对象
+baseline_raw   = _fetch("baseline_model.pt")
+baseline_model = _bytes_to_model(baseline_raw)
 baseline_in_dim = baseline_model.net[0].in_features
 
 curr_raw       = _fetch("model.pt")
 current_model  = _bytes_to_model(curr_raw)
 
-model_sig      = hashlib.md5(curr_raw).hexdigest()
+print(f"[infer:{pod_name}] baseline in_features = {baseline_in_dim}")
+print(f"[infer:{pod_name}] adaptive model       = {current_model}")
+
+# 用 md5 记录当前模型签名，后续热重载判断是否变化
+model_sig        = hashlib.md5(curr_raw).hexdigest()
 model_loading_ms = 0.0
 
 # ---------- 热重载 --------------------------------------------------------
 def _reload_model(force: bool = False):
     """
-    如果 model.pt 发生变化则重新加载，并打印第一层权重均值用于调试。
+    如 model.pt 内容变化则重新加载；否则跳过。
     """
     global current_model, curr_raw, model_sig, model_loading_ms
 
-    # 拉最新权重 bytes & 计算签名
     raw = _fetch("model.pt")
     sig = hashlib.md5(raw).hexdigest()
     if not force and sig == model_sig:
-        return
+        return                      # 未变化，直接返回
 
-    # 真正加载新模型
     t0 = time.perf_counter()
-    current_model = _bytes_to_model(raw)
-
-    # === DEBUG ①：检查第一层权重平均绝对值是否为 0（若为 0 则说明没 load 对）====
+    current_model = _bytes_to_model(raw)        # 关键：统一入口
+    # DEBUG: 打印第一层权重均值，确认成功加载
     w0 = current_model.net[0].weight
-    print(f"[infer:{pod_name}] DEBUG ① first-layer |w| mean={w0.abs().mean().item():.6f}")
+    print(f"[infer:{pod_name}] DEBUG first-layer |w| mean={w0.abs().mean().item():.6f}")
 
-    # 记录加载时长、更新签名
     model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
     curr_raw, model_sig = raw, sig
 
-    # 打指标 & 打日志
     log_metric(component="infer", event="hot_reload_runtime",
                model_loading_ms=model_loading_ms)
     print(f"[infer:{pod_name}] hot-reloaded, load={model_loading_ms} ms")
+
 
 def hot_reload():
     """异步触发热重载，不阻塞主推理循环。"""
@@ -277,7 +279,9 @@ while True:
         adpt_p90=float(adpt_q[2]), adpt_p95=float(adpt_q[3]),
         adpt_p99=float(adpt_q[4]),
     )
-
+    
+    # ---------- 收集指标 & 日志 ------------------------------------------
+    ts_hist.extend([r["send_ts"] for r in rows_batch])
     # 5) 原有指标 & 日志
     pred_orig_hist.extend(preds_base.tolist())
     pred_adj_hist .extend(preds_adpt.tolist())
@@ -325,26 +329,30 @@ while True:
 print(f"[infer:{pod_name}] TOTAL processed {msg_total} samples, exit")
 
 
-# ---------- 收尾（保持不变） ---------------------------------------------
-arr_adj  = np.asarray(pred_adj_hist , np.float32)
-arr_orig = np.asarray(pred_orig_hist, np.float32)
-arr_true = np.asarray(true_hist    , np.float32)
+# ---------- 收尾：保存完整 trace 并上传 ----------------------------------
+print(f"[infer:{pod_name}] TOTAL processed {msg_total} samples, exit")
 
-np.save(f"{local_out}/inference_pred_adj.npy" , arr_adj)
-np.save(f"{local_out}/inference_pred_orig.npy", arr_orig)
-np.save(f"{local_out}/inference_true.npy"     , arr_true)
+# ★★★ 新增：把 send_ts 转成 epoch 秒，与预测一起保存 ★★★
+arr_adj   = np.asarray(pred_adj_hist , np.float32)
+arr_orig  = np.asarray(pred_orig_hist, np.float32)
+arr_true  = np.asarray(true_hist     , np.float32)
+arr_ts    = np.asarray([
+    datetime.fromisoformat(t.rstrip("Z")).timestamp()  # iso → epoch
+    for t in ts_hist
+], np.float64)
 
-save_np(f"{RESULT_DIR}/{pod_name}_inference_pred_adj.npy" , arr_adj)
-save_np(f"{RESULT_DIR}/{pod_name}_inference_pred_orig.npy", arr_orig)
-save_np(f"{RESULT_DIR}/{pod_name}_inference_true.npy"     , arr_true)
-print(f"[infer:{pod_name}] prediction arrays saved – total {len(arr_true)} samples")
+npz_local = f"{local_out}/inference_trace.npz"
+np.savez(npz_local,
+         ts=arr_ts,
+         pred_adj=arr_adj,
+         pred_orig=arr_orig,
+         true=arr_true)
 
-global_csv = f"/mnt/pvc/{RESULT_DIR}/metrics_summary.csv"
-if os.path.exists(global_csv):
-    with open(global_csv, "rb") as f:
-        save_bytes(f"{RESULT_DIR}/{pod_name}_infer_metrics.csv",
-                   f.read(), "text/csv")
-    print(f"[infer:{pod_name}] uploaded {pod_name}_infer_metrics.csv")
+with open(npz_local, "rb") as f:
+    save_bytes(f"{RESULT_DIR}/{pod_name}_inference_trace.npz",
+               f.read(), "application/octet-stream")
+print(f"[infer:{pod_name}] trace npz saved – total {len(arr_true)} samples")
 
+# 同步全局 metrics（保持不变）
 sync_all_metrics_to_minio()
 print(f"[infer:{pod_name}] all metrics synced, exiting.")

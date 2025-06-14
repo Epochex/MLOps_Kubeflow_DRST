@@ -9,7 +9,7 @@ ml.train_offline.py - baseline MLP with PCA (bridge only)
 • 输出 scaler / pca / model.pt / 预测结果等
 """
 
-TRIGGER = 1  # 1 = 训练；0 = 跳过
+TRIGGER = 0  # 1 = 训练；0 = 跳过
 
 import sys, os, json, joblib, numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.optim import Adam
@@ -19,28 +19,110 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from datetime import datetime
+from typing import Dict, Tuple
 
 from shared.minio_helper import load_csv, load_np, save_np, save_bytes, s3
 from shared.config import MODEL_DIR, RESULT_DIR, TARGET_COL, BUCKET, DATA_DIR
 from shared.metric_logger import log_metric
 from shared.features import FEATURE_COLS
-from shared.utils import calculate_accuracy_within_threshold
+from shared.utils import calculate_accuracy_within_threshold, _bytes_to_model
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 if TRIGGER == 0:
     print("[offline] TRIGGER=0 → 跳过训练，下载已有 artefacts")
     os.makedirs("/mnt/pvc/models", exist_ok=True)
     os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
 
-    for fname in ("scaler.pkl", "pca.pkl", "model.pt"):
+    # 1) 下载预处理器 + 两个模型
+    for fname in ("scaler.pkl", "pca.pkl", "baseline_model.pt", "model.pt"):
         raw = s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/{fname}")["Body"].read()
-        with open(f"/mnt/pvc/models/{fname}", "wb") as f: f.write(raw)
+        local = f"/mnt/pvc/models/{fname}"
+        with open(local, "wb") as f:
+            f.write(raw)
+        print(f"[offline] downloaded {fname} → {local}")
 
-    for arr in ("bridge_true.npy", "bridge_pred.npy"):
-        try:
-            a = load_np(f"{RESULT_DIR}/{arr}")
-            np.save(f"/mnt/pvc/{RESULT_DIR}/{arr}", a)
-        except: pass
+    # 2) 加载
+    scaler = joblib.load("/mnt/pvc/models/scaler.pkl")
+    pca    = joblib.load("/mnt/pvc/models/pca.pkl")
 
+    with open("/mnt/pvc/models/baseline_model.pt", "rb") as f:
+        baseline_model = _bytes_to_model(f.read())       # ✔ 兼容 state_dict / 完整模型
+
+    with open("/mnt/pvc/models/model.pt", "rb") as f:
+        adaptive_model = _bytes_to_model(f.read())       # 同理
+
+    # 3) 对齐函数（给 adaptive model 用）
+    def _align_adaptive_input(X_scaled: np.ndarray, model: nn.Module) -> np.ndarray:
+        in_dim = model.net[0].in_features
+        if X_scaled.shape[1] >= in_dim:
+            return X_scaled[:, :in_dim]
+        pad = np.zeros((X_scaled.shape[0], in_dim - X_scaled.shape[1]), dtype=np.float32)
+        return np.concatenate([X_scaled, pad], axis=1)
+
+    # —— 在 old_total.csv 上测两条线路的精度 ——  
+    df_tot = (load_csv(f"{DATA_DIR}/old_total.csv")
+              .replace({'<not counted>': np.nan})
+              .dropna())
+    df_tot.drop(columns=["input_rate","latency"], errors="ignore", inplace=True)
+    df_tot = df_tot.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
+
+    X_raw      = df_tot[FEATURE_COLS].astype(np.float32).values
+    y_true_tot = df_tot[TARGET_COL].astype(np.float32).values
+
+    # 3.1 PCA → baseline
+    X_scaled = scaler.transform(X_raw)
+    X_pca    = pca.transform(X_scaled).astype(np.float32)
+    with torch.no_grad():
+        y_base = baseline_model(torch.from_numpy(X_pca).to(device)).cpu().numpy()
+    acc_base_tot = calculate_accuracy_within_threshold(y_true_tot, y_base, 0.15)
+    print(f"[offline][SKIP] baseline@old_total acc = {acc_base_tot:.2f}%")
+    log_metric(component="offline", event="baseline_old_total_acc",
+               accuracy=round(acc_base_tot,2))
+
+    # 3.2 Scaler → adaptive
+    X_adpt = _align_adaptive_input(X_scaled, adaptive_model)
+    with torch.no_grad():
+        y_adpt = adaptive_model(torch.from_numpy(X_adpt).to(device)).cpu().numpy()
+    acc_adpt_tot = calculate_accuracy_within_threshold(y_true_tot, y_adpt, 0.15)
+    print(f"[offline][SKIP] adaptive@old_total acc = {acc_adpt_tot:.2f}%")
+    log_metric(component="offline", event="adaptive_old_total_acc",
+               accuracy=round(acc_adpt_tot,2))
+
+    # —— 在 old_dag-1.csv 上同样测试 ——  
+    try:
+        df_d1 = (load_csv(f"{DATA_DIR}/old_dag-1.csv")
+                 .replace({'<not counted>': np.nan})
+                 .dropna())
+        df_d1.drop(columns=["input_rate","latency"], errors="ignore", inplace=True)
+        df_d1 = df_d1.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
+
+        X1_raw      = df_d1[FEATURE_COLS].astype(np.float32).values
+        y_true_d1   = df_d1[TARGET_COL].astype(np.float32).values
+        X1_scaled   = scaler.transform(X1_raw)
+
+        # baseline
+        X1_pca      = pca.transform(X1_scaled).astype(np.float32)
+        with torch.no_grad():
+            y1_base = baseline_model(torch.from_numpy(X1_pca).to(device)).cpu().numpy()
+        acc1_base = calculate_accuracy_within_threshold(y_true_d1, y1_base, 0.15)
+        print(f"[offline][SKIP] baseline@old_dag1 acc = {acc1_base:.2f}%")
+        log_metric(component="offline", event="baseline_dag1_acc",
+                   accuracy=round(acc1_base,2))
+
+        # adaptive
+        X1_adpt    = _align_adaptive_input(X1_scaled, adaptive_model)
+        with torch.no_grad():
+            y1_adpt = adaptive_model(torch.from_numpy(X1_adpt).to(device)).cpu().numpy()
+        acc1_adpt = calculate_accuracy_within_threshold(y_true_d1, y1_adpt, 0.15)
+        print(f"[offline][SKIP] adaptive@old_dag1 acc = {acc1_adpt:.2f}%")
+        log_metric(component="offline", event="adaptive_dag1_acc",
+                   accuracy=round(acc1_adpt,2))
+
+    except Exception as e:
+        print(f"[offline] old_dag-1 accuracy calc failed: {e}")
+
+    # 最后打个 skip_train
     log_metric(component="offline", event="skip_train")
     sys.exit(0)
 
@@ -72,7 +154,6 @@ bs = 16
 tr_loader = DataLoader(TensorDataset(torch.from_numpy(X_tr),
                                      torch.from_numpy(y_tr)), batch_size=bs, shuffle=True)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class MLP(nn.Module):
     def __init__(self, inp):
@@ -146,40 +227,72 @@ except Exception as e:
 
 
 # ---------- 8. 保存 artefacts ----------
+import os
+from datetime import datetime
+from shared.minio_helper import save_bytes
+
+# 确保路径存在
 os.makedirs("/mnt/pvc/models",        exist_ok=True)
 os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
 
-# 1) 本地持久化
-joblib.dump(scaler, "/mnt/pvc/models/scaler.pkl")
-joblib.dump(pca,    "/mnt/pvc/models/pca.pkl")
-torch.save(best_state, "/mnt/pvc/models/model.pt")
+# 1) 本地持久化：保存 scaler、pca，以及完整的模型对象
+scaler_path = "/mnt/pvc/models/scaler.pkl"
+pca_path    = "/mnt/pvc/models/pca.pkl"
+model_path  = "/mnt/pvc/models/model.pt"
+true_path   = f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy"
+pred_path   = f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy"
 
-np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy", y_te)
-np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy", y_pred)
+# 保存预处理对象
+joblib.dump(scaler, scaler_path)
+joblib.dump(pca,    pca_path)
 
-# 2) 上传 MinIO
-for fn in ("scaler.pkl", "pca.pkl", "model.pt"):
-    with open(f"/mnt/pvc/models/{fn}", "rb") as f:
-        save_bytes(f"{MODEL_DIR}/{fn}", f.read())
+# ←—— 这里改为保存完整模型对象 ——→
+# model 已经用 best_state load 好了：
+model.load_state_dict(best_state)
+torch.save(model.eval().cpu(), model_path)
 
-# ---------------- 新增：自动提取隐藏层宽度 ----------------
+# 保存测试集真值与预测
+np.save(true_path, y_te)
+np.save(pred_path, y_pred)
+
+print(f"[offline] scaler saved to: {scaler_path}")
+print(f"[offline] pca    saved to: {pca_path}")
+print(f"[offline] model  saved to: {model_path}")
+print(f"[offline] bridge_true.npy → {true_path}")
+print(f"[offline] bridge_pred.npy → {pred_path}")
+
+# 2) 上传到 MinIO
+#   — scaler / pca / model.pt（完整模型）
+for fn, local in [
+    ("scaler.pkl", scaler_path),
+    ("pca.pkl",    pca_path),
+    ("model.pt",   model_path),
+]:
+    with open(local, "rb") as f:
+        save_bytes(f"{MODEL_DIR}/{fn}", f.read(), "application/octet-stream")
+
+# 3) 上传 bridge_true / bridge_pred
+save_bytes(f"{RESULT_DIR}/bridge_true.npy",
+           open(true_path, "rb").read(),
+           "application/npy")
+save_bytes(f"{RESULT_DIR}/bridge_pred.npy",
+           open(pred_path, "rb").read(),
+           "application/npy")
+
+# 4) 上传配置（可选，保持原样）
 hidden_layers = tuple(
     l.out_features for l in model.net if isinstance(l, nn.Linear)
-)[:-1]  # 去掉最后一层输出层
+)[:-1]
 cfg = {"hidden_layers": hidden_layers, "activation": "relu"}
-
-save_bytes(f"{MODEL_DIR}/last_model_config.json",
-           json.dumps(cfg).encode(), "application/json")
 save_bytes(f"{MODEL_DIR}/baseline_model_config.json",
            json.dumps(cfg).encode(), "application/json")
-save_bytes(f"{MODEL_DIR}/baseline_model.pt",
-           open("/mnt/pvc/models/model.pt", "rb").read())
-save_bytes(f"{MODEL_DIR}/last_update_utc.txt",
-           datetime.utcnow().isoformat().encode())
+save_bytes(f"{MODEL_DIR}/last_model_config.json",
+           json.dumps(cfg).encode(), "application/json")
 
-# 3) 记录指标
-log_metric(component="offline", event="test_accuracy",
-           accuracy=round(acc, 2))
+# 5) 上传时间戳
+save_bytes(f"{MODEL_DIR}/last_update_utc.txt",
+           datetime.utcnow().isoformat().encode(), "text/plain")
+
 print("[offline] artefacts uploaded ✔")
 
 # ---------- 9. KFP metadata ----------
