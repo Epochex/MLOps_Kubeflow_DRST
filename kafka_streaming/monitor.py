@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-kafka_streaming/monitor.py ─ 真·流式 Drift 监控 (Window-based)
+kafka_streaming/monitor.py ─ 流式 Drift 监控
 ──────────────────────────────────────────────────────────────
-• 每收到 1 条 Kafka 消息立即放入滑动窗口  
-• 窗口长度达到 WINDOW_SIZE 时计算一次 Jensen–Shannon  
-• 超过 JS_TRIGGER_THRESH 即刻触发 dynamic_retrain  
-• retrain 完成后把当前窗口并入 baseline，JS 立即回落  
-• log_metric() → 本地 CSV/JSONL → 统一上传 MinIO
+• Kafka 消息 ⇒ 滑动窗口 ⇒ Jensen–Shannon
+• 超阈值则后台触发 dynamic_retrain，并把窗口写入 /mnt/pvc/latest_batch.npy
 """
-
 from __future__ import annotations
-import os, json, queue, threading, time, sys, subprocess          # ★ subprocess 改非阻塞
+import os, json, queue, threading, time, subprocess
 from datetime import datetime
 
 import numpy as np
@@ -21,7 +17,7 @@ from scipy.spatial.distance import jensenshannon
 
 from shared.config import (
     KAFKA_TOPIC, KAFKA_SERVERS,
-    JS_TRIGGER_THRESH, JS_SEV1_THRESH, JS_SEV2_THRESH,   
+    JS_TRIGGER_THRESH, JS_SEV1_THRESH, JS_SEV2_THRESH,
     CONSUME_IDLE_S, AUTO_OFFSET_RESET, ENABLE_AUTO_COMMIT,
     RESULT_DIR
 )
@@ -33,14 +29,14 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 # 0. 全局 & 初始化
 # ----------------------------------------------------------------------
 WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))
-MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))  # ★ 5 min 冷却
+MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))  # 5 min
 metrics_buffer : list[dict] = []
 producer_done  = threading.Event()
 q: queue.Queue = queue.Queue()
-retrain_lock   = threading.Lock()                                     # ★ 同时只跑 1 个
-retrain_running = False                                              # ★ 状态位
+retrain_lock   = threading.Lock()          # baseline 更新 & retrain 互斥
+retrain_running = False
 
-# —— 预加载 baseline（离线训练见过的分布）——
+# —— 预加载 baseline（离线训练分布）——
 BASELINE_KEY = os.getenv("BASELINE_KEY", "datasets_old/old_total.csv")
 baseline_df  = load_csv(BASELINE_KEY)
 baseline_df.drop(columns=["input_rate", "latency", "output_rate"],
@@ -49,7 +45,7 @@ baseline_df  = baseline_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
 JS_FEATS     = [f for f in FEATURE_COLS if f in baseline_df.columns]
 
 # ----------------------------------------------------------------------
-# 1. 轻量埋点
+# 1. 指标工具
 # ----------------------------------------------------------------------
 def record_metric(component: str, event: str, **kw):
     entry = {
@@ -83,7 +79,7 @@ def _listener():
         value_deserializer=lambda m: json.loads(m.decode()),
     )
     os.makedirs("/mnt/pvc/results", exist_ok=True)
-    open("/mnt/pvc/results/monitor_ready.flag","w").close()
+    open("/mnt/pvc/results/monitor_ready.flag", "w").close()
     print("[monitor] readiness flag touched")
 
     for msg in cons:
@@ -95,7 +91,7 @@ def _listener():
 threading.Thread(target=_listener, daemon=True).start()
 
 # ----------------------------------------------------------------------
-# 3. JS 计算
+# 3. Jensen–Shannon
 # ----------------------------------------------------------------------
 def _js(p: np.ndarray, q_: np.ndarray, bins=50, eps=1e-9) -> float:
     p = p[~np.isnan(p)]; q_ = q_[~np.isnan(q_)]
@@ -114,18 +110,40 @@ def _avg_js(df: pd.DataFrame) -> float:
                           for f in JS_FEATS])) if JS_FEATS else 0.0
 
 # ----------------------------------------------------------------------
-# 4. retrain 触发辅助
+# 4. 重训后台线程
 # ----------------------------------------------------------------------
-def _bg_retrain(js_val: float, snapshot: pd.DataFrame):
-    """后台串行 retrain + baseline 扩充"""
+def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
+    """
+    ① 把当前窗口写入 latest_batch.npy（供 dynamic_retrain）
+    ② 调 dynamic_retrain（同步等待）
+    ③ 扩充 baseline_df
+    """
     global retrain_running, baseline_df
-    with retrain_lock: retrain_running = True
-    cmd = ["python","-m","ml.dynamic_retrain",f"{js_val:.4f}"]
-    print(f"[monitor] ➜ exec: {' '.join(cmd)}")
-    subprocess.call(cmd)                        # ★ 同步等待
-    baseline_df = pd.concat([baseline_df, snapshot], ignore_index=True)  # ★ baseline 扩充
-    with retrain_lock: retrain_running = False
-    print("[monitor] retrain done & baseline updated")
+    try:
+        # 1) Dump latest window for retrain process
+        np.save("/mnt/pvc/latest_batch.npy", np.array(snapshot_rows, dtype=object))
+        print("[monitor] latest_batch.npy saved")
+
+        # 2) 同步调用 retrain 子进程
+        with retrain_lock:
+            retrain_running = True
+        cmd = ["python", "-m", "ml.dynamic_retrain", f"{js_val:.4f}"]
+        print(f"[monitor] ➜ exec: {' '.join(cmd)}")
+        ret = subprocess.call(cmd)
+        if ret != 0:
+            print(f"[monitor] retrain exit code = {ret}")
+
+        # 3) 更新 baseline（线程安全）
+        with retrain_lock:
+            df_add = pd.DataFrame([r["features"] for r in snapshot_rows])
+            baseline_df = pd.concat([baseline_df, df_add], ignore_index=True)
+            retrain_running = False
+        print("[monitor] retrain done & baseline updated")
+
+    except Exception as exc:
+        print(f"[monitor] retrain thread error: {exc}")
+        with retrain_lock:
+            retrain_running = False
 
 # ----------------------------------------------------------------------
 # 5. 主循环
@@ -140,33 +158,38 @@ while True:
         item = q.get(timeout=CONSUME_IDLE_S)
     except queue.Empty:
         if producer_done.is_set():
-            print("[monitor] producer_done & queue empty → bye"); break
+            print("[monitor] producer_done & queue empty → bye")
+            break
         continue
 
     msg_count += 1
     win_rows.append(item)
-    if len(win_rows) > WINDOW_SIZE: win_rows.pop(0)
-    if len(win_rows) < WINDOW_SIZE: continue
+    if len(win_rows) > WINDOW_SIZE:
+        win_rows.pop(0)
+    if len(win_rows) < WINDOW_SIZE:
+        continue
 
     t0 = time.time()
     df_win = pd.DataFrame([r["features"] for r in win_rows])
     js_val = _avg_js(df_win)
-    js_ms  = (time.time()-t0)*1000
+    js_ms  = (time.time() - t0) * 1000
 
-    record_metric("monitor","drift_calc",
-                  js_val=round(js_val,4), window_size=WINDOW_SIZE,
-                  msg_since_start=msg_count, runtime_ms=round(js_ms,3),
+    record_metric("monitor", "drift_calc",
+                  js_val=round(js_val, 4), window_size=WINDOW_SIZE,
+                  msg_since_start=msg_count, runtime_ms=round(js_ms, 3),
                   **_sys_metrics())
 
     print(f"[monitor] JS={js_val:.4f} (thr={JS_TRIGGER_THRESH}) msgs={msg_count}")
 
+    # ---- 触发重训 ----
+    now = time.time()
     if (js_val > JS_TRIGGER_THRESH
-        and (time.time()-last_retrain_ts) >= MIN_RETRAIN_INTERVAL
+        and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
-        last_retrain_ts = time.time()
-        snapshot = df_win.copy()
+        last_retrain_ts = now
+        snapshot = win_rows.copy()   # 带 features + label
 
-        # ★ 判断 severity
+        # severity
         if js_val > JS_SEV2_THRESH:
             severity = "K"
         elif js_val > JS_SEV1_THRESH:
@@ -174,14 +197,14 @@ while True:
         else:
             severity = "1"
 
-        print(f"[monitor] retrain triggered by JS={js_val:.4f} → Severity-{severity}")
+        print(f"[monitor] retrain triggered → Severity-{severity}")
 
         threading.Thread(target=_bg_retrain,
                          args=(js_val, snapshot),
                          daemon=True).start()
 
-        record_metric("monitor", "retrain_trigger", js_val=round(js_val, 4), severity=severity)
-
+        record_metric("monitor", "retrain_trigger",
+                      js_val=round(js_val, 4), severity=severity)
 
 # ----------------------------------------------------------------------
 # 6. 收尾：写指标 & 上传
@@ -191,16 +214,19 @@ os.makedirs("/mnt/pvc/results", exist_ok=True)
 csv_path   = "/mnt/pvc/results/monitor_metrics.csv"
 jsonl_path = "/mnt/pvc/results/monitor_metrics.jsonl"
 
-pd.DataFrame(metrics_buffer).to_csv(csv_path,index=False)
-with open(jsonl_path,"w") as fp:
-    for e in metrics_buffer: fp.write(json.dumps(e)+"\n")
+pd.DataFrame(metrics_buffer).to_csv(csv_path, index=False)
+with open(jsonl_path, "w") as fp:
+    for e in metrics_buffer:
+        fp.write(json.dumps(e) + "\n")
 
-with open(csv_path,"rb") as fp:
-    save_bytes(f"{RESULT_DIR}/monitor_metrics.csv", fp.read(),"text/csv")
-with open(jsonl_path,"rb") as fp:
-    save_bytes(f"{RESULT_DIR}/monitor_metrics.jsonl", fp.read(),"application/json")
+with open(csv_path, "rb") as fp:
+    save_bytes(f"{RESULT_DIR}/monitor_metrics.csv", fp.read(), "text/csv")
+with open(jsonl_path, "rb") as fp:
+    save_bytes(f"{RESULT_DIR}/monitor_metrics.jsonl", fp.read(), "application/json")
 
 sync_all_metrics_to_minio()
 
-open("/tmp/kfp_outputs/output_metadata.json","w").write("{}")
+# —— 写入 KFP metadata ——  
+os.makedirs("/tmp/kfp_outputs", exist_ok=True)
+open("/tmp/kfp_outputs/output_metadata.json", "w").write("{}")
 print("[monitor] metrics uploaded – bye.")

@@ -2,7 +2,7 @@
 from kfp.dsl import pipeline, container_component, ContainerSpec
 from kfp import compiler
 
-PVC_NAME, MOUNT_PATH = "data-pvc", "/mnt/pvc"
+PVC_NAME, MOUNT_PATH = "mlops-custom3-workspace", "/mnt/pvc"
 
 def make_op(name, image, cmd):
     @container_component
@@ -58,8 +58,8 @@ def drift_stream():
           .set_caching_options(False)
     )
 
-    # 3) 水平扩展 N 个 Inference Consumers（N = 分区数 = 6）
-    N = 6
+    # 3) 水平扩展 N 个 Inference Consumers（N = 分区数 = 3）
+    N = 3
     consumer_ops = []
     for i in range(N):
         consumer = pvc(

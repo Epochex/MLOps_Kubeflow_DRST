@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-ml.dynamic_retrain ─ 在线 JS-driven 轻量重训练
-──────────────────────────────────────────────────────────────
-• 读取 /mnt/pvc/latest_batch.npy（由 monitor 写入）  
-• 根据 JS 大小选择 A/B/C 三档超参网格  
-• 训练 ≤ 10 个 config，选择最优 val_loss  
-• 推送 models/model.pt + last_model_config.json  
-• 完成后 touch /mnt/pvc/retrain_done.flag 供调试
+ml.dynamic_retrain ─ JS 触发的在线增量重训练  
+新的实现：**累积全部已见流数据** 而非仅滑动窗口
 """
-import sys, io, itertools, json, joblib, numpy as np, torch
+import os
+import sys, io, json, itertools, joblib, numpy as np, torch
 from datetime import datetime
 from sklearn.model_selection import train_test_split
 import torch.nn as nn
@@ -23,23 +19,56 @@ from shared.profiler     import Timer
 # ---------- 1. 当前 JS ----------
 JS = float(sys.argv[1])
 
-# ---------- 2. A/B/C 超参网格（简化版） ----------
-param_grid_A = {"learning_rate":[1e-3], "batch_size":[32]}
-param_grid_B = {"learning_rate":[1e-3,5e-4], "batch_size":[32],
-                "hidden_layers":[(64,32),(128,64,32)], "activation":["relu"]}
-param_grid_C = {"learning_rate":[1e-3],  "batch_size":[32],
-                "hidden_layers":[(128,64,32),(256,128,64)],
-                "activation":["relu","gelu"], "loss":["Huber"]}
+# ---------- 2. 合并 “最新窗口” + “历史累计” ----------
+latest_rows = np.load("/mnt/pvc/latest_batch.npy", allow_pickle=True).tolist()
+cumu_path   = "/mnt/pvc/all_seen.npy"
 
+if os.path.exists(cumu_path):
+    all_seen = np.load(cumu_path, allow_pickle=True).tolist()
+else:
+    all_seen = []
+
+def _row_key(r):
+    feats = tuple(r["features"][c] for c in FEATURE_COLS)
+    return feats + (r["label"],)
+
+merged = { _row_key(r): r for r in all_seen }
+merged.update({ _row_key(r): r for r in latest_rows })
+all_rows = list(merged.values())
+
+# 持久化新的累计数据，供下次 retrain 使用
+np.save(cumu_path, np.array(all_rows, dtype=object))
+
+# ---------- 3. 超参网格选择 ----------
+param_grid_A = {
+    "learning_rate": [1e-3],
+    "batch_size":    [8, 16, 32],
+    "hidden_layers": [(64, 32)],
+    "activation":    ["relu"]
+}
+param_grid_B = {
+    "learning_rate": [1e-3, 5e-4],
+    "batch_size":    [8, 16, 32],
+    "hidden_layers": [(64, 32), (128, 64, 32)],
+    "activation":    ["relu"]
+}
+param_grid_C = {
+    "learning_rate": [1e-2, 1e-3],
+    "batch_size":    [8, 16],
+    "hidden_layers": [(128, 64, 32)],
+    "activation":    ["relu", "gelu"],
+    "loss":          ["Huber", "mse"]
+}
 def _select_grid(js):
-    if js <= JS_SEV1_THRESH/3: return None
-    if js <= JS_SEV1_THRESH   : return param_grid_A
-    if js <= JS_SEV2_THRESH   : return param_grid_B
+    if js <= JS_SEV1_THRESH / 3:   return None
+    if js <= JS_SEV1_THRESH:       return param_grid_A
+    if js <= JS_SEV2_THRESH:       return param_grid_B
     return param_grid_C
 
 grid_cfg = _select_grid(JS)
 if grid_cfg is None:
-    print("[dynamic] JS below skip threshold → exit"); sys.exit(0)
+    print("[dynamic] JS below skip threshold → exit")
+    sys.exit(0)
 
 # ---------- 3. 载 scaler ----------
 buf = io.BytesIO(
@@ -84,12 +113,25 @@ with Timer("Dynamic_Retrain", "retrain"):
             print(f"[dynamic] ★ new best {best_loss:.4f} cfg={cfg}")
 
 # ---------- 6. 推送 artefacts ----------
-buf = io.BytesIO(); torch.save(best_state, buf); buf.seek(0)
+# 保存完整模型（而不是 state_dict）
+best_model = build_model(best_cfg, Xtr.shape[1])
+best_model.load_state_dict(best_state)
+
+buf = io.BytesIO()
+torch.save(best_model.eval().cpu(), buf)   # ① 直接 dump 模型对象
+buf.seek(0)
 save_bytes(f"{MODEL_DIR}/model.pt", buf.read())
+
+# 把 config 一并保存，便于将来回溯
 save_bytes(f"{MODEL_DIR}/last_model_config.json",
            json.dumps(best_cfg).encode(), "application/json")
 save_bytes(f"{MODEL_DIR}/last_update_utc.txt",
-           datetime.utcnow().isoformat()+"Z".encode())
+           (datetime.utcnow().isoformat() + "Z").encode())
+
+
+# ←—— 这里是修改点 ——→
+save_bytes(f"{MODEL_DIR}/last_update_utc.txt",
+           (datetime.utcnow().isoformat() + "Z").encode())
 
 log_metric(component="retrain", event="model_pushed")
 log_metric(component="retrain", event="model_update", value=round(best_loss,6))

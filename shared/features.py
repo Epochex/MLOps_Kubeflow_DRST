@@ -1,13 +1,16 @@
 # shared/features.py
-# 唯一“真理源”：datasets/random_rates.csv 的 60 个特征列
-import numpy as np, pandas as pd
+# ------------------------------------------------------------
+# “唯一真理源”：old_total.csv 决定 60 个特征列
+# ------------------------------------------------------------
+import numpy as np
 from .config         import DATA_DIR, TARGET_COL, EXCLUDE_COLS
-from .minio_helper   import load_csv     # ➜ 自动支持本地 / MinIO
-import os, io, json
+from .minio_helper   import load_csv
 
-SRC_KEY  = f"{DATA_DIR}/random_rates.csv"    # Producer 用的同一文件
+# 直接以旧版全量数据作为基准
+SRC_KEY  = f"{DATA_DIR}/old_total.csv"
+
 _df_src  = (
-    load_csv(SRC_KEY)                        # 先本地，再 MinIO
+    load_csv(SRC_KEY)
       .replace({'<not counted>': np.nan})
       .dropna()
 )
