@@ -47,10 +47,9 @@ proc   = psutil.Process()
 pred_orig_hist: List[float] = []
 pred_adj_hist : List[float] = []
 true_hist     : List[float] = []
-ts_hist       : List[str]   = []     
+ts_hist       : List[str]   = []
 
-
-# ---------- scaler / PCA / baseline --------------------------------------
+# ---------- scaler / PCA --------------------------------------------------
 with open(f"{local_out}/scaler.pkl", "wb") as f:
     f.write(_fetch("scaler.pkl"))
 scaler = joblib.load(f"{local_out}/scaler.pkl")
@@ -58,31 +57,39 @@ scaler = joblib.load(f"{local_out}/scaler.pkl")
 try:
     with open(f"{local_out}/pca.pkl", "wb") as f:
         f.write(_fetch("pca.pkl"))
-    pca = joblib.load(f"{local_out}/pca.pkl"); use_pca = True
+    pca = joblib.load(f"{local_out}/pca.pkl")
+    use_pca = True
 except Exception:
     pca, use_pca = None, False
 
-# -- baseline & adaptive 都是“完整模型对象” --
-baseline_model = torch.load(io.BytesIO(_fetch("baseline_model.pt")),
-                            map_location=device).eval()
-baseline_in_dim = baseline_model.net[0].in_features
+# ---------- 完整模型加载工具函数 ------------------------------------------
+def _load_full_model(key: str) -> tuple[nn.Module, bytes]:
+    """
+    从 MinIO 拉取 key 对应文件，确保它是完整 torch.save(model) 导出的 nn.Module。
+    如果收到 OrderedDict（state_dict），_bytes_to_model 会抛 TypeError。
+    返回 (model, raw_bytes)。
+    """
+    raw = _fetch(key)
+    model = _bytes_to_model(raw).to(device)  # _bytes_to_model 已经 .eval()
+    return model, raw
 
-curr_raw      = _fetch("model.pt")
-current_model = torch.load(io.BytesIO(curr_raw),
-                           map_location=device).eval()
+# ---------- baseline & adaptive 模型装载 ----------------------------------
+baseline_model, base_raw = _load_full_model("baseline_model.pt")
+baseline_in_dim          = baseline_model.net[0].in_features
 
+current_model, curr_raw  = _load_full_model("model.pt")
 print(f"[infer:{pod_name}] baseline in_features = {baseline_in_dim}")
 print(f"[infer:{pod_name}] adaptive model       = {current_model}")
 
 # —— 若 adaptive 权重“几乎空”，回退 baseline ——
 w_mean = current_model.net[0].weight.abs().mean().item()
-if w_mean < 1e-4:        # 阈值按需调整
-    print(f"[infer:{pod_name}] Detected un-trained adaptive "
-          f"( |w| mean={w_mean:.1e} ) → fallback to baseline")
+if w_mean < 1e-4:
+    print(f"[infer:{pod_name}] Detected un-trained adaptive (|w| mean={w_mean:.1e}) → fallback to baseline")
     current_model = baseline_model
 
 model_sig        = hashlib.md5(curr_raw).hexdigest()
 model_loading_ms = 0.0
+
 
 
 # ---------- 热重载 --------------------------------------------------------

@@ -13,77 +13,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def _fetch(key: str) -> bytes:
     return s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/{key}")["Body"].read()
 
+
 def _bytes_to_model(raw: bytes) -> nn.Module:
-    """
-    将一段 raw bytes（可能是 torch.save(model) 或 state_dict）反序列化为 nn.Module。
-    0) 如果直接存的是完整模型，立刻返回；
-    1) 否则当成 state_dict，依次尝试用 last_config → 自动推断 → baseline_config 重建。
-    """
-    # 0) load 之后如果本身就是 Module，就直接用
-    obj = torch.load(io.BytesIO(raw), map_location=device)
-    if isinstance(obj, nn.Module):
-        return obj.to(device).eval()
-
-    # 1) 否则把它当成 state_dict 来处理
-    state_dict = obj
-
-    # helper: 给定 cfg，构建 DynamicMLP 并尝试 load_state_dict
-    def try_with_cfg(cfg: dict) -> nn.Module | None:
-        if not cfg or "hidden_layers" not in cfg:
-            return None
-        mdl = DynamicMLP(
-            in_dim=input_dim,
-            hidden_layers=tuple(cfg["hidden_layers"]),
-            activation=cfg.get("activation", "relu")
-        )
-        try:
-            mdl.load_state_dict(state_dict)
-            return mdl.to(device).eval()
-        except RuntimeError:
-            return None
-
-    # 推断输入维度：找到 net.0.weight 的第二维
-    input_dim = next(
-        v.shape[1]
-        for k, v in state_dict.items()
-        if k.endswith(".weight") and "net.0" in k
-    )
-
-    # 2) 优先用 dynamic retrain 的最新配置
-    try:
-        cfg_raw = _fetch("last_model_config.json")
-        cfg = json.loads(cfg_raw.decode())
-        mdl = try_with_cfg(cfg)
-        if mdl is not None:
-            return mdl
-    except Exception:
-        pass
-
-    # 3) 保底：根据所有 weight 层的 out_features 推 hidden_layers
-    weight_layers = [w for k, w in state_dict.items() if k.endswith(".weight")]
-    hidden_layers_dyn = tuple(int(w.shape[0]) for w in weight_layers[:-1]) or (64,)
-    mdl_auto = DynamicMLP(input_dim, hidden_layers_dyn, "relu")
-    try:
-        mdl_auto.load_state_dict(state_dict)
-        return mdl_auto.to(device).eval()
-    except Exception:
-        pass
-
-    # 4) 再尝试 baseline 的配置
-    try:
-        cfg_raw = _fetch("baseline_model_config.json")
-        cfg = json.loads(cfg_raw.decode())
-        mdl = try_with_cfg(cfg)
-        if mdl is not None:
-            return mdl
-    except Exception:
-        pass
-
-    # 5) 最终兜底：直接返回 auto 重建的那个（一定能 load）
-    print("[utils] fallback to weight-based rebuild (final)")
-    mdl_auto.load_state_dict(state_dict)
-    return mdl_auto.to(device).eval()
-
+    return torch.load(io.BytesIO(raw), map_location=device).eval()
 
 
 # ---------- 评估 ---------------------------------------------------------
