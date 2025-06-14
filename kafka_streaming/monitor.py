@@ -28,12 +28,18 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 # ----------------------------------------------------------------------
 # 0. 全局 & 初始化
 # ----------------------------------------------------------------------
-WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))
+WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))   # JS 计算窗口
+RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))   # 喂给最新模型retrain 的样本数
 MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))  # 5 min
+
 metrics_buffer : list[dict] = []
 producer_done  = threading.Event()
 q: queue.Queue = queue.Queue()
-retrain_lock   = threading.Lock()          # baseline 更新 & retrain 互斥
+
+from collections import deque
+retrain_buf = deque(maxlen=RETRAIN_BATCH_SIZE)   
+
+retrain_lock   = threading.Lock()
 retrain_running = False
 
 # —— 预加载 baseline（离线训练分布）——
@@ -81,6 +87,9 @@ def _listener():
     os.makedirs("/mnt/pvc/results", exist_ok=True)
     open("/mnt/pvc/results/monitor_ready.flag", "w").close()
     print("[monitor] readiness flag touched")
+    # —— 以下为新增，同步一个空文件到 MinIO，Producer 可在 MinIO 上轮询
+    from shared.minio_helper import save_bytes
+    save_bytes(f"{RESULT_DIR}/monitor_ready.flag", b"", "text/plain")
 
     for msg in cons:
         v = msg.value
@@ -120,6 +129,9 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
     """
     global retrain_running, baseline_df
     try:
+        start_ts = time.time()
+        print(f"[monitor] retrain start at {datetime.utcnow().isoformat()}Z (JS={js_val:.4f})")
+
         # 1) Dump latest window for retrain process
         np.save("/mnt/pvc/latest_batch.npy", np.array(snapshot_rows, dtype=object))
         print("[monitor] latest_batch.npy saved")
@@ -138,7 +150,9 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
             df_add = pd.DataFrame([r["features"] for r in snapshot_rows])
             baseline_df = pd.concat([baseline_df, df_add], ignore_index=True)
             retrain_running = False
-        print("[monitor] retrain done & baseline updated")
+
+        elapsed = time.time() - start_ts
+        print(f"[monitor] retrain done at {datetime.utcnow().isoformat()}Z – elapsed {elapsed:.2f}s & baseline updated")
 
     except Exception as exc:
         print(f"[monitor] retrain thread error: {exc}")
@@ -163,7 +177,9 @@ while True:
         continue
 
     msg_count += 1
-    win_rows.append(item)
+    win_rows.append(item)  # js滑窗
+    retrain_buf.append(item)  # 用于 dynamic_retrain 缓存
+    
     if len(win_rows) > WINDOW_SIZE:
         win_rows.pop(0)
     if len(win_rows) < WINDOW_SIZE:
@@ -187,7 +203,7 @@ while True:
         and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
         last_retrain_ts = now
-        snapshot = win_rows.copy()   # 带 features + label
+        snapshot = list(retrain_buf)
 
         # severity
         if js_val > JS_SEV2_THRESH:
@@ -197,7 +213,7 @@ while True:
         else:
             severity = "1"
 
-        print(f"[monitor] retrain triggered → Severity-{severity}")
+        # print(f"[monitor] Begin:retrain triggered at msg={msg_count} → Severity-{severity} (JS={js_val:.4f})")
 
         threading.Thread(target=_bg_retrain,
                          args=(js_val, snapshot),

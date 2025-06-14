@@ -9,7 +9,7 @@ ml.train_offline.py - baseline MLP with PCA (bridge only)
 • 输出 scaler / pca / model.pt / 预测结果等
 """
 
-TRIGGER = 1  # 1 = 训练；0 = 跳过
+TRIGGER = 0  # 1 = 训练；0 = 跳过
 
 import sys, os, json, joblib, numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.optim import Adam
@@ -32,104 +32,99 @@ from ml.model import build_model
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 if TRIGGER == 0:
-    print("[offline] TRIGGER=0 → 跳过训练，下载已有 artefacts")
-    os.makedirs("/mnt/pvc/models", exist_ok=True)
-    os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
+    """
+    快速路径：跳过离线训练，仅下载已有 artefacts，并在 bridge/linear/dag1 上做准确率检查。
+    """
+    import shutil
+    from pathlib import Path
+    import joblib, torch, numpy as np
 
-    # 1) 下载预处理器 + 两个模型
-    for fname in ("scaler.pkl", "pca.pkl", "baseline_model.pt", "model.pt"):
-        raw = s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/{fname}")["Body"].read()
-        local = f"/mnt/pvc/models/{fname}"
-        with open(local, "wb") as f:
-            f.write(raw)
-        print(f"[offline] downloaded {fname} → {local}")
+    # 目录准备
+    model_dir_local  = Path("/mnt/pvc/models")
+    result_dir_local = Path(f"/mnt/pvc/{RESULT_DIR}")
+    model_dir_local.mkdir(parents=True, exist_ok=True)
+    result_dir_local.mkdir(parents=True, exist_ok=True)
 
-    # —— FIX：用 baseline_model 覆盖 model.pt，确保 adaptive 初始 = baseline ——  
-    shutil.copy("/mnt/pvc/models/baseline_model.pt",
-                "/mnt/pvc/models/model.pt")
-    print("[offline] copied baseline_model.pt ➜ model.pt (init adaptive)")
+    # 1) 下载 artefacts
+    artefacts = ["scaler.pkl", "pca.pkl", "baseline_model.pt", "model.pt"]
+    for fname in artefacts:
+        key = f"{MODEL_DIR}/{fname}"
+        print(f"[offline][SKIP] downloading {key} …")
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        local_path = model_dir_local / fname
+        with open(local_path, "wb") as f:
+            f.write(obj["Body"].read())
+        print(f"[offline][SKIP] saved → {local_path}")
 
-
-    # 2) 加载
-    scaler = joblib.load("/mnt/pvc/models/scaler.pkl")
-    pca    = joblib.load("/mnt/pvc/models/pca.pkl")
+    # 2) adaptive 初始 = baseline
+    shutil.copy(model_dir_local / "baseline_model.pt",
+                model_dir_local / "model.pt")
+    print("[offline][SKIP] copied baseline_model.pt → model.pt")
     
-    baseline_model = torch.load("/mnt/pvc/models/baseline_model.pt", map_location=device).eval()
-    adaptive_model = torch.load("/mnt/pvc/models/model.pt", map_location=device).eval()
+    with open(model_dir_local / "model.pt", "rb") as f:
+        save_bytes(f"{MODEL_DIR}/model.pt",
+                f.read(),
+                "application/octet-stream")
+    print("[offline][SKIP] uploaded model.pt to MinIO (baseline clone)")
 
-    # 3) 对齐函数（给 adaptive model 用）
-    def _align_adaptive_input(X_scaled: np.ndarray, model: nn.Module) -> np.ndarray:
-        in_dim = model.net[0].in_features
-        if X_scaled.shape[1] >= in_dim:
-            return X_scaled[:, :in_dim]
-        pad = np.zeros((X_scaled.shape[0], in_dim - X_scaled.shape[1]), dtype=np.float32)
-        return np.concatenate([X_scaled, pad], axis=1)
-
-    # —— 在 old_total.csv 上测两条线路的精度 ——  
-    df_tot = (load_csv(f"{DATA_DIR}/old_total.csv")
-              .replace({'<not counted>': np.nan})
-              .dropna())
-    df_tot.drop(columns=["input_rate","latency"], errors="ignore", inplace=True)
-    df_tot = df_tot.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
-
-    X_raw      = df_tot[FEATURE_COLS].astype(np.float32).values
-    y_true_tot = df_tot[TARGET_COL].astype(np.float32).values
-
-    # 3.1 PCA → baseline
-    X_scaled = scaler.transform(X_raw)
-    X_pca    = pca.transform(X_scaled).astype(np.float32)
-    with torch.no_grad():
-        y_base = baseline_model(torch.from_numpy(X_pca).to(device)).cpu().numpy()
-    acc_base_tot = calculate_accuracy_within_threshold(y_true_tot, y_base, 0.15)
-    print(f"[offline][SKIP] baseline@old_total acc = {acc_base_tot:.2f}%")
-    log_metric(component="offline", event="baseline_old_total_acc",
-               accuracy=round(acc_base_tot,2))
-
-    # 3.2 Scaler → adaptive
-    X_adpt = _align_adaptive_input(X_scaled, adaptive_model)
-    with torch.no_grad():
-        y_adpt = adaptive_model(torch.from_numpy(X_adpt).to(device)).cpu().numpy()
-    acc_adpt_tot = calculate_accuracy_within_threshold(y_true_tot, y_adpt, 0.15)
-    print(f"[offline][SKIP] adaptive@old_total acc = {acc_adpt_tot:.2f}%")
-    log_metric(component="offline", event="adaptive_old_total_acc",
-               accuracy=round(acc_adpt_tot,2))
-
-    # —— 在 old_dag-1.csv 上同样测试 ——  
+    # 3) 在 bridge/linear/dag1 上检查准确率
     try:
-        df_d1 = (load_csv(f"{DATA_DIR}/old_dag-1.csv")
-                 .replace({'<not counted>': np.nan})
-                 .dropna())
-        df_d1.drop(columns=["input_rate","latency"], errors="ignore", inplace=True)
-        df_d1 = df_d1.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
+        # 加载预处理器和模型
+        scaler = joblib.load(model_dir_local / "scaler.pkl")
+        pca    = joblib.load(model_dir_local / "pca.pkl")
+        baseline_model = torch.load(
+            model_dir_local / "baseline_model.pt",
+            map_location=device
+        ).eval()
 
-        X1_raw      = df_d1[FEATURE_COLS].astype(np.float32).values
-        y_true_d1   = df_d1[TARGET_COL].astype(np.float32).values
-        X1_scaled   = scaler.transform(X1_raw)
+        # 加载并清洗数据集
+        df_bridge = (load_csv(f"{DATA_DIR}/old_total.csv")
+                     .replace({'<not counted>': np.nan}).dropna())
+        df_linear = (load_csv(f"{DATA_DIR}/old_linear.csv")
+                     .replace({'<not counted>': np.nan}).dropna())
+        df_dag1   = (load_csv(f"{DATA_DIR}/old_dag-1.csv")
+                     .replace({'<not counted>': np.nan}).dropna())
 
-        # baseline
-        X1_pca      = pca.transform(X1_scaled).astype(np.float32)
-        with torch.no_grad():
-            y1_base = baseline_model(torch.from_numpy(X1_pca).to(device)).cpu().numpy()
-        acc1_base = calculate_accuracy_within_threshold(y_true_d1, y1_base, 0.15)
-        print(f"[offline][SKIP] baseline@old_dag1 acc = {acc1_base:.2f}%")
-        log_metric(component="offline", event="baseline_dag1_acc",
-                   accuracy=round(acc1_base,2))
+        # 丢弃不需要的列并重排
+        for df in (df_bridge, df_linear, df_dag1):
+            df.drop(columns=["input_rate", "latency"], errors="ignore", inplace=True)
+        df_bridge = df_bridge.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
+        df_linear = df_linear.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
+        df_dag1   = df_dag1.reindex(columns=FEATURE_COLS + [TARGET_COL], fill_value=0.0)
 
-        # adaptive
-        X1_adpt    = _align_adaptive_input(X1_scaled, adaptive_model)
-        with torch.no_grad():
-            y1_adpt = adaptive_model(torch.from_numpy(X1_adpt).to(device)).cpu().numpy()
-        acc1_adpt = calculate_accuracy_within_threshold(y_true_d1, y1_adpt, 0.15)
-        print(f"[offline][SKIP] adaptive@old_dag1 acc = {acc1_adpt:.2f}%")
-        log_metric(component="offline", event="adaptive_dag1_acc",
-                   accuracy=round(acc1_adpt,2))
+        # 打印样本数
+        print(f"[offline] bridge={len(df_bridge)}  linear={len(df_linear)}  dag1={len(df_dag1)}")
+
+        # 定义一个评估函数
+        def eval_acc(df, name):
+            X_raw = df[FEATURE_COLS].astype(np.float32).values
+            y_true = df[TARGET_COL].astype(np.float32).values
+            X_pca = pca.transform(scaler.transform(X_raw)).astype(np.float32)
+            with torch.no_grad():
+                y_pred = baseline_model(
+                    torch.from_numpy(X_pca).to(device)
+                ).cpu().numpy()
+            acc = calculate_accuracy_within_threshold(y_true, y_pred, 0.15)
+            print(f"[offline] {name}-test accuracy = {acc:.2f}%")
+            log_metric(component="offline",
+                       event=f"{name}_accuracy",
+                       accuracy=round(acc, 2))
+
+        # 评估 bridge 和 dag1
+        eval_acc(df_bridge, "bridge")
+        eval_acc(df_dag1,   "dag-1")
 
     except Exception as e:
-        print(f"[offline] old_dag-1 accuracy calc failed: {e}")
+        print(f"[offline][SKIP] accuracy check failed: {e}")
 
-    # 最后打个 skip_train
+    # 4) 记录并退出
     log_metric(component="offline", event="skip_train")
+    os.makedirs("/tmp/kfp_outputs", exist_ok=True)
+    open("/tmp/kfp_outputs/output_metadata.json", "w").write("{}")
+
+    print("[offline][SKIP] artefacts ready, training skipped – bye.")
     sys.exit(0)
+# ----------------------------------------------------------------------
 
 # ─── 1. 读取 & 清洗 ──────────────────────────────────────────────
 def _read_clean(rel_path: str) -> pd.DataFrame:          # <<< 修改：提炼公共函数

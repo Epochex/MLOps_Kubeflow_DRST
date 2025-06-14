@@ -139,6 +139,14 @@ def _listener():
     open(flag, "w").close()
     print(f"[infer:{pod_name}] readiness flag → {flag}")
 
+    # —— 新增：把这个就绪标记也上传到 MinIO，供 Producer 轮询使用
+    from shared.minio_helper import save_bytes
+    save_bytes(
+        f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
+        b"",                    # 空文件
+        "text/plain"
+    )
+
     for msg in cons:
         v = msg.value
         if v.get("producer_done"):
@@ -183,17 +191,40 @@ def _align_adaptive_input(X_scaled: np.ndarray, model: nn.Module) -> np.ndarray:
         print(f"[infer:{pod_name}] DEBUG ②  aligned input **ALL ZERO** !")
     return X_aligned
 
+def _align_to_dim(X_scaled: np.ndarray, in_dim: int) -> np.ndarray:
+    """
+    把 60-维 Scaler 特征裁剪/补零到目标 in_dim。
+    """
+    if in_dim == X_scaled.shape[1]:
+        return X_scaled
+    elif in_dim < X_scaled.shape[1]:
+        return X_scaled[:, :in_dim]          # 截断
+    else:
+        pad = np.zeros((X_scaled.shape[0], in_dim - X_scaled.shape[1]),
+                       dtype=np.float32)
+        return np.concatenate([X_scaled, pad], axis=1)
 
-# ---------- 主循环 --------------------------------------------------------
+
+def _make_input(model: nn.Module, X_scaled: np.ndarray) -> np.ndarray:
+    """
+    根据 **模型首层 in_features** 自动决定：
+        • 用 PCA 特征       —— 若 in_dim == pca.n_components_
+        • 用 Scaler 特征对齐 —— 否则
+    这样无论 adaptive 模型是 6-维（PCA）还是 60-维（全特征）都能喂对输入。
+    """
+    in_dim = model.net[0].in_features
+    if use_pca and in_dim == pca.n_components_:
+        return pca.transform(X_scaled).astype(np.float32)
+    return _align_to_dim(X_scaled, in_dim)
+
+# ---------------------------  主循环  ------------------------------------
 first_batch     = True
 container_start = time.perf_counter()
 IDLE_TIMEOUT_S  = 180
 last_data_time  = time.time()
 msg_total       = 0
-
-# —— 新增：累计正确样本数 & 总样本数 ——  
-correct_count = 0
-total_count   = 0
+correct_count   = 0
+total_count     = 0
 
 print(f"[infer:{pod_name}] consumer started…")
 
@@ -216,11 +247,11 @@ while True:
                    cold_start_ms=round(cold_ms, 3))
         first_batch = False
 
-    # 1) Extraction
+    # 1) Extraction --------------------------------------------------------
     with Timer("Extraction", "infer"):
         rows_batch = list(batch)
 
-    # 2) Preprocessing
+    # 2) Preprocessing -----------------------------------------------------
     with Timer("Preprocessing", "infer"):
         X_raw = np.array(
             [[r["features"].get(c, 0.0) for c in FEATURE_COLS]
@@ -228,8 +259,12 @@ while True:
             np.float32
         )
         X_scaled = scaler.transform(X_raw)
-        X_base   = pca.transform(X_scaled) if use_pca else X_scaled[:, :baseline_in_dim]
-        X_adpt   = _align_adaptive_input(X_scaled, current_model)
+
+        # baseline 一直走 PCA → in_dim == baseline_in_dim
+        X_base = pca.transform(X_scaled).astype(np.float32)       # (N, 6)
+
+        # adaptive 根据当前模型 in_features 自适应选择 PCA or Scaler
+        X_adpt = _make_input(current_model, X_scaled)
 
     # 3) Inference
     cpu0, t0 = proc.cpu_times(), time.perf_counter()

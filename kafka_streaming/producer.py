@@ -82,16 +82,32 @@ def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
 def main():
     print("[producer] start …")
 
-    # —— 等消费者 ——  
+    # —— 等 monitor 写入 MinIO readiness flag ——  
+    key = f"{RESULT_DIR}/monitor_ready.flag"
+    print(f"[producer] polling MinIO for {key} …")
+    while True:
+        try:
+            s3.head_object(Bucket=BUCKET, Key=key)
+            break
+        except:
+            time.sleep(1)
+    print("[producer] monitor ready → start producing")
+
+    # —— 等consumer 在 MinIO 上写好就绪标记 ——  
     num_consumers = int(os.getenv("NUM_CONSUMERS", "3"))
     timeout       = int(os.getenv("CONSUMER_WAIT_TIMEOUT", "60"))
-    flag_glob     = f"/mnt/pvc/{RESULT_DIR}/consumer_ready_*.flag"
+    prefix        = f"{RESULT_DIR}/consumer_ready_"
+    print(f"[producer] polling MinIO for {prefix}*.flag …")
     t0 = time.time()
-    print(f"[producer] waiting {num_consumers} consumers …")
+    ready_count = 0
     while time.time() - t0 < timeout:
-        if len(glob.glob(flag_glob)) >= num_consumers:
+        resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+        contents = resp.get("Contents", [])
+        ready_count = len([o for o in contents if o["Key"].endswith(".flag")])
+        if ready_count >= num_consumers:
             break
         time.sleep(1)
+    print(f"[producer] detected {ready_count}/{num_consumers} consumers ready → continue")
 
     # —— KafkaProducer ——  
     prod = KafkaProducer(
