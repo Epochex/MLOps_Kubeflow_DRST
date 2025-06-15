@@ -26,9 +26,9 @@ from shared.minio_helper  import load_csv, save_bytes
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 # 0. 全局 & 初始化
-WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))
+WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "100"))
 RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))
-MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))
+MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "3"))  # retrain冷却时间
 
 TMP_DIR        = "/tmp/monitor"        # ← 不再用 PVC
 os.makedirs(TMP_DIR, exist_ok=True)

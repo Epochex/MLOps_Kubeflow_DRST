@@ -190,6 +190,10 @@ print(f"[offline] random(500) accuracy = {acc_rand:.2f}%")
 log_metric(component="offline", event="bridge_accuracy", accuracy=round(acc_bridge, 2))
 log_metric(component="offline", event="random_accuracy", accuracy=round(acc_rand, 2))
 
+# ---------- 4. 评估完成后，把 acc 写进模型本体 ----------
+# 这里用 random_rates 子集的 acc 作为“通用基准”
+model._val_acc15 = float(acc_rand)  
+
 # 5) 保存 artefacts & 上传 MinIO
 local_scaler = f"{TMP_DIR}/scaler.pkl"
 local_pca    = f"{TMP_DIR}/pca.pkl"

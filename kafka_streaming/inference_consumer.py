@@ -94,48 +94,55 @@ model_loading_ms = 0.0
 
 
 # ---------- 热重载 --------------------------------------------------------
+# ---------- 热重载 --------------------------------------------------------
+GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.05"))  # ≥0.5 个百分点就换
+
 def _reload_model(force: bool = False):
-    """拉取 latest.txt 指向的新模型；不存在就安静返回。"""
+    """
+    只有当 new_acc - baseline_acc ≥ GAIN_THR_PP (百分点) 才切换；
+    force=True（退出前最后一次）则无条件加载。
+    """
     global current_model, curr_raw, model_sig, model_loading_ms
 
-    # 1) 没有 latest.txt 说明还没重训过 → 直接退出
     try:
-        latest_raw = _fetch("latest.txt")        # models/latest.txt
+        latest_raw = _fetch("latest.txt")           # models/latest.txt
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
-            return                               # 首次启动的正常情况
-        raise                                    # 其它异常继续抛
+            return
+        raise
 
-    # 2) 解析 latest.txt
     model_key, metrics_key = latest_raw.decode().strip().splitlines()
-
-    # 3) 如果版本没变且不是强制刷新，就不加载
     raw = _fetch(model_key)
     sig = hashlib.md5(raw).hexdigest()
+
     if not force and sig == model_sig:
+        return                                      # same version
+
+    metrics   = json.loads(_fetch(metrics_key).decode())
+    new_acc   = metrics.get("acc@0.15", 0.0)
+    base_acc  = metrics.get("baseline_acc@0.15", 0.0)
+    gain_pp   = new_acc - base_acc                 # 单位：百分点
+
+    if not force and gain_pp < GAIN_THR_PP:
+        print(f"[infer:{pod_name}] Δ{gain_pp:+.2f} pp < {GAIN_THR_PP} → skip")
         return
 
-    # 4) 读取验证集指标，只有当新模型 **明显更好** 才切换
-    metrics = json.loads(_fetch(metrics_key).decode())
-    new_acc = metrics.get("acc@0.15", 0.0)                      # ← 指标名统一
-    old_acc = getattr(current_model, "_val_acc15", 0.0)
-    if not force and (new_acc - old_acc) < MODEL_IMPROVE_EPS:
-        print(f"[infer:{pod_name}] new acc={new_acc:.2f} ≤ old "
-              f"{old_acc:.2f}+{MODEL_IMPROVE_EPS} → skip")
-        return
-
-    # 5) 真正热加载
     t0 = time.perf_counter()
     mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
     current_model = mdl
-    current_model._val_acc15 = new_acc              # 记录基准
+    current_model._val_acc15 = new_acc
     curr_raw, model_sig = raw, sig
     model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
 
     log_metric(component="infer", event="hot_reload_runtime",
                model_loading_ms=model_loading_ms)
-    print(f"[infer:{pod_name}] hot-reloaded → acc@0.15={new_acc:.2f}  "
-          f"load={model_loading_ms} ms")
+    print(f"[infer:{pod_name}] hot-reloaded ✓  "
+          f"baseline={base_acc:.2f} → new={new_acc:.2f}  "
+          f"(Δ{gain_pp:+.2f} pp)  load={model_loading_ms} ms")
+
+def hot_reload():
+    """异步触发热重载，不阻塞主推理循环。"""
+    threading.Thread(target=_reload_model, daemon=True).start()
 
 
 

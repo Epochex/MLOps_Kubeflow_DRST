@@ -2,11 +2,7 @@
 """
 ml.plot_report.py ─ Phase-1 / 2 / 3 对比图（定制版）
 ──────────────────────────────────────────────────────────────
-• draw_three_phases():
-  - 注入点固定为样本序号 400
-  - 保留注入前 100 点和注入后 700 点，共 800 点窗口
-  - 丢弃真实值 output < 500 的样本
-  - 绘制 Baseline / Adaptive / Real 三条曲线及垂直参考线与 Phase 标签
+
 """
 
 import numpy as np
@@ -64,7 +60,7 @@ def draw_three_phases(
     y_adp = y_pred_adp[lo:hi]
 
     # 丢弃真实值小于 500 的样本
-    mask = (y_true >= 500)
+    mask = (y_true >= 600)
     y_true = y_true[mask]
     y_bls = y_bls[mask]
     y_adp = y_adp[mask]
