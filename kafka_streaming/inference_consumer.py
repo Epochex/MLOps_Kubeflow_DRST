@@ -31,12 +31,19 @@ from shared.config        import (
 from shared.features      import FEATURE_COLS
 from ml.model             import DynamicMLP, build_model
 
+from botocore.exceptions import ClientError     
+
 
 # ---------- 常量 ----------------------------------------------------------
+MODEL_IMPROVE_EPS = float(os.getenv("MODEL_IMPROVE_EPS", "1.0"))  # %
+
+
 done_flag = f"/mnt/pvc/{RESULT_DIR}/producer_done.flag"
 pod_name  = os.getenv("HOSTNAME", "infer")
 local_out = f"/mnt/pvc/{RESULT_DIR}/{pod_name}"
 os.makedirs(local_out, exist_ok=True)
+
+
 
 correct_count = 0
 total_count   = 0
@@ -78,14 +85,12 @@ baseline_model, base_raw = _load_full_model("baseline_model.pt")
 baseline_in_dim          = baseline_model.net[0].in_features
 
 current_model, curr_raw  = _load_full_model("model.pt")
+
+current_model._val_acc15 = 0.0          # 初始基线
+
 print(f"[infer:{pod_name}] baseline in_features = {baseline_in_dim}")
 print(f"[infer:{pod_name}] adaptive model       = {current_model}")
 
-# —— 若 adaptive 权重“几乎空”，回退 baseline ——
-w_mean = current_model.net[0].weight.abs().mean().item()
-if w_mean < 1e-4:
-    print(f"[infer:{pod_name}] Detected un-trained adaptive (|w| mean={w_mean:.1e}) → fallback to baseline")
-    current_model = baseline_model
 
 model_sig        = hashlib.md5(curr_raw).hexdigest()
 model_loading_ms = 0.0
@@ -94,26 +99,47 @@ model_loading_ms = 0.0
 
 # ---------- 热重载 --------------------------------------------------------
 def _reload_model(force: bool = False):
+    """拉取 latest.txt 指向的新模型；不存在就安静返回。"""
     global current_model, curr_raw, model_sig, model_loading_ms
 
-    raw = _fetch("model.pt"); sig = hashlib.md5(raw).hexdigest()
+    # 1) 没有 latest.txt 说明还没重训过 → 直接退出
+    try:
+        latest_raw = _fetch("latest.txt")        # models/latest.txt
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return                               # 首次启动的正常情况
+        raise                                    # 其它异常继续抛
+
+    # 2) 解析 latest.txt
+    model_key, metrics_key = latest_raw.decode().strip().splitlines()
+
+    # 3) 如果版本没变且不是强制刷新，就不加载
+    raw = _fetch(model_key)
+    sig = hashlib.md5(raw).hexdigest()
     if not force and sig == model_sig:
         return
 
+    # 4) 读取验证集指标，只有当新模型 **明显更好** 才切换
+    metrics = json.loads(_fetch(metrics_key).decode())
+    new_acc = metrics.get("acc@0.15", 0.0)                      # ← 指标名统一
+    old_acc = getattr(current_model, "_val_acc15", 0.0)
+    if not force and (new_acc - old_acc) < MODEL_IMPROVE_EPS:
+        print(f"[infer:{pod_name}] new acc={new_acc:.2f} ≤ old "
+              f"{old_acc:.2f}+{MODEL_IMPROVE_EPS} → skip")
+        return
+
+    # 5) 真正热加载
     t0 = time.perf_counter()
     mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
-
-    # 健康检查
-    if mdl.net[0].weight.abs().mean().item() < 1e-4:
-        print(f"[infer:{pod_name}] hot-reload found un-trained model → ignore")
-        return                      # 不更新
-
     current_model = mdl
-    model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
+    current_model._val_acc15 = new_acc              # 记录基准
     curr_raw, model_sig = raw, sig
+    model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
+
     log_metric(component="infer", event="hot_reload_runtime",
                model_loading_ms=model_loading_ms)
-    print(f"[infer:{pod_name}] hot-reloaded OK, load={model_loading_ms} ms")
+    print(f"[infer:{pod_name}] hot-reloaded → acc@0.15={new_acc:.2f}  "
+          f"load={model_loading_ms} ms")
 
 
 

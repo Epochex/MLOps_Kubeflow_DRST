@@ -10,7 +10,7 @@ ml.train_offline.py - baseline MLP with PCA (bridge only)
 """
 
 TRIGGER = 0  # 1 = 训练；0 = 跳过
-
+import io
 import sys, os, json, joblib, numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -116,6 +116,35 @@ if TRIGGER == 0:
 
     except Exception as e:
         print(f"[offline][SKIP] accuracy check failed: {e}")
+        
+    # ---------- 额外生成 bridge_true.npy / bridge_pred.npy ----------
+    try:
+        print("[offline][SKIP] dumping bridge artefacts …")
+        Xb_raw = df_bridge[FEATURE_COLS].astype(np.float32).values
+        yb_true = df_bridge[TARGET_COL].astype(np.float32).values
+        Xb_pca  = pca.transform(scaler.transform(Xb_raw)).astype(np.float32)
+
+        with torch.no_grad():
+            yb_pred = baseline_model(
+                torch.from_numpy(Xb_pca).to(device)
+            ).cpu().numpy()
+
+        # 本地 PVC
+        os.makedirs(f"/mnt/pvc/{RESULT_DIR}", exist_ok=True)
+        np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_true.npy", yb_true)
+        np.save(f"/mnt/pvc/{RESULT_DIR}/bridge_pred.npy", yb_pred)
+
+        # 上传 MinIO
+        for fn, arr in (("bridge_true.npy", yb_true),
+                        ("bridge_pred.npy", yb_pred)):
+            buf = io.BytesIO(); np.save(buf, arr); buf.seek(0)
+            save_bytes(f"{RESULT_DIR}/{fn}", buf.read(), "application/npy")
+
+        print("[offline][SKIP] bridge artefacts generated & uploaded")
+    except Exception as e:
+        print(f"[offline][SKIP] ❌ failed to dump bridge artefacts: {e}")
+
+        
 
     # 4) 记录并退出
     log_metric(component="offline", event="skip_train")
