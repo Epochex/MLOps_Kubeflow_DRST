@@ -49,11 +49,17 @@ np.save(cumu_path, np.array(all_seen, dtype=object))
 # ── 3. 采样：最近 N + 少量 baseline ─────────────────────────
 RECENT_N = int(os.getenv("RETRAIN_RECENT_N", "1500"))
 recent_rows = latest_rows[-RECENT_N:]
+
 # 混入 10% baseline 保证不过拟合新分布
 baseline_sample = []
 if all_seen:
-    k = max(1, int(0.1 * RECENT_N))
+    # 希望抽取的目标数量
+    k_target = max(1, int(0.1 * RECENT_N))
+    # 关键修复：实际抽取数不能超过已有样本数
+    k = min(k_target, len(all_seen))
     baseline_sample = list(np.random.choice(all_seen, size=k, replace=False))
+
+# 合并成最终训练集
 all_rows = recent_rows + baseline_sample
 
 # ── 4. 加载 scaler & PCA（保证 6-维输入） ─────────────────────
