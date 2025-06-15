@@ -33,20 +33,16 @@ from ml.model             import DynamicMLP, build_model
 
 from botocore.exceptions import ClientError     
 
-
-# ---------- 常量 ----------------------------------------------------------
+# ---------- 常量 & 本地路径 ---------------------------------------------
 MODEL_IMPROVE_EPS = float(os.getenv("MODEL_IMPROVE_EPS", "1.0"))  # %
 
+TMP_DIR  = "/tmp/infer"                     # ← 改用 /tmp
+os.makedirs(TMP_DIR, exist_ok=True)
 
-done_flag = f"/mnt/pvc/{RESULT_DIR}/producer_done.flag"
-pod_name  = os.getenv("HOSTNAME", "infer")
-local_out = f"/mnt/pvc/{RESULT_DIR}/{pod_name}"
+pod_name = os.getenv("HOSTNAME", "infer")   # k8s 容器名
+
+local_out = os.path.join(TMP_DIR, pod_name) # 每个 consumer 独立目录
 os.makedirs(local_out, exist_ok=True)
-
-
-
-correct_count = 0
-total_count   = 0
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 proc   = psutil.Process()
@@ -161,22 +157,20 @@ def _listener():
         enable_auto_commit=ENABLE_AUTO_COMMIT,
         value_deserializer=lambda m: json.loads(m.decode()),
     )
-    flag = f"/mnt/pvc/{RESULT_DIR}/consumer_ready_{pod_name}.flag"
-    open(flag, "w").close()
-    print(f"[infer:{pod_name}] readiness flag → {flag}")
 
-    # —— 新增：把这个就绪标记也上传到 MinIO，供 Producer 轮询使用
-    from shared.minio_helper import save_bytes
-    save_bytes(
-        f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
-        b"",                    # 空文件
-        "text/plain"
-    )
+    # readiness flag：/tmp + MinIO
+    flag_local = os.path.join(TMP_DIR, f"consumer_ready_{pod_name}.flag")
+    open(flag_local, "w").close()
+    print(f"[infer:{pod_name}] readiness flag →", flag_local)
+
+    save_bytes(f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
+               b"", "text/plain")
 
     for msg in cons:
         v = msg.value
         if v.get("producer_done"):
-            producer_done.set(); continue
+            producer_done.set()
+            continue
         v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
         q.put(v)
 
@@ -260,11 +254,13 @@ while True:
 
     if not batch:
         hot_reload()
-        if os.path.exists(done_flag) or (now - last_data_time) > IDLE_TIMEOUT_S:
+        # 若已收到 producer_done 或长时间无数据则结束
+        if producer_done.is_set() or (now - last_data_time) > IDLE_TIMEOUT_S:
             _reload_model(force=True)
             break
         time.sleep(0.3)
         continue
+
 
     last_data_time = now
     if first_batch:
@@ -404,16 +400,15 @@ print(f"[infer:{pod_name}] TOTAL processed {msg_total} samples, exit")
 # ---------- 收尾：保存完整 trace 并上传 ----------------------------------
 print(f"[infer:{pod_name}] TOTAL processed {msg_total} samples, exit")
 
-# ★★★ 新增：把 send_ts 转成 epoch 秒，与预测一起保存 ★★★
 arr_adj   = np.asarray(pred_adj_hist , np.float32)
 arr_orig  = np.asarray(pred_orig_hist, np.float32)
 arr_true  = np.asarray(true_hist     , np.float32)
 arr_ts    = np.asarray([
-    datetime.fromisoformat(t.rstrip("Z")).timestamp()  # iso → epoch
+    datetime.fromisoformat(t.rstrip("Z")).timestamp()
     for t in ts_hist
 ], np.float64)
 
-npz_local = f"{local_out}/inference_trace.npz"
+npz_local = os.path.join(local_out, "inference_trace.npz")
 np.savez(npz_local,
          ts=arr_ts,
          pred_adj=arr_adj,
@@ -425,6 +420,6 @@ with open(npz_local, "rb") as f:
                f.read(), "application/octet-stream")
 print(f"[infer:{pod_name}] trace npz saved – total {len(arr_true)} samples")
 
-# 同步全局 metrics（保持不变）
 sync_all_metrics_to_minio()
 print(f"[infer:{pod_name}] all metrics synced, exiting.")
+

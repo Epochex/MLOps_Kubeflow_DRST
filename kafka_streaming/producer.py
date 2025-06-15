@@ -20,19 +20,41 @@ from shared.config       import (
 from shared.features      import FEATURE_COLS
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
+
+
 # ---------- 发送节奏 ----------
 SLEEP = float(os.getenv("MSG_SLEEP", "0.1"))
 LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
 LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
 
+# STAGES = [
+#     ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
+#     ("Phase-2", f"{DATA_DIR}/old_dag-1.csv", LIM2),
+#     ("Phase-3", f"{DATA_DIR}/old_dag-1.csv", LIM3),
+# ]
+
+# STAGES = [
+#     ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
+#     ("Phase-2", f"datasets/random_rates.csv", LIM2),
+#     ("Phase-3", f"datasets/random_rates.csv", LIM3),
+# ]
+
 STAGES = [
     ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
-    ("Phase-2", f"{DATA_DIR}/old_dag-1.csv", LIM2),
-    ("Phase-3", f"{DATA_DIR}/old_dag-1.csv", LIM3),
+    ("Phase-2", f"datasets/random_rates.csv", LIM2),
+    ("Phase-3", f"datasets/random_rates.csv", LIM3),
 ]
 
-_START = datetime.datetime.utcnow()
+# ---------- 本地缓存 & 时间戳 ----------
+TMP_DIR = "/tmp/producer"             # ← 全面改用 /tmp
+os.makedirs(TMP_DIR, exist_ok=True)
+
+_START = datetime.datetime.utcnow()   # 保留原来的启动时间
+
+# producer_done 本地标记（只给本进程参考）
+FLAG_DONE_LOCAL = os.path.join(TMP_DIR, "producer_done.flag")
+
 
 # ---------- Helper ----------
 def _ensure_local(rel_path: str) -> str:
@@ -125,32 +147,46 @@ def main():
         if limit:
             df = df.iloc[:limit]
         send_df(df, prod, phase)
-
     # —— sentinel ——  
     sentinel = {
         "producer_done": True,
         "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
     }
     for _ in range(num_consumers):
-        prod.send(KAFKA_TOPIC,
-                  key=os.urandom(4),   # ★ 同样带 key，避免全部去同一分区
-                  value=sentinel)
-    prod.flush(); prod.close()
-    open(f"/mnt/pvc/{RESULT_DIR}/producer_done.flag", "w").close()
+        prod.send(
+            KAFKA_TOPIC,
+            key=os.urandom(4),              # 保持随机 key
+            value=sentinel
+        )
+    prod.flush()
+    prod.close()
+
+    # ① 本地 /tmp 写一个标记文件（可选，仅供诊断）
+    open(FLAG_DONE_LOCAL, "w").close()
+
+    # ② 上传 MinIO，让 Monitor / Inference 通过 MinIO 同步
+    save_bytes(f"{RESULT_DIR}/producer_done.flag", b"", "text/plain")
     print(f"[producer] sent {num_consumers} producer_done signals")
 
     # —— timing & metrics ——  
-    timing_dir = os.path.join("/mnt/pvc", RESULT_DIR, "timing")
+    timing_dir = os.path.join(TMP_DIR, "timing")
     os.makedirs(timing_dir, exist_ok=True)
-    with open(os.path.join(timing_dir, "producer.json"), "w") as fp:
+    local_json = os.path.join(timing_dir, "producer.json")
+    with open(local_json, "w") as fp:
         json.dump({
             "component":   "producer",
             "start_utc":   _START.isoformat() + "Z",
             "end_utc":     datetime.datetime.utcnow().isoformat() + "Z",
-            "elapsed_sec": round((datetime.datetime.utcnow() - _START).total_seconds(), 3)
+            "elapsed_sec": round(
+                (datetime.datetime.utcnow() - _START).total_seconds(), 3
+            )
         }, fp, indent=2)
-    with open(os.path.join(timing_dir, "producer.json"), "rb") as fp:
-        save_bytes(f"{RESULT_DIR}/timing/producer.json", fp.read(), "application/json")
+
+    # 上传 timing 到 MinIO
+    with open(local_json, "rb") as fp:
+        save_bytes(f"{RESULT_DIR}/timing/producer.json",
+                   fp.read(), "application/json")
+
     sync_all_metrics_to_minio()
 
     # —— KFP metadata 占位 ——  
@@ -158,6 +194,7 @@ def main():
     open("/tmp/kfp_outputs/output_metadata.json", "w").write("{}")
 
     print("[producer] ALL done.")
+
 
 if __name__ == "__main__":
     main()

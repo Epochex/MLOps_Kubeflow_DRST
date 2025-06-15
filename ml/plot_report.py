@@ -54,9 +54,9 @@ def draw_three_phases(
     y_pred_adp = np.concatenate([bridge_pred, dag_pred_adj])
 
     # 定义注入点和窗口范围
-    inject_idx = 400
-    lo = inject_idx - 100
-    hi = inject_idx + 700
+    inject_idx = 500
+    lo = inject_idx + 1100
+    hi = inject_idx + 1400
 
     # 窗口切片
     y_true = y_true_all[lo:hi]

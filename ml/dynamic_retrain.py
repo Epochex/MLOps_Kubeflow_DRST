@@ -25,16 +25,28 @@ from ml.model            import build_model
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 from shared.profiler     import Timer
 
+import time
+start_ts = time.time()
+
 # 1. 当前漂移值（由 monitor.py 传参）
 JS = float(sys.argv[1])
 
-# ── 2. 合并累计样本 ────────────────────────────────────────
-latest_rows = np.load("/mnt/pvc/latest_batch.npy", allow_pickle=True).tolist()
-cumu_path   = "/mnt/pvc/all_seen.npy"
+# ── 2. 从本地临时盘读取最新窗口 & 定位累积文件 ────────────────────────────
+import os
+
+# Monitor 写入的本地文件
+latest_path = "/tmp/monitor/latest_batch.npy"
+if not os.path.exists(latest_path):
+    raise FileNotFoundError(f"latest batch not found: {latest_path}")
+latest_rows = np.load(latest_path, allow_pickle=True).tolist()
+
+# 本地累积也放到同一路径
+cumu_path = "/tmp/monitor/all_seen.npy"
 if os.path.exists(cumu_path):
     all_seen = np.load(cumu_path, allow_pickle=True).tolist()
 else:
     all_seen = []
+
 
 def _row_key(r):
     feats = tuple(r["features"][c] for c in FEATURE_COLS)
@@ -226,4 +238,9 @@ log_metric(component="retrain", event="model_pushed")
 log_metric(component="retrain", event="model_update", value=round(best_loss,6))
 sync_all_metrics_to_minio()
 
-print(f"[dynamic] retrain done | JS={JS:.4f} | loss={best_loss:.6f} | cfg={best_cfg}")
+elapsed = time.time() - start_ts
+print(
+    f"[dynamic] retrain done | JS={JS:.4f} | "
+    f"loss={best_loss:.6f} | cfg={best_cfg} | "
+    f"elapsed={elapsed:.2f}s"
+)

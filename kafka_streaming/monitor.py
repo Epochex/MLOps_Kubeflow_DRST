@@ -25,21 +25,22 @@ from shared.features      import FEATURE_COLS
 from shared.minio_helper  import load_csv, save_bytes
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
-# ----------------------------------------------------------------------
 # 0. 全局 & 初始化
-# ----------------------------------------------------------------------
-WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))   # JS 计算窗口
-RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))   # 喂给最新模型retrain 的样本数
-MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))  # 5 min
+WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "50"))
+RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))
+MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "300"))
+
+TMP_DIR        = "/tmp/monitor"        # ← 不再用 PVC
+os.makedirs(TMP_DIR, exist_ok=True)
 
 metrics_buffer : list[dict] = []
 producer_done  = threading.Event()
 q: queue.Queue = queue.Queue()
 
 from collections import deque
-retrain_buf = deque(maxlen=RETRAIN_BATCH_SIZE)   
+retrain_buf = deque(maxlen=RETRAIN_BATCH_SIZE)
 
-retrain_lock   = threading.Lock()
+retrain_lock    = threading.Lock()
 retrain_running = False
 
 # —— 预加载 baseline（离线训练分布）——
@@ -75,6 +76,9 @@ def _sys_metrics() -> dict:
 # ----------------------------------------------------------------------
 # 2. Kafka 监听线程
 # ----------------------------------------------------------------------
+TMP_DIR = "/tmp/monitor"                # ← 改用 /tmp 做临时存储
+os.makedirs(TMP_DIR, exist_ok=True)
+
 def _listener():
     cons = KafkaConsumer(
         KAFKA_TOPIC,
@@ -84,17 +88,20 @@ def _listener():
         enable_auto_commit=ENABLE_AUTO_COMMIT,
         value_deserializer=lambda m: json.loads(m.decode()),
     )
-    os.makedirs("/mnt/pvc/results", exist_ok=True)
-    open("/mnt/pvc/results/monitor_ready.flag", "w").close()
-    print("[monitor] readiness flag touched")
-    # —— 以下为新增，同步一个空文件到 MinIO，Producer 可在 MinIO 上轮询
+
+    # —— readiness flag：本地 /tmp + MinIO ————————————————
+    flag_local = os.path.join(TMP_DIR, "monitor_ready.flag")
+    open(flag_local, "w").close()
+    print("[monitor] readiness flag touched →", flag_local)
+
     from shared.minio_helper import save_bytes
     save_bytes(f"{RESULT_DIR}/monitor_ready.flag", b"", "text/plain")
 
     for msg in cons:
         v = msg.value
         if v.get("producer_done"):
-            producer_done.set(); continue
+            producer_done.set()
+            continue
         q.put(v)
 
 threading.Thread(target=_listener, daemon=True).start()
@@ -123,24 +130,25 @@ def _avg_js(df: pd.DataFrame) -> float:
 # ----------------------------------------------------------------------
 def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
     """
-    ① 把当前窗口写入 latest_batch.npy（供 dynamic_retrain）
-    ② 调 dynamic_retrain（同步等待）
+    ① 把当前窗口写入 /tmp/monitor/latest_batch.npy（供 dynamic_retrain）
+    ② 同步调用 dynamic_retrain
     ③ 扩充 baseline_df
     """
     global retrain_running, baseline_df
     try:
         start_ts = time.time()
-        print(f"[monitor] retrain start at {datetime.utcnow().isoformat()}Z (JS={js_val:.4f})")
+        print(f"[monitor] retrain start (JS={js_val:.4f})")
 
-        # 1) Dump latest window for retrain process
-        np.save("/mnt/pvc/latest_batch.npy", np.array(snapshot_rows, dtype=object))
-        print("[monitor] latest_batch.npy saved")
+        # 1) Dump 最新窗口到本地临时目录
+        local_np = os.path.join(TMP_DIR, "latest_batch.npy")
+        np.save(local_np, np.array(snapshot_rows, dtype=object))
+        print(f"[monitor] latest_batch.npy saved → {local_np}")
 
-        # 2) 同步调用 retrain 子进程
+        # 2) 同步调用 retrain 子进程（dynamic_retrain 会直接读本地这个文件）
         with retrain_lock:
             retrain_running = True
         cmd = ["python", "-m", "ml.dynamic_retrain", f"{js_val:.4f}"]
-        print(f"[monitor] ➜ exec: {' '.join(cmd)}")
+        print("[monitor] ➜ exec:", " ".join(cmd))
         ret = subprocess.call(cmd)
         if ret != 0:
             print(f"[monitor] retrain exit code = {ret}")
@@ -152,7 +160,7 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
             retrain_running = False
 
         elapsed = time.time() - start_ts
-        print(f"[monitor] retrain done at {datetime.utcnow().isoformat()}Z – elapsed {elapsed:.2f}s & baseline updated")
+        print(f"[monitor] retrain done – elapsed {elapsed:.1f}s")
 
     except Exception as exc:
         print(f"[monitor] retrain thread error: {exc}")
@@ -213,7 +221,6 @@ while True:
         else:
             severity = "1"
 
-        # print(f"[monitor] Begin:retrain triggered at msg={msg_count} → Severity-{severity} (JS={js_val:.4f})")
 
         threading.Thread(target=_bg_retrain,
                          args=(js_val, snapshot),
@@ -226,9 +233,12 @@ while True:
 # 6. 收尾：写指标 & 上传
 # ----------------------------------------------------------------------
 print("[monitor] writing buffered metrics …")
-os.makedirs("/mnt/pvc/results", exist_ok=True)
-csv_path   = "/mnt/pvc/results/monitor_metrics.csv"
-jsonl_path = "/mnt/pvc/results/monitor_metrics.jsonl"
+
+local_res = os.path.join(TMP_DIR, "results")
+os.makedirs(local_res, exist_ok=True)
+
+csv_path   = os.path.join(local_res, "monitor_metrics.csv")
+jsonl_path = os.path.join(local_res, "monitor_metrics.jsonl")
 
 pd.DataFrame(metrics_buffer).to_csv(csv_path, index=False)
 with open(jsonl_path, "w") as fp:
