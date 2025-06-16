@@ -135,18 +135,23 @@ def main():
                 .reset_index(drop=True))
         if limit:
             df = df.iloc[:limit]
-        send_df(df, prod, phase)  
+        send_df(df, prod, phase)
+
     # —— sentinel ——  
     sentinel = {
         "producer_done": True,
-        "send_ts": datetime.datetime.utcnow().isoformat() + "Z"    # 发送标记, 同时注入utc时间戳
+        "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
     }
-    for _ in range(num_consumers):
+
+    # 获取 topic 的所有分区，并将 sentinel 分发到每个分区
+    partitions = prod.partitions_for(KAFKA_TOPIC)
+    for p in partitions:
         prod.send(
             KAFKA_TOPIC,
-            key=os.urandom(4),              # 保持随机 key
-            value=sentinel     # utc 时间戳 注入
+            partition=p,
+            value=sentinel
         )
+
     prod.flush()
     prod.close()
 
@@ -155,7 +160,7 @@ def main():
 
     # ② 上传 MinIO，让 Monitor / Inference 通过 MinIO 同步
     save_bytes(f"{RESULT_DIR}/producer_done.flag", b"", "text/plain")
-    print(f"[producer] sent {num_consumers} producer_done signals")
+    print(f"[producer] sent sentinel to {len(partitions)} partitions")
 
     # —— timing & metrics ——  
     timing_dir = os.path.join(TMP_DIR, "timing")

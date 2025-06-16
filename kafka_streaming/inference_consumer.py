@@ -159,36 +159,55 @@ def hot_reload():
 
 
 
-# ---------- Kafka 监听线程 -----------------------------------------------
+# ---------- Kafka 监听线程（带重试） -----------------------------------------------
+import time
+from kafka.errors import NoBrokersAvailable
+
 q = queue.Queue()
 producer_done = threading.Event()
 
-def _listener():
-    cons = KafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=",".join(KAFKA_SERVERS),
-        group_id="cg-infer",
-        auto_offset_reset=AUTO_OFFSET_RESET,
-        enable_auto_commit=ENABLE_AUTO_COMMIT,
-        value_deserializer=lambda m: json.loads(m.decode()),
-    )
+def _create_consumer():
+    """尝试重试连接 Kafka，多次失败后抛出 RuntimeError"""
+    for attempt in range(1, 11):  # 最多重试 10 次
+        try:
+            return KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=",".join(KAFKA_SERVERS),
+                group_id="cg-infer",
+                auto_offset_reset=AUTO_OFFSET_RESET,
+                enable_auto_commit=ENABLE_AUTO_COMMIT,
+                value_deserializer=lambda m: json.loads(m.decode()),
+                # 限制 api_version 自动探测时间，防止卡住
+                api_version_auto_timeout_ms=10000,
+            )
+        except NoBrokersAvailable as e:
+            print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
+            time.sleep(5)
+    raise RuntimeError("[infer] Kafka still unreachable after 10 retries")
 
-    # readiness flag：/tmp + MinIO
+def _listener():
+    # 1) 创建 consumer（内含重试）
+    cons = _create_consumer()
+    print(f"[infer:{pod_name}] KafkaConsumer created, beginning to poll…")
+
+    # 2) readiness flag：/tmp + MinIO
     flag_local = os.path.join(TMP_DIR, f"consumer_ready_{pod_name}.flag")
     open(flag_local, "w").close()
     print(f"[infer:{pod_name}] readiness flag →", flag_local)
-
     save_bytes(f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
                b"", "text/plain")
 
-    for msg in cons:    # 监听 Kafka 消息
+    # 3) 持续接收消息
+    for msg in cons:
         v = msg.value
         if v.get("producer_done"):
             producer_done.set()
             continue
-        v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"   # 再次注入 UTC 时间戳，为接收时间戳，也保留了原始的 v["send_ts"]
+        # 注入接收时间戳
+        v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
         q.put(v)
 
+# 启动监听线程（daemon 模式，不阻塞主线程）
 threading.Thread(target=_listener, daemon=True).start()
 
 def _take_batch():
@@ -264,15 +283,15 @@ total_count     = 0
 print(f"[infer:{pod_name}] consumer started…")
 
 while True:
+    
+    hot_reload()  # 让每个 consumer 等到真正收到哨兵后再结束。这样不会因为某些分区提前耗尽而“假死”或“早退
     batch = _take_batch()
     now   = time.time()
-
-    if not batch:
-        hot_reload()
-        # 若已收到 producer_done 或长时间无数据则结束
-        if producer_done.is_set() or (now - last_data_time) > IDLE_TIMEOUT_S:
-            _reload_model(force=True)
-            break
+    
+    if not batch:  #  只在 “收到 producer_done” 且 “本地队列已清空” 时才优雅收尾
+        if producer_done.is_set() and q.empty():
+            _reload_model(force=True)      # 最后再强制载一次最新模型
+            break                          # graceful shutdown
         time.sleep(0.3)
         continue
 

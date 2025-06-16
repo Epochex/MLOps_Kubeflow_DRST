@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-ml.train_offline.py – baseline training / skip with artefacts (MinIO‑only)
-──────────────────────────────────────────────────────────────────────────────
-* TRIGGER=1  → 重新训练 (datasets/combined.csv) 并更新 artefacts
-* TRIGGER=0  → 跳过训练；下载已有 artefacts，
-               将 baseline_model.pt 拷贝为 model.pt，
-               并重新生成 bridge_true.npy / bridge_pred.npy
-* Phase‑1 桥接基线 = combined.csv **最后 500 条**
-* 精度测试 (两种子集各 500 条) 打印 & 记录 metric_logger
-* 完全移除 PVC：所有中间文件写 /tmp/offline_models，然后立即上传 MinIO
-"""
 
 from __future__ import annotations
 import os, io, sys, json, shutil, random, joblib
@@ -81,9 +70,7 @@ save_bytes(
     "application/json"
 )
 
-# ---------------------------------------------------------------------
-# 3) StandardScaler（不做 PCA）
-# ---------------------------------------------------------------------
+# 3) StandardScaler
 # 3.1 准备训练数据（只用 SELECTED_FEATS 这 10 维）
 X_full = df_all[SELECTED_FEATS].astype(np.float32).values
 y_full = df_all[TARGET_COL].astype(np.float32).values
@@ -156,7 +143,7 @@ acc_bridge = calculate_accuracy_within_threshold(yb, ypb, 0.15)
 
 # 5.2 random_rates 子集
 df_rand = _read_clean(test_path)
-rand_sub = df_rand.sample(n=min(RAND_N, len(df_rand)), random_state=0).reset_index(drop=True)
+rand_sub = df_rand.head(min(RAND_N, len(df_rand))).reset_index(drop=True)
 Xr = scaler.transform(rand_sub[SELECTED_FEATS].values.astype(np.float32))
 yr = rand_sub[TARGET_COL].astype(np.float32).values
 with torch.no_grad():

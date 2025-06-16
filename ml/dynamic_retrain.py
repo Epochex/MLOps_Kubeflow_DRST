@@ -29,7 +29,7 @@ from shared.profiler     import Timer
 # ---------------------------------------------------------------------
 # 0. 超参数门槛
 # ---------------------------------------------------------------------
-NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "200"))   # ↓ 300 → 200
+NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "300"))   
 RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "1500"))
 
 start_ts = time.time()
@@ -62,18 +62,24 @@ all_seen = list(merged.values())
 np.save(cumu_path, np.array(all_seen, dtype=object))
 
 # ---------------------------------------------------------------------
-# 3. 采样：
+# 3. 采样：仅使用最近 RECENT_N 条流式样本
 # ---------------------------------------------------------------------
-# RECENT_N = int(os.getenv("RETRAIN_RECENT_N", "1500"))
-# recent_rows = latest_rows[-RECENT_N:]
+# 环境变量可调，默认取最新 300 条
+RECENT_N = int(os.getenv("RETRAIN_RECENT_N", "300"))
 
-# baseline_sample = []
-# if all_seen:
-#     k_target = max(1, int(0.1 * RECENT_N))
-#     k = min(k_target, len(all_seen))
-#     baseline_sample = list(np.random.choice(all_seen, size=k, replace=False))
+# 加载 monitor.py 丢到 /tmp/monitor/latest_batch.npy 的滑窗快照
+latest_path = "/tmp/monitor/latest_batch.npy"
+if not os.path.exists(latest_path):
+    raise FileNotFoundError(f"latest batch not found: {latest_path}")
+latest_rows = np.load(latest_path, allow_pickle=True).tolist()
 
-all_rows = recent_rows + baseline_sample
+# 数据量检查：不够就推迟重训（exit code=2 会让 monitor 识别为失败，不更新 baseline_df）
+if len(latest_rows) < RECENT_N:
+    print(f"[dynamic] only {len(latest_rows)} recent rows (<{RECENT_N}), postpone retrain")
+    sys.exit(2)
+
+# 最终用来训练的行集：仅最后 RECENT_N 条流式样本
+all_rows = latest_rows[-RECENT_N:]
 
 # ---------------------------------------------------------------------
 # 4. 加载 Top-10 特征列表 & StandardScaler
@@ -94,7 +100,7 @@ scaler = joblib.load(buf)
 # ---------------------------------------------------------------------
 if len(latest_rows) < NEW_SAMPLE_MIN:
     print(f"[dynamic] only {len(latest_rows)} recent rows (<{NEW_SAMPLE_MIN}), postpone retrain")
-    sys.exit(0)
+    sys.exit(2)
 
 
 # 特征矩阵
@@ -117,6 +123,15 @@ Xtr_t, ytr_t   = torch.from_numpy(Xtr),  torch.from_numpy(ytr)
 Xval_t, yval_t = torch.from_numpy(Xval), torch.from_numpy(yval)
 
 # ---------------------------------------------------------------------
+# 0. 触发 & 采样规模
+# ---------------------------------------------------------------------
+# 只要最近 100 条流式样本到位就可以开始尝试重训练
+NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "100"))
+# 但真正拿来做训练的，是最近 600 条样本
+RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "300"))
+
+
+# ---------------------------------------------------------------------
 # 6. 动态网格微调 + Early Stopping (warm-start baseline)
 # ---------------------------------------------------------------------
 # 6.1 定义搜索空间（保持原有三档）
@@ -137,17 +152,20 @@ param_grid_C = [
 
 # 6.2 根据漂移严重度选择网格 & 微调节奏
 if JS <= JS_SEV1_THRESH:
+    # 轻度漂移 → 只训练最后一层，最多 15 轮
     search_space = param_grid_A
-    MAX_EPOCH = 5     # A 档：超轻量
-    PATIENCE  = 2
+    MAX_EPOCH = 15
+    PATIENCE  = 4
 elif JS <= JS_SEV2_THRESH:
+    # 中度漂移 → 训练末两层，最多 30 轮
     search_space = param_grid_B
-    MAX_EPOCH = 10    # B 档：中等
-    PATIENCE  = 3
-else:
-    search_space = param_grid_C
-    MAX_EPOCH = 50    # C 档：全量强训
+    MAX_EPOCH = 30
     PATIENCE  = 6
+else:
+    # 重度漂移 → 全模型训练，最多 60 轮
+    search_space = param_grid_C
+    MAX_EPOCH = 60
+    PATIENCE  = 8
 
 device = "cpu"
 
@@ -157,14 +175,22 @@ def _train_one(cfg: dict) -> tuple[torch.nn.Module, float]:
                         Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
     model = torch.load(io.BytesIO(raw), map_location=device).train()
 
-    # — ② 损失 & 优化器 —
+    # — ② 仅解冻最后一层，加速微调 —
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.net[-1].parameters():
+        param.requires_grad = True
+
+    # — ③ 损失 & 优化器 —
     loss_fn = (nn.MSELoss() if cfg.get("loss") == "mse"
                else nn.SmoothL1Loss())
-    opt     = torch.optim.Adam(model.parameters(),
-                               lr=cfg["learning_rate"])
+    opt     = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg["learning_rate"]
+    )
 
     best_state, best_loss, es = None, float("inf"), 0
-    # — ③ 按 cfg.batch_size 训练 —
+    # — ④ 按 cfg.batch_size 训练 & Early Stopping —
     for epoch in range(1, MAX_EPOCH + 1):
         perm = np.random.permutation(len(Xtr))
         for i in range(0, len(perm), cfg["batch_size"]):
@@ -172,11 +198,11 @@ def _train_one(cfg: dict) -> tuple[torch.nn.Module, float]:
             xb  = torch.from_numpy(Xtr[idx]).to(device)
             yb  = torch.from_numpy(ytr[idx]).to(device)
             opt.zero_grad()
-            loss = loss_fn(model(xb).squeeze(1), yb)
+            loss = loss_fn(model(xb), yb)
             loss.backward()
             opt.step()
 
-        # — ④ 验证集 Early Stopping —
+        # 验证集上 Early Stopping
         with torch.no_grad():
             val_loss = loss_fn(
                 model(torch.from_numpy(Xval).to(device)),

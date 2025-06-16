@@ -44,9 +44,9 @@ retrain_lock:  threading.Lock = threading.Lock()
 retrain_running: bool         = False       # 后台重训是否正在进行
 
 # —— 基线动态配置 —— 
-#  保留 combined.csv 的后10%  + 最新300条流数据
+#  保留 combined.csv 的后10%  + 最新500条流数据
 PCT                 = 0.1
-TRAIN_N             = 300
+TRAIN_N             = 500
 BASELINE_KEY        = os.getenv("BASELINE_KEY", "datasets/combined.csv")
 
 # 1) 从 MinIO 取 combined.csv 并只保留 FEATURE_COLS
@@ -253,7 +253,7 @@ while True:
         last_retrain_ts = now
 
         # ✅ 只用“当前滑动窗口”做 snapshot
-        snapshot = win_rows.copy()          # <<<<<< 关键改动
+        snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
 
         # 判断严重度 …
         if   js_val > JS_SEV2_THRESH: severity = "K"
