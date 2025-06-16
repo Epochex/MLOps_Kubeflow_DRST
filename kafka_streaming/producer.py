@@ -28,22 +28,11 @@ LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
 LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
 
-# STAGES = [
-#     ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
-#     ("Phase-2", f"{DATA_DIR}/old_dag-1.csv", LIM2),
-#     ("Phase-3", f"{DATA_DIR}/old_dag-1.csv", LIM3),
-# ]
-
-# STAGES = [
-#     ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
-#     ("Phase-2", f"datasets/random_rates.csv", LIM2),
-#     ("Phase-3", f"datasets/random_rates.csv", LIM3),
-# ]
 
 STAGES = [
-    ("Phase-1", f"{DATA_DIR}/old_total.csv", LIM1),
-    ("Phase-2", f"datasets/random_rates.csv", LIM2),
-    ("Phase-3", f"datasets/random_rates.csv", LIM3),
+    ("Phase-1", f"datasets/random_rates.csv", LIM1),
+    ("Phase-2", f"datasets/resource_stimulus_global_A-B-C_modified.csv", LIM2),
+    ("Phase-3", f"datasets/resource_stimulus_global_A-B-C_modified.csv", LIM3),
 ]
 
 # ---------- 本地缓存 & 时间戳 ----------
@@ -146,17 +135,17 @@ def main():
                 .reset_index(drop=True))
         if limit:
             df = df.iloc[:limit]
-        send_df(df, prod, phase)
+        send_df(df, prod, phase)  
     # —— sentinel ——  
     sentinel = {
         "producer_done": True,
-        "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
+        "send_ts": datetime.datetime.utcnow().isoformat() + "Z"    # 发送标记, 同时注入utc时间戳
     }
     for _ in range(num_consumers):
         prod.send(
             KAFKA_TOPIC,
             key=os.urandom(4),              # 保持随机 key
-            value=sentinel
+            value=sentinel     # utc 时间戳 注入
         )
     prod.flush()
     prod.close()

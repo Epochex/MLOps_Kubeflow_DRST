@@ -2,10 +2,10 @@
 """
 kafka_streaming/inference_consumer.py
 ────────────────────────────────────────────────────────────
-• baseline  : offline 训练得到的 MLP（Scaler→PCA→N 维输入）
-• adaptive  : 热更新模型（Scaler 后直接吃 full_dim 特征）
-• 两路预测 + 真实值全量落盘，供 plot_final.py 直接拼 Phase-1/2/3
-• 所有原有指标埋点 / 日志完全保留
+baseline  : offline 训练得到的 MLP Scaler→PCA→N 维输入
+adaptive  : 热更新模型 Scaler 后直接吃 full_dim 特征
+两路预测 + 真实值 全量记录，供 plot_final.py 直接拼 Phase-1/2/3
+所有原有指标埋点 ,日志完全保留
 """
 
 import os, io, json, time, queue, threading, hashlib
@@ -13,6 +13,7 @@ from datetime import datetime
 from collections import deque
 from typing import List
 
+import threading
 import numpy as np
 import joblib
 import psutil
@@ -34,6 +35,7 @@ from ml.model             import DynamicMLP, build_model
 from botocore.exceptions import ClientError     
 
 # ---------- 常量 & 本地路径 ---------------------------------------------
+model_lock = threading.Lock()
 MODEL_IMPROVE_EPS = float(os.getenv("MODEL_IMPROVE_EPS", "1.0"))  # %
 
 TMP_DIR  = "/tmp/infer"                     # ← 改用 /tmp
@@ -52,18 +54,22 @@ pred_adj_hist : List[float] = []
 true_hist     : List[float] = []
 ts_hist       : List[str]   = []
 
-# ---------- scaler / PCA --------------------------------------------------
+# ---------- 选特征 & scaler 加载 ------------------------------------------
+import json, io, joblib
+
+# 1) 拉取并加载与 output_rate 最相关的 top10 特征列表
+raw_feats = _fetch("selected_feats.json")
+SELECTED_FEATS = json.loads(raw_feats)
+print(f"[infer:{pod_name}] using selected feats: {SELECTED_FEATS}")
+
+# 2) 拉取并加载对应的 StandardScaler
 with open(f"{local_out}/scaler.pkl", "wb") as f:
     f.write(_fetch("scaler.pkl"))
 scaler = joblib.load(f"{local_out}/scaler.pkl")
 
-try:
-    with open(f"{local_out}/pca.pkl", "wb") as f:
-        f.write(_fetch("pca.pkl"))
-    pca = joblib.load(f"{local_out}/pca.pkl")
-    use_pca = True
-except Exception:
-    pca, use_pca = None, False
+# 不再使用 PCA
+pca = None
+use_pca = False
 
 # ---------- 完整模型加载工具函数 ------------------------------------------
 def _load_full_model(key: str) -> tuple[nn.Module, bytes]:
@@ -81,31 +87,28 @@ baseline_model, base_raw = _load_full_model("baseline_model.pt")
 baseline_in_dim          = baseline_model.net[0].in_features
 
 current_model, curr_raw  = _load_full_model("model.pt")
-
 current_model._val_acc15 = 0.0          # 初始基线
 
 print(f"[infer:{pod_name}] baseline in_features = {baseline_in_dim}")
 print(f"[infer:{pod_name}] adaptive model       = {current_model}")
 
-
 model_sig        = hashlib.md5(curr_raw).hexdigest()
 model_loading_ms = 0.0
 
 
-
 # ---------- 热重载 --------------------------------------------------------
-# ---------- 热重载 --------------------------------------------------------
-GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.05"))  # ≥0.5 个百分点就换
+GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.001"))  # ≥0.x 个百分点就换
 
 def _reload_model(force: bool = False):
     """
-    只有当 new_acc - baseline_acc ≥ GAIN_THR_PP (百分点) 才切换；
-    force=True（退出前最后一次）则无条件加载。
+    热加载：仅当新模型相对 baseline 精度提升 >= GAIN_THR_PP
+    或者 force=True 时才替换 current_model。
+    🔒 线程安全：更新过程持 model_lock。
     """
     global current_model, curr_raw, model_sig, model_loading_ms
 
     try:
-        latest_raw = _fetch("latest.txt")           # models/latest.txt
+        latest_raw = _fetch("latest.txt")
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
             return
@@ -115,40 +118,45 @@ def _reload_model(force: bool = False):
     raw = _fetch(model_key)
     sig = hashlib.md5(raw).hexdigest()
 
+    # 1) 如果版本未变，直接跳过
     if not force and sig == model_sig:
-        return                                      # same version
-
-    metrics   = json.loads(_fetch(metrics_key).decode())
-    new_acc   = metrics.get("acc@0.15", 0.0)
-    base_acc  = metrics.get("baseline_acc@0.15", 0.0)
-    gain_pp   = new_acc - base_acc                 # 单位：百分点
-
-    if not force and gain_pp < GAIN_THR_PP:
-        print(f"[infer:{pod_name}] Δ{gain_pp:+.2f} pp < {GAIN_THR_PP} → skip")
         return
 
+    # 2) 读取新旧模型在验证集上的 acc@0.15
+    metrics = json.loads(_fetch(metrics_key).decode())
+    new_acc  = metrics.get("acc@0.15", 0.0)
+    base_acc = metrics.get("baseline_acc@0.15", 0.0)
+    gain_pp  = new_acc - base_acc
+
+    # 3) 只有当提升 >= GAIN_THR_PP 时才替换
+    if not force and gain_pp < GAIN_THR_PP:
+        print(
+            f"[infer:{pod_name}] Δ{gain_pp:+.3f} pp < {GAIN_THR_PP} → skip reload"
+        )
+        return
+
+    # 4) 加载新模型并替换
     t0 = time.perf_counter()
     mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
-    current_model = mdl
-    current_model._val_acc15 = new_acc
-    curr_raw, model_sig = raw, sig
+    with model_lock:
+        current_model      = mdl
+        current_model._val_acc15 = new_acc
+        curr_raw, model_sig = raw, sig
     model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
 
     log_metric(component="infer", event="hot_reload_runtime",
                model_loading_ms=model_loading_ms)
-    print(f"[infer:{pod_name}] hot-reloaded ✓  "
-          f"baseline={base_acc:.2f} → new={new_acc:.2f}  "
-          f"(Δ{gain_pp:+.2f} pp)  load={model_loading_ms} ms")
+    print(
+        f"[infer:{pod_name}] hot-reloaded ✓  "
+        f"baseline={base_acc:.2f}% → new={new_acc:.2f}%  "
+        f"(Δ{gain_pp:+.3f} pp)  load={model_loading_ms} ms"
+    )
 
 def hot_reload():
     """异步触发热重载，不阻塞主推理循环。"""
     threading.Thread(target=_reload_model, daemon=True).start()
 
 
-
-def hot_reload():
-    """异步触发热重载，不阻塞主推理循环。"""
-    threading.Thread(target=_reload_model, daemon=True).start()
 
 
 # ---------- Kafka 监听线程 -----------------------------------------------
@@ -173,12 +181,12 @@ def _listener():
     save_bytes(f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
                b"", "text/plain")
 
-    for msg in cons:
+    for msg in cons:    # 监听 Kafka 消息
         v = msg.value
         if v.get("producer_done"):
             producer_done.set()
             continue
-        v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
+        v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"   # 再次注入 UTC 时间戳，为接收时间戳，也保留了原始的 v["send_ts"]
         q.put(v)
 
 threading.Thread(target=_listener, daemon=True).start()
@@ -268,7 +276,6 @@ while True:
         time.sleep(0.3)
         continue
 
-
     last_data_time = now
     if first_batch:
         cold_ms = (time.perf_counter() - container_start) * 1000
@@ -282,27 +289,34 @@ while True:
 
     # 2) Preprocessing -----------------------------------------------------
     with Timer("Preprocessing", "infer"):
+        # ① 提取 top-10 原始特征
         X_raw = np.array(
-            [[r["features"].get(c, 0.0) for c in FEATURE_COLS]
+            [[r["features"].get(c, 0.0) for c in SELECTED_FEATS]
              for r in rows_batch],
-            np.float32
+            dtype=np.float32
         )
+        # ② 标准化
         X_scaled = scaler.transform(X_raw)
 
-        # baseline 一直走 PCA → in_dim == baseline_in_dim
-        X_base = pca.transform(X_scaled).astype(np.float32)       # (N, 6)
+    # ── 线程安全地拿一份当前 adaptive 模型引用 ─────────────────────────────
+    with model_lock:
+        model_ref = current_model          # 只在临界区做引用拷贝
 
-        # adaptive 根据当前模型 in_features 自适应选择 PCA or Scaler
-        X_adpt = _make_input(current_model, X_scaled)
-
-    # 3) Inference
+    # === 关键：让两路输入与各自模型首层维度匹配 ============================
+    X_base = _align_to_dim(X_scaled, baseline_in_dim)   # 基线模型固定 10 维
+    X_adpt = _make_input(model_ref, X_scaled)           # adaptive 可能是 10 或 60 维
+        
+        
+    # 3) Inference ---------------------------------------------------------
     cpu0, t0 = proc.cpu_times(), time.perf_counter()
     with Timer("Inference_Engine", "infer"):
         with torch.no_grad():
+            # Baseline 预测
             preds_base = baseline_model(
                 torch.from_numpy(X_base).to(device)
             ).cpu().numpy().ravel()
-            preds_adpt = current_model(
+            # Adaptive 预测（使用刚才线程安全取到的 model_ref）
+            preds_adpt = model_ref(
                 torch.from_numpy(X_adpt).to(device)
             ).cpu().numpy().ravel()
     cpu1, t1 = proc.cpu_times(), time.perf_counter()
@@ -416,11 +430,11 @@ arr_ts    = np.asarray([
 ], np.float64)
 
 npz_local = os.path.join(local_out, "inference_trace.npz")
-np.savez(npz_local,
-         ts=arr_ts,
-         pred_adj=arr_adj,
-         pred_orig=arr_orig,
-         true=arr_true)
+np.savez(npz_local,     # 保存为 npz 格式 数据
+         ts=arr_ts,     # 每条样本的发送时间戳
+         pred_adj=arr_adj,  # 热更新模型的预测值序列
+         pred_orig=arr_orig,  # 基线模型的预测值序列
+         true=arr_true)  # 真实标签序列, 用来之后算吞吐量
 
 with open(npz_local, "rb") as f:
     save_bytes(f"{RESULT_DIR}/{pod_name}_inference_trace.npz",

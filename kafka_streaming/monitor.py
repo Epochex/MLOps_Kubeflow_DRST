@@ -26,30 +26,49 @@ from shared.minio_helper  import load_csv, save_bytes
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 # 0. 全局 & 初始化
-WINDOW_SIZE          = int(os.getenv("JS_WINDOW_SIZE", "100"))
+# 动态的后10%combined 数据+300条训练的数据(一开始的时候就是约500多条combined数据)作为基线数据，然后跟滑动窗口为200的流数据进行js漂移值计算，
+# 一旦触发retrain，就把基线数据中300条训练的数据立刻替换retrain前的300条流数据，但仍然保留10%combined 数据，也就是10%combined 数据+300条retrain前最新数据
+# —— 窗口大小 —— 
+WINDOW_SIZE          = 200
 RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))
-MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "3"))  # retrain冷却时间
+MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "3"))
 
-TMP_DIR        = "/tmp/monitor"        # ← 不再用 PVC
-os.makedirs(TMP_DIR, exist_ok=True)
-
-metrics_buffer : list[dict] = []
+# —— 声明指标 buffer、Producer 完成 flag、消息队列 q ——  
+metrics_buffer: list[dict] = []
 producer_done  = threading.Event()
 q: queue.Queue = queue.Queue()
 
-from collections import deque
-retrain_buf = deque(maxlen=RETRAIN_BATCH_SIZE)
+# >>>  Drift re-training state  <<<
+retrain_buf:   list[dict]     = []          # 最近收到的所有样本
+retrain_lock:  threading.Lock = threading.Lock()
+retrain_running: bool         = False       # 后台重训是否正在进行
 
-retrain_lock    = threading.Lock()
-retrain_running = False
+# —— 基线动态配置 —— 
+#  保留 combined.csv 的后10%  + 最新300条流数据
+PCT                 = 0.1
+TRAIN_N             = 300
+BASELINE_KEY        = os.getenv("BASELINE_KEY", "datasets/combined.csv")
 
-# —— 预加载 baseline（离线训练分布）——
-BASELINE_KEY = os.getenv("BASELINE_KEY", "datasets_old/old_total.csv")
-baseline_df  = load_csv(BASELINE_KEY)
-baseline_df.drop(columns=["input_rate", "latency", "output_rate"],
+# 1) 从 MinIO 取 combined.csv 并只保留 FEATURE_COLS
+combined_df = load_csv(BASELINE_KEY)
+combined_df.drop(columns=["input_rate", "latency", "output_rate"],
                  errors="ignore", inplace=True)
-baseline_df  = baseline_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
-JS_FEATS     = [f for f in FEATURE_COLS if f in baseline_df.columns]
+combined_df = combined_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
+
+# 2) 拿尾部 10%
+ten_n = max(1, int(PCT * len(combined_df)))
+base_combined = combined_df.tail(ten_n).reset_index(drop=True)
+
+# 3) 初始训练池：从 combined_df 抽样 300 条（若未来要用离线 artefacts，可改为加载文件）
+init_train = combined_df.sample(n=min(TRAIN_N, len(combined_df)),
+                                random_state=0).reset_index(drop=True)
+
+# 4) 合并成 baseline_df，用于 JS 计算
+baseline_df = pd.concat([base_combined, init_train], ignore_index=True)
+
+# 全部 60 维都参与 JS 比较
+JS_FEATS = FEATURE_COLS.copy()
+
 
 # ----------------------------------------------------------------------
 # 1. 指标工具
@@ -79,6 +98,8 @@ def _sys_metrics() -> dict:
 TMP_DIR = "/tmp/monitor"                # ← 改用 /tmp 做临时存储
 os.makedirs(TMP_DIR, exist_ok=True)
 
+
+
 def _listener():
     cons = KafkaConsumer(
         KAFKA_TOPIC,
@@ -93,17 +114,26 @@ def _listener():
     flag_local = os.path.join(TMP_DIR, "monitor_ready.flag")
     open(flag_local, "w").close()
     print("[monitor] readiness flag touched →", flag_local)
-
-    from shared.minio_helper import save_bytes
     save_bytes(f"{RESULT_DIR}/monitor_ready.flag", b"", "text/plain")
 
-    for msg in cons:
-        v = msg.value
-        if v.get("producer_done"):
-            producer_done.set()
+    # 持续 poll()，并捕获所有异常后重试
+    while True:
+        try:
+            records = cons.poll(timeout_ms=1000)
+            for tp, msgs in records.items():
+                for msg in msgs:
+                    v = msg.value
+                    if v.get("producer_done"):
+                        producer_done.set()
+                    else:
+                        q.put(v)
+        except Exception as e:
+            # 打印日志但保持线程存活
+            print(f"[monitor] listener error, restarting poll(): {e}")
+            time.sleep(1)
             continue
-        q.put(v)
 
+# 启动监听线程（daemon 模式，不阻塞主线程）
 threading.Thread(target=_listener, daemon=True).start()
 
 # ----------------------------------------------------------------------
@@ -131,12 +161,11 @@ def _avg_js(df: pd.DataFrame) -> float:
 def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
     """
     ① 把当前窗口写入 /tmp/monitor/latest_batch.npy（供 dynamic_retrain）
-    ② 同步调用 dynamic_retrain
-    ③ 扩充 baseline_df
+    ② 同步调用 dynamic_retrain，捕获成功或失败
+    ③ 成功时扩充 baseline_df；失败时重置状态，跳过更新
     """
     global retrain_running, baseline_df
     try:
-        start_ts = time.time()
         print(f"[monitor] retrain start (JS={js_val:.4f})")
 
         # 1) Dump 最新窗口到本地临时目录
@@ -144,23 +173,30 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         np.save(local_np, np.array(snapshot_rows, dtype=object))
         print(f"[monitor] latest_batch.npy saved → {local_np}")
 
-        # 2) 同步调用 retrain 子进程（dynamic_retrain 会直接读本地这个文件）
+        # 2) 同步调用 retrain 子进程，并捕获异常
         with retrain_lock:
             retrain_running = True
         cmd = ["python", "-m", "ml.dynamic_retrain", f"{js_val:.4f}"]
-        print("[monitor] ➜ exec:", " ".join(cmd))
-        ret = subprocess.call(cmd)
-        if ret != 0:
-            print(f"[monitor] retrain exit code = {ret}")
+        print("[monitor] ➜ executing retrain:", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            print("[monitor] retrain succeeded")
+        except subprocess.CalledProcessError as e:
+            print(f"[monitor] retrain failed: exit {e.returncode}")
+            with retrain_lock:
+                retrain_running = False
+            return
 
-        # 3) 更新 baseline（线程安全）
+        # 3) 只有 retrain 成功后，才更新 baseline_df
         with retrain_lock:
-            df_add = pd.DataFrame([r["features"] for r in snapshot_rows])
-            baseline_df = pd.concat([baseline_df, df_add], ignore_index=True)
+            combined_part = baseline_df.iloc[:ten_n].copy()
+            recent_features = [r["features"] for r in snapshot_rows[-TRAIN_N:]]
+            train_part = (
+                pd.DataFrame(recent_features)
+                  .reindex(columns=FEATURE_COLS, fill_value=0.0)
+            )
+            baseline_df = pd.concat([combined_part, train_part], ignore_index=True)
             retrain_running = False
-
-        elapsed = time.time() - start_ts
-        print(f"[monitor] retrain done – elapsed {elapsed:.1f}s")
 
     except Exception as exc:
         print(f"[monitor] retrain thread error: {exc}")
@@ -182,17 +218,20 @@ while True:
         if producer_done.is_set():
             print("[monitor] producer_done & queue empty → bye")
             break
+        # 无消息且生产者未完成，继续等待
         continue
 
     msg_count += 1
-    win_rows.append(item)  # js滑窗
-    retrain_buf.append(item)  # 用于 dynamic_retrain 缓存
-    
+    win_rows.append(item)            # 加入滑动窗口
+    retrain_buf.append(item)         # 缓存用于 dynamic_retrain
+
+    # 保持窗口固定长度
     if len(win_rows) > WINDOW_SIZE:
         win_rows.pop(0)
     if len(win_rows) < WINDOW_SIZE:
-        continue
+        continue  # 窗口未满，跳过 JS 计算
 
+    # 计算 JS 值
     t0 = time.time()
     df_win = pd.DataFrame([r["features"] for r in win_rows])
     js_val = _avg_js(df_win)
@@ -204,27 +243,28 @@ while True:
                   **_sys_metrics())
 
     print(f"[monitor] JS={js_val:.4f} (thr={JS_TRIGGER_THRESH}) msgs={msg_count}")
-
-    # ---- 触发重训 ----
+    
+    # ───── 触发重训 ─────────────────────────────────────────────
     now = time.time()
     if (js_val > JS_TRIGGER_THRESH
         and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
+
         last_retrain_ts = now
-        snapshot = list(retrain_buf)
 
-        # severity
-        if js_val > JS_SEV2_THRESH:
-            severity = "K"
-        elif js_val > JS_SEV1_THRESH:
-            severity = "2"
-        else:
-            severity = "1"
+        # ✅ 只用“当前滑动窗口”做 snapshot
+        snapshot = win_rows.copy()          # <<<<<< 关键改动
 
+        # 判断严重度 …
+        if   js_val > JS_SEV2_THRESH: severity = "K"
+        elif js_val > JS_SEV1_THRESH: severity = "2"
+        else:                          severity = "1"
 
-        threading.Thread(target=_bg_retrain,
-                         args=(js_val, snapshot),
-                         daemon=True).start()
+        threading.Thread(
+            target=_bg_retrain,
+            args=(js_val, snapshot),
+            daemon=True
+        ).start()
 
         record_metric("monitor", "retrain_trigger",
                       js_val=round(js_val, 4), severity=severity)

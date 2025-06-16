@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-ml.plot_report.py ─ Phase-1 / 2 / 3 对比图（定制版）
-──────────────────────────────────────────────────────────────
-
-"""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,11 +33,6 @@ def draw_three_phases(
         输出 PNG 文件路径
 
     Behavior
-    --------
-    - 注入点设为样本索引 400
-    - 切片窗口为 [inject_idx-100 : inject_idx+700]
-    - 过滤掉 y_true < 500 的样本
-    - 绘制三条曲线，添加垂直参考线及 Phase 标签
     """
     # 拼接完整数据序列
     y_true_all = np.concatenate([bridge_true, dag_true])
@@ -51,8 +41,8 @@ def draw_three_phases(
 
     # 定义注入点和窗口范围
     inject_idx = 500
-    lo = inject_idx + 1100
-    hi = inject_idx + 1400
+    lo = inject_idx + 1600
+    hi = inject_idx + 1800
 
     # 窗口切片
     y_true = y_true_all[lo:hi]
