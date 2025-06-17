@@ -13,6 +13,8 @@ from datetime import datetime
 from collections import deque
 from typing import List
 
+
+from time import sleep
 import threading
 import numpy as np
 import joblib
@@ -31,7 +33,6 @@ from shared.config        import (
 )
 from shared.features      import FEATURE_COLS
 from ml.model             import DynamicMLP, build_model
-
 from botocore.exceptions import ClientError     
 
 # ---------- 常量 & 本地路径 ---------------------------------------------
@@ -62,14 +63,31 @@ raw_feats = _fetch("selected_feats.json")
 SELECTED_FEATS = json.loads(raw_feats)
 print(f"[infer:{pod_name}] using selected feats: {SELECTED_FEATS}")
 
+# ① baseline_scaler：仅启动时加载一次，绝不在热重载中替换
+baseline_scaler = joblib.load(io.BytesIO(_fetch("scaler.pkl")))
+
+# ② adaptive_scaler：首次沿用 baseline，可在 hot-reload 时被替换
+adaptive_scaler = baseline_scaler
+
+
 # 2) 拉取并加载对应的 StandardScaler
 with open(f"{local_out}/scaler.pkl", "wb") as f:
     f.write(_fetch("scaler.pkl"))
 scaler = joblib.load(f"{local_out}/scaler.pkl")
 
-# 不再使用 PCA
-pca = None
-use_pca = False
+
+def _wait_for_latest_txt(timeout=120):
+    print("[infer] polling for latest.txt …")
+    for _ in range(timeout):
+        try:
+            s3.head_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/latest.txt")
+            print("[infer] ✅ latest.txt available")
+            return
+        except ClientError:
+            sleep(1)
+    raise TimeoutError("Timeout waiting for latest.txt")
+
+_wait_for_latest_txt()
 
 # ---------- 完整模型加载工具函数 ------------------------------------------
 def _load_full_model(key: str) -> tuple[nn.Module, bytes]:
@@ -97,65 +115,69 @@ model_loading_ms = 0.0
 
 
 # ---------- 热重载 --------------------------------------------------------
-GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.001"))  # ≥0.x 个百分点就换
+# ---------- 热重载 --------------------------------------------------------
+GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.5"))
 
 def _reload_model(force: bool = False):
-    """
-    热加载：仅当新模型相对 baseline 精度提升 >= GAIN_THR_PP
-    或者 force=True 时才替换 current_model。
-    🔒 线程安全：更新过程持 model_lock。
-    """
-    global current_model, curr_raw, model_sig, model_loading_ms
+    global current_model, curr_raw, model_sig, model_loading_ms, adaptive_scaler
 
+    print(f"[infer:{pod_name}] check update (force={force})")
+    # 0) 先取 latest.txt
     try:
         latest_raw = _fetch("latest.txt")
     except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchKey":
-            return
-        raise
-
-    model_key, metrics_key = latest_raw.decode().strip().splitlines()
-    raw = _fetch(model_key)
-    sig = hashlib.md5(raw).hexdigest()
-
-    # 1) 如果版本未变，直接跳过
-    if not force and sig == model_sig:
+        print(f"[infer:{pod_name}] no latest.txt yet: {e}")
         return
 
-    # 2) 读取新旧模型在验证集上的 acc@0.15
+    parts = latest_raw.decode().strip().splitlines()
+    if len(parts) < 2:
+        print(f"[infer:{pod_name}] malformed latest.txt → {parts}")
+        return
+    model_key, metrics_key = parts[0], parts[1]
+    scaler_key = parts[2] if len(parts) >= 3 else None
+    print(f"[infer:{pod_name}] latest.txt → model={model_key}, metrics={metrics_key}, scaler={scaler_key}")
+
+    # 1) 判断是不是同一个模型
+    raw_model = _fetch(model_key)
+    new_sig = hashlib.md5(raw_model).hexdigest()
+    if not force and new_sig == model_sig:
+        print(f"[infer:{pod_name}] signature unchanged ({new_sig}) → skip reload")
+        return
+
+    # 2) 看 accuracy 增益够不够
     metrics = json.loads(_fetch(metrics_key).decode())
     new_acc  = metrics.get("acc@0.15", 0.0)
     base_acc = metrics.get("baseline_acc@0.15", 0.0)
     gain_pp  = new_acc - base_acc
-
-    # 3) 只有当提升 >= GAIN_THR_PP 时才替换
+    print(f"[infer:{pod_name}] baseline_acc={base_acc:.2f}%, new_acc={new_acc:.2f}%, gain={gain_pp:.3f}pp (thr={GAIN_THR_PP}pp)")
     if not force and gain_pp < GAIN_THR_PP:
-        print(
-            f"[infer:{pod_name}] Δ{gain_pp:+.3f} pp < {GAIN_THR_PP} → skip reload"
-        )
+        print(f"[infer:{pod_name}] gain {gain_pp:.3f}pp < threshold → skip reload")
         return
 
-    # 4) 加载新模型并替换
-    t0 = time.perf_counter()
-    mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
+    # 3) 真正加载新模型
+    print(f"[infer:{pod_name}] loading new model from {model_key}")
+    mdl = torch.load(io.BytesIO(raw_model), map_location=device).eval()
+    new_scaler = None
+    if scaler_key:
+        try:
+            new_scaler = joblib.load(io.BytesIO(_fetch(scaler_key)))
+            print(f"[infer:{pod_name}] loaded new scaler {scaler_key}")
+        except Exception as exc:
+            print(f"[infer:{pod_name}] failed to load scaler {scaler_key}: {exc}")
+
+    # 4) 原子更新
     with model_lock:
-        current_model      = mdl
-        current_model._val_acc15 = new_acc
-        curr_raw, model_sig = raw, sig
-    model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
+        current_model, curr_raw, model_sig = mdl, raw_model, new_sig
+        if new_scaler is not None:
+            adaptive_scaler = new_scaler
 
-    log_metric(component="infer", event="hot_reload_runtime",
-               model_loading_ms=model_loading_ms)
-    print(
-        f"[infer:{pod_name}] hot-reloaded ✓  "
-        f"baseline={base_acc:.2f}% → new={new_acc:.2f}%  "
-        f"(Δ{gain_pp:+.3f} pp)  load={model_loading_ms} ms"
-    )
-
+    model_loading_ms = 0.0
+    print(f"[infer:{pod_name}] hot-reload complete → new signature {new_sig}")
+    
+    
 def hot_reload():
     """异步触发热重载，不阻塞主推理循环。"""
     threading.Thread(target=_reload_model, daemon=True).start()
-
 
 
 
@@ -308,22 +330,23 @@ while True:
 
     # 2) Preprocessing -----------------------------------------------------
     with Timer("Preprocessing", "infer"):
-        # ① 提取 top-10 原始特征
         X_raw = np.array(
             [[r["features"].get(c, 0.0) for c in SELECTED_FEATS]
-             for r in rows_batch],
+            for r in rows_batch],
             dtype=np.float32
         )
-        # ② 标准化
-        X_scaled = scaler.transform(X_raw)
+        # baseline / adaptive 分别用自己的 scaler
+        X_scaled_base = baseline_scaler.transform(X_raw)
+        X_scaled_adpt = adaptive_scaler.transform(X_raw)
 
     # ── 线程安全地拿一份当前 adaptive 模型引用 ─────────────────────────────
     with model_lock:
         model_ref = current_model          # 只在临界区做引用拷贝
+        
+    # === 关键：让两路输入维度匹配 ============================
+    X_base = _align_to_dim(X_scaled_base, baseline_in_dim) #  基线模型固定 10 维
+    X_adpt = _make_input(model_ref,      X_scaled_adpt) # adaptive 可能是 10 或 60 维
 
-    # === 关键：让两路输入与各自模型首层维度匹配 ============================
-    X_base = _align_to_dim(X_scaled, baseline_in_dim)   # 基线模型固定 10 维
-    X_adpt = _make_input(model_ref, X_scaled)           # adaptive 可能是 10 或 60 维
         
         
     # 3) Inference ---------------------------------------------------------

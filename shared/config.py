@@ -26,9 +26,9 @@ TARGET_COL   = "output_rate"
 EXCLUDE_COLS = ["Unnamed: 0", "input_rate", "latency"]
 
 # ---------- Drift 监控 & Adaptation 阈值（可由环境变量覆盖） ----------
-JS_TRIGGER_THRESH = float(os.getenv("JS_TRIGGER_THRESH", "0.35"))
-JS_SEV1_THRESH    = float(os.getenv("JS_SEV1_THRESH",    "0.60"))
-JS_SEV2_THRESH    = float(os.getenv("JS_SEV2_THRESH",    "0.80"))
+JS_TRIGGER_THRESH = float(os.getenv("JS_TRIGGER_THRESH", "0.30"))
+JS_SEV1_THRESH    = float(os.getenv("JS_SEV1_THRESH",    "0.50"))
+JS_SEV2_THRESH    = float(os.getenv("JS_SEV2_THRESH",    "0.60"))
 
 
 # ---------- 其他（用到 RESULT_DIR 的地方） ----------

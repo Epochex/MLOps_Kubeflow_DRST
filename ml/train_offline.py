@@ -13,7 +13,6 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 
 from shared.minio_helper import load_csv, save_bytes, s3, BUCKET

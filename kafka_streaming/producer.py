@@ -23,9 +23,9 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 
 # ---------- 发送节奏 ----------
-SLEEP = float(os.getenv("MSG_SLEEP", "0.1"))
-LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
-LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
+SLEEP = float(os.getenv("MSG_SLEEP", "1"))
+LIM1  = int(os.getenv("LIMIT_PHASE1", "1000"))
+LIM2  = int(os.getenv("LIMIT_PHASE2", "500"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
 
 
