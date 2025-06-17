@@ -30,7 +30,6 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 # 一旦触发retrain，就把基线数据中300条训练的数据立刻替换retrain前的300条流数据，但仍然保留10%combined 数据，也就是10%combined 数据+300条retrain前最新数据
 # —— 窗口大小 —— 
 WINDOW_SIZE          = 200
-RETRAIN_BATCH_SIZE   = int(os.getenv("RETRAIN_BATCH_SIZE", "500"))
 MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "3"))
 
 # —— 声明指标 buffer、Producer 完成 flag、消息队列 q ——  
@@ -44,7 +43,7 @@ retrain_lock:  threading.Lock = threading.Lock()
 retrain_running: bool         = False       # 后台重训是否正在进行
 
 # —— 基线动态配置 —— 
-#  保留 combined.csv 的后10%  + 最新500条流数据
+# 只保留 combined.csv 的后10%，初始不加入流数据
 PCT                 = 0.1
 TRAIN_N             = 500
 BASELINE_KEY        = os.getenv("BASELINE_KEY", "datasets/combined.csv")
@@ -55,16 +54,12 @@ combined_df.drop(columns=["input_rate", "latency", "output_rate"],
                  errors="ignore", inplace=True)
 combined_df = combined_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
 
-# 2) 拿尾部 10%
+# 2) 拿尾部 10% 作为 static 基线
 ten_n = max(1, int(PCT * len(combined_df)))
 base_combined = combined_df.tail(ten_n).reset_index(drop=True)
 
-# 3) 初始训练池：从 combined_df 抽样 300 条（若未来要用离线 artefacts，可改为加载文件）
-init_train = combined_df.sample(n=min(TRAIN_N, len(combined_df)),
-                                random_state=0).reset_index(drop=True)
-
-# 4) 合并成 baseline_df，用于 JS 计算
-baseline_df = pd.concat([base_combined, init_train], ignore_index=True)
+# ✅ 3) 初始化基线：只保留 static 部分（尾部10%）
+baseline_df = base_combined.copy()
 
 # 全部 60 维都参与 JS 比较
 JS_FEATS = FEATURE_COLS.copy()
@@ -174,19 +169,6 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         print(f"[monitor] latest_batch.npy saved → {local_np}")
 
         # 2) 同步调用 retrain 子进程，并捕获异常
-        with retrain_lock:
-            retrain_running = True
-        cmd = ["python", "-m", "ml.dynamic_retrain", f"{js_val:.4f}"]
-        print("[monitor] ➜ executing retrain:", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True)
-            print("[monitor] retrain succeeded")
-        except subprocess.CalledProcessError as e:
-            print(f"[monitor] retrain failed: exit {e.returncode}")
-            with retrain_lock:
-                retrain_running = False
-            return
-
         # 3) 只有 retrain 成功后，才更新 baseline_df
         with retrain_lock:
             combined_part = baseline_df.iloc[:ten_n].copy()

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 """
-kafka_streaming/producer.py
-────────────────────────────────────────────────────────────
-Phase-1  : old_total.csv  → 与离线模型同分布，几乎 0 JS
-Phase-2  : old_dag-1.csv → 触发 Drift & Retrain
-Phase-3  : old_dag-1.csv → Monitor 重训完毕，Inference 热加载
 """
 import os, sys, time, json, glob, datetime
 import pandas as pd, numpy as np
@@ -23,10 +18,10 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 
 # ---------- 发送节奏 ----------
-SLEEP = float(os.getenv("MSG_SLEEP", "0.1"))
+SLEEP = float(os.getenv("MSG_SLEEP", "1"))
 LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
-LIM2  = int(os.getenv("LIMIT_PHASE2", "1000"))
-LIM3  = int(os.getenv("LIMIT_PHASE3", "1000"))
+LIM2  = int(os.getenv("LIMIT_PHASE2", "2000"))
+LIM3  = int(os.getenv("LIMIT_PHASE3", "2000"))
 
 
 STAGES = [

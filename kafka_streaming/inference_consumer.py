@@ -67,9 +67,6 @@ with open(f"{local_out}/scaler.pkl", "wb") as f:
     f.write(_fetch("scaler.pkl"))
 scaler = joblib.load(f"{local_out}/scaler.pkl")
 
-# 不再使用 PCA
-pca = None
-use_pca = False
 
 # ---------- 完整模型加载工具函数 ------------------------------------------
 def _load_full_model(key: str) -> tuple[nn.Module, bytes]:
@@ -97,7 +94,7 @@ model_loading_ms = 0.0
 
 
 # ---------- 热重载 --------------------------------------------------------
-GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.001"))  # ≥0.x 个百分点就换
+GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.01"))  # ≥0.x 个百分点就换
 
 def _reload_model(force: bool = False):
     """
@@ -229,21 +226,6 @@ def _forecast_loop():
         log_metric(component="infer", event="forecasting_runtime")
 threading.Thread(target=_forecast_loop, daemon=True).start()
 
-def _align_adaptive_input(X_scaled: np.ndarray, model: nn.Module) -> np.ndarray:
-    in_dim = model.net[0].in_features
-    if in_dim == X_scaled.shape[1]:
-        X_aligned = X_scaled
-    elif in_dim < X_scaled.shape[1]:
-        X_aligned = X_scaled[:, :in_dim]          # 截断
-    else:
-        pad = np.zeros((X_scaled.shape[0], in_dim - X_scaled.shape[1]),
-                       dtype=np.float32)
-        X_aligned = np.concatenate([X_scaled, pad], axis=1)
-
-    # === DEBUG 2：输入是不是全 0？ =============================
-    if not np.any(X_aligned):
-        print(f"[infer:{pod_name}] DEBUG ②  aligned input **ALL ZERO** !")
-    return X_aligned
 
 def _align_to_dim(X_scaled: np.ndarray, in_dim: int) -> np.ndarray:
     """
@@ -258,18 +240,6 @@ def _align_to_dim(X_scaled: np.ndarray, in_dim: int) -> np.ndarray:
                        dtype=np.float32)
         return np.concatenate([X_scaled, pad], axis=1)
 
-
-def _make_input(model: nn.Module, X_scaled: np.ndarray) -> np.ndarray:
-    """
-    根据 **模型首层 in_features** 自动决定：
-        • 用 PCA 特征       —— 若 in_dim == pca.n_components_
-        • 用 Scaler 特征对齐 —— 否则
-    这样无论 adaptive 模型是 6-维（PCA）还是 60-维（全特征）都能喂对输入。
-    """
-    in_dim = model.net[0].in_features
-    if use_pca and in_dim == pca.n_components_:
-        return pca.transform(X_scaled).astype(np.float32)
-    return _align_to_dim(X_scaled, in_dim)
 
 # ---------------------------  主循环  ------------------------------------
 first_batch     = True

@@ -128,7 +128,7 @@ Xval_t, yval_t = torch.from_numpy(Xval), torch.from_numpy(yval)
 # 只要最近 100 条流式样本到位就可以开始尝试重训练
 NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "100"))
 # 但真正拿来做训练的，是最近 600 条样本
-RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "300"))
+RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "600"))
 
 
 # ---------------------------------------------------------------------
