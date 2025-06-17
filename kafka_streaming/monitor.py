@@ -12,7 +12,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import psutil
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 from scipy.spatial.distance import jensenshannon
 
 from shared.config import (
@@ -139,7 +139,6 @@ def _listener():
 
 # 启动监听线程（daemon 模式，不阻塞主线程）
 threading.Thread(target=_listener, daemon=True).start()
-
 # ----------------------------------------------------------------------
 # 3. Jensen–Shannon
 # ----------------------------------------------------------------------
@@ -225,17 +224,15 @@ while True:
     win_rows.append(item)
     retrain_buf.append(item)
 
-    # —— 初始强制重训 —— 
     if not first_forced and infer_msg_count >= NEW_SAMPLE_MIN:
         first_forced = True
         print(f"[monitor] initial force retrain at infer_msg_count={infer_msg_count}")
-        retrain_running = True
-        snapshot = retrain_buf.copy()
-        threading.Thread(
-            target=_bg_retrain,
-            args=(JS_TRIGGER_THRESH, snapshot),
-            daemon=True
-        ).start()
+        # 1) 广播暂停
+        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "start"})
+        # 2) 阻断式 retrain
+        _bg_retrain(JS_TRIGGER_THRESH, retrain_buf.copy())
+        # 3) 广播恢复
+        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "end"})
 
     # 保持窗口固定长度 & 未满则跳过
     if len(win_rows) > WINDOW_SIZE:
@@ -262,22 +259,27 @@ while True:
         and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
 
+        # —— 阻断式 retrain ——
         retrain_running = True
         snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
 
-        # 判断严重度
-        if   js_val > JS_SEV2_THRESH: severity = "K"
-        elif js_val > JS_SEV1_THRESH: severity = "2"
-        else:                          severity = "1"
+        # 1) 通知下游：暂停生产/消费
+        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "start"})
 
-        threading.Thread(
-            target=_bg_retrain,
-            args=(js_val, snapshot),
-            daemon=True
-        ).start()
+        # 2) 同步调用 retrain（内部会更新 baseline_df、last_retrain_ts 并重置 retrain_running）
+        _bg_retrain(js_val, snapshot)
 
+        # 3) retrain 完毕，通知下游恢复
+        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "end"})
+
+        # 4) 记录触发事件
         record_metric("monitor", "retrain_trigger",
-                      js_val=round(js_val, 4), severity=severity)
+                    js_val=round(js_val, 4),
+                    severity=(
+                        "K" if js_val > JS_SEV2_THRESH else
+                        "2" if js_val > JS_SEV1_THRESH else
+                        "1"
+                    ))
 
 
 # ----------------------------------------------------------------------

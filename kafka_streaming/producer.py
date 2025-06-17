@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """
+kafka_streaming/producer.py — Kafka 数据生产者，支持接收 retrain 控制消息暂停／恢复
 """
-import os, sys, time, json, glob, datetime
-import pandas as pd, numpy as np
-from kafka import KafkaProducer
+import os
+import sys
+import time
+import json
+import glob
+import datetime
+import threading
+
+import pandas as pd
+import numpy as np
+from kafka import KafkaProducer, KafkaConsumer
 
 # 把项目根目录放进 sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 from shared.minio_helper import s3, BUCKET, load_csv, save_bytes
 from shared.config       import (
     DATA_DIR, KAFKA_TOPIC, KAFKA_SERVERS,
-    TARGET_COL, BATCH_SIZE, RESULT_DIR
+    TARGET_COL, BATCH_SIZE, RESULT_DIR, CONTROL_TOPIC
 )
 from shared.features      import FEATURE_COLS
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
-
-
 
 # ---------- 发送节奏 ----------
 SLEEP = float(os.getenv("MSG_SLEEP", "0.5"))
 LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
 LIM2  = int(os.getenv("LIMIT_PHASE2", "500"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "250"))
-
 
 STAGES = [
     ("Phase-1", f"datasets/random_rates.csv", LIM1),
@@ -31,14 +38,34 @@ STAGES = [
 ]
 
 # ---------- 本地缓存 & 时间戳 ----------
-TMP_DIR = "/tmp/producer"             # ← 全面改用 /tmp
+TMP_DIR = "/tmp/producer"
 os.makedirs(TMP_DIR, exist_ok=True)
-
-_START = datetime.datetime.utcnow()   # 保留原来的启动时间
-
-# producer_done 本地标记（只给本进程参考）
+_START = datetime.datetime.utcnow()
 FLAG_DONE_LOCAL = os.path.join(TMP_DIR, "producer_done.flag")
 
+# ---------- 控制暂停/恢复 的全局 event ----------
+pause_event = threading.Event()
+
+def _ctrl_listener():
+    """监听 CONTROL_TOPIC 上的 retrain:start/end 消息"""
+    cons = KafkaConsumer(
+        CONTROL_TOPIC,
+        bootstrap_servers=",".join(KAFKA_SERVERS),
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        value_deserializer=lambda m: json.loads(m.decode()),
+    )
+    for msg in cons:
+        v = msg.value
+        if v.get("retrain") == "start":
+            print("[producer] ⏸ pausing send (retrain start)")
+            pause_event.set()
+        elif v.get("retrain") == "end":
+            print("[producer] ▶ resuming send (retrain end)")
+            pause_event.clear()
+
+# 启动控制监听线程
+threading.Thread(target=_ctrl_listener, daemon=True).start()
 
 # ---------- Helper ----------
 def _ensure_local(rel_path: str) -> str:
@@ -53,14 +80,17 @@ def _ensure_local(rel_path: str) -> str:
     print(f"[producer]   saved → {abs_path}")
     return abs_path
 
-
 def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
     """
-    加随机 key = os.urandom(4)，确保 round-robin 分区，
-    三个 consumer 负载均衡。
+    加随机 key = os.urandom(4)，确保 round-robin 分区。
+    支持在 retrain 期间自动 pause。
     """
     total, sent, batch_id = len(df), 0, 0
     for idx, row in df.iterrows():
+        # —— 如果正在重训，则暂停发送 —— 
+        while pause_event.is_set():
+            time.sleep(0.5)
+
         payload = {
             "phase": phase,
             "row_index": int(idx),
@@ -68,10 +98,11 @@ def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
             "label": float(row[TARGET_COL]),
             "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
         }
-        # ★ 关键改动：带随机 key
-        prod.send(KAFKA_TOPIC,
-                  key=os.urandom(4),
-                  value=payload)
+        prod.send(
+            KAFKA_TOPIC,
+            key=os.urandom(4),
+            value=payload
+        )
 
         sent += 1
         if sent % BATCH_SIZE == 0 or sent == total:
@@ -87,7 +118,9 @@ def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
 # ---------- main ----------
 def main():
     print("[producer] start …")
-
+    
+    time.sleep(10)
+    save_bytes(f"{RESULT_DIR}/producer_ready.flag", b"", "text/plain")
     # —— 等 monitor 写入 MinIO readiness flag ——  
     key = f"{RESULT_DIR}/monitor_ready.flag"
     print(f"[producer] polling MinIO for {key} …")
@@ -99,7 +132,7 @@ def main():
             time.sleep(1)
     print("[producer] monitor ready → start producing")
 
-    # —— 等consumer 在 MinIO 上写好就绪标记 ——  
+    # —— 等 consumer 准备好 ——  
     num_consumers = int(os.getenv("NUM_CONSUMERS", "3"))
     timeout       = int(os.getenv("CONSUMER_WAIT_TIMEOUT", "60"))
     prefix        = f"{RESULT_DIR}/consumer_ready_"
@@ -137,27 +170,18 @@ def main():
         "producer_done": True,
         "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
     }
-
-    # 获取 topic 的所有分区，并将 sentinel 分发到每个分区
     partitions = prod.partitions_for(KAFKA_TOPIC)
     for p in partitions:
-        prod.send(
-            KAFKA_TOPIC,
-            partition=p,
-            value=sentinel
-        )
-
+        prod.send(KAFKA_TOPIC, partition=p, value=sentinel)
     prod.flush()
     prod.close()
 
-    # ① 本地 /tmp 写一个标记文件（可选，仅供诊断）
+    # 本地 & MinIO 标记
     open(FLAG_DONE_LOCAL, "w").close()
-
-    # ② 上传 MinIO，让 Monitor / Inference 通过 MinIO 同步
     save_bytes(f"{RESULT_DIR}/producer_done.flag", b"", "text/plain")
     print(f"[producer] sent sentinel to {len(partitions)} partitions")
 
-    # —— timing & metrics ——  
+    # timing & metrics
     timing_dir = os.path.join(TMP_DIR, "timing")
     os.makedirs(timing_dir, exist_ok=True)
     local_json = os.path.join(timing_dir, "producer.json")
@@ -170,20 +194,15 @@ def main():
                 (datetime.datetime.utcnow() - _START).total_seconds(), 3
             )
         }, fp, indent=2)
-
-    # 上传 timing 到 MinIO
     with open(local_json, "rb") as fp:
         save_bytes(f"{RESULT_DIR}/timing/producer.json",
                    fp.read(), "application/json")
-
     sync_all_metrics_to_minio()
 
-    # —— KFP metadata 占位 ——  
+    # KFP metadata 占位
     os.makedirs("/tmp/kfp_outputs", exist_ok=True)
     open("/tmp/kfp_outputs/output_metadata.json", "w").write("{}")
-
     print("[producer] ALL done.")
-
 
 if __name__ == "__main__":
     main()

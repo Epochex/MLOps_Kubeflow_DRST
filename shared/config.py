@@ -33,3 +33,8 @@ JS_SEV2_THRESH    = float(os.getenv("JS_SEV2_THRESH",    "0.80"))
 
 # ---------- 其他（用到 RESULT_DIR 的地方） ----------
 MAPPING_KEY  = f"{RESULT_DIR}/js_accuracy_mapping.json"
+
+# ---------- 控制信道（用于 pause/resume） ----------
+# Monitor 会在 retrain 前后往这个 topic 发 {"retrain":"start"/"end"}，
+# Producer & Consumer 订阅它来自行暂停/恢复。
+CONTROL_TOPIC = KAFKA_TOPIC + "_control"

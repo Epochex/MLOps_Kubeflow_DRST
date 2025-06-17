@@ -191,6 +191,26 @@ def _create_consumer():
     raise RuntimeError("[infer] Kafka still unreachable after 10 retries")
 
 def _listener():
+    # 0) 等待 producer_ready.flag （防止抢跑）
+    MAX_WAIT_FOR_PRODUCER = 600
+    WAIT_STEP = 5
+    flag_key = f"{RESULT_DIR}/producer_ready.flag"
+
+    def _wait_for_producer_flag():
+        for i in range(0, MAX_WAIT_FOR_PRODUCER, WAIT_STEP):
+            try:
+                s3.head_object(Bucket=BUCKET, Key=flag_key)
+                print(f"[infer:{pod_name}] ✓ detected producer_ready.flag in MinIO")
+                return
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "404":
+                    print(f"[infer:{pod_name}] MinIO error → {e}")
+                    break
+            time.sleep(WAIT_STEP)
+        raise TimeoutError(f"[infer:{pod_name}] ❌ wait for producer_ready.flag timeout after {MAX_WAIT_FOR_PRODUCER}s")
+
+    _wait_for_producer_flag()
+
     # 1) 创建 consumer（内含重试）
     cons = _create_consumer()
     print(f"[infer:{pod_name}] KafkaConsumer created, beginning to poll…")
@@ -221,8 +241,6 @@ def _listener():
         v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
         q.put(v)
 
-# 启动监听线程（daemon 模式，不阻塞主线程）
-threading.Thread(target=_listener, daemon=True).start()
 
 # -----------------------------------------------------------------------------
 # 周期性后台热重载（每 RELOAD_INTERVAL_S 秒调用一次 _reload_model）
