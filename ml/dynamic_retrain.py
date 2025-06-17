@@ -29,8 +29,8 @@ from shared.profiler     import Timer
 # ---------------------------------------------------------------------
 # 0. 超参数门槛
 # ---------------------------------------------------------------------
-NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "300"))   
-RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "1500"))
+NEW_SAMPLE_MIN    = int(os.getenv("NEW_SAMPLE_MIN", "100"))   # 初始强制重训样本数
+RETRAIN_RECENT_N  = int(os.getenv("RETRAIN_RECENT_N", "300"))  # 常规定期重训样本数
 
 start_ts = time.time()
 
@@ -46,91 +46,59 @@ if not os.path.exists(latest_path):
 latest_rows = np.load(latest_path, allow_pickle=True).tolist()
 
 cumu_path = "/tmp/monitor/all_seen.npy"
+all_seen = []
 if os.path.exists(cumu_path):
     all_seen = np.load(cumu_path, allow_pickle=True).tolist()
-else:
-    all_seen = []
 
-def _row_key(r):
-    # 用所有特征 + label 去重
-    feats = tuple(r["features"][c] for c in r["features"].keys())
-    return feats + (r["label"],)
-
-merged = { _row_key(r): r for r in all_seen }
-merged.update({ _row_key(r): r for r in latest_rows })
+# 去重
+keys = [(tuple(r['features'].get(c,0.0) for c in r['features']), r['label']) for r in all_seen]
+merged = {k: r for k, r in zip(keys, all_seen)}
+new_keys = [(tuple(r['features'].get(c,0.0) for c in r['features']), r['label']) for r in latest_rows]
+for k, r in zip(new_keys, latest_rows):
+    merged[k] = r
 all_seen = list(merged.values())
 np.save(cumu_path, np.array(all_seen, dtype=object))
 
 # ---------------------------------------------------------------------
-# 3. 采样：仅使用最近 RECENT_N 条流式样本
+# 3. 确定训练样本数
 # ---------------------------------------------------------------------
-# 环境变量可调，默认取最新 300 条
-RECENT_N = int(os.getenv("RETRAIN_RECENT_N", "300"))
+# 初始触发时使用少量样本，其他情况下使用常规定义数
+if JS == JS_TRIGGER_THRESH:
+    needed = NEW_SAMPLE_MIN
+else:
+    needed = RETRAIN_RECENT_N
 
-# 加载 monitor.py 丢到 /tmp/monitor/latest_batch.npy 的滑窗快照
-latest_path = "/tmp/monitor/latest_batch.npy"
-if not os.path.exists(latest_path):
-    raise FileNotFoundError(f"latest batch not found: {latest_path}")
-latest_rows = np.load(latest_path, allow_pickle=True).tolist()
-
-# 数据量检查：不够就推迟重训（exit code=2 会让 monitor 识别为失败，不更新 baseline_df）
-if len(latest_rows) < RECENT_N:
-    print(f"[dynamic] only {len(latest_rows)} recent rows (<{RECENT_N}), postpone retrain")
+if len(latest_rows) < needed:
+    print(f"[dynamic] only {len(latest_rows)} recent rows (<{needed}), postpone retrain")
     sys.exit(2)
 
-# 最终用来训练的行集：仅最后 RECENT_N 条流式样本
-all_rows = latest_rows[-RECENT_N:]
+# 从最新窗口中截取需要的样本
+latest_rows = latest_rows[-needed:]
 
 # ---------------------------------------------------------------------
 # 4. 加载 Top-10 特征列表 & StandardScaler
 # ---------------------------------------------------------------------
-# 4.1 Top-10 特征
 raw_feats = s3.get_object(Bucket=BUCKET,
-                          Key=f"{MODEL_DIR}/selected_feats.json")["Body"].read()
+                          Key=f"{MODEL_DIR}/selected_feats.json")['Body'].read()
 SELECTED_FEATS = json.loads(raw_feats)
 
-# 4.2 StandardScaler（offline 已训练好）
 buf = io.BytesIO(
-    s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/scaler.pkl")["Body"].read()
+    s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/scaler.pkl")['Body'].read()
 )
 scaler = joblib.load(buf)
 
 # ---------------------------------------------------------------------
-# 5. 数据充足性检查
+# 5. 准备训练数据 & 划分
 # ---------------------------------------------------------------------
-if len(latest_rows) < NEW_SAMPLE_MIN:
-    print(f"[dynamic] only {len(latest_rows)} recent rows (<{NEW_SAMPLE_MIN}), postpone retrain")
-    sys.exit(2)
+X = np.array([[r['features'].get(c,0.0) for c in SELECTED_FEATS] for r in latest_rows], dtype=np.float32)
+y = np.array([r['label'] for r in latest_rows], dtype=np.float32)
+X_scaled = scaler.transform(X)
 
-
-# 特征矩阵
-X_all = np.asarray(
-    [[r["features"].get(c, 0.0) for c in SELECTED_FEATS]
-     for r in all_rows],
-    dtype=np.float32
-)
-y_all = np.asarray([r["label"] for r in all_rows], dtype=np.float32)
-
-# 归一化
-X_scaled = scaler.transform(X_all).astype(np.float32)
-input_dim = X_scaled.shape[1]  # =10
-
-# 划分训练/验证
 Xtr, Xval, ytr, yval = train_test_split(
-    X_scaled, y_all, test_size=0.2, random_state=0
+    X_scaled, y, test_size=0.2, random_state=0
 )
-Xtr_t, ytr_t   = torch.from_numpy(Xtr),  torch.from_numpy(ytr)
+Xtr_t, ytr_t = torch.from_numpy(Xtr), torch.from_numpy(ytr)
 Xval_t, yval_t = torch.from_numpy(Xval), torch.from_numpy(yval)
-
-# ---------------------------------------------------------------------
-# 0. 触发 & 采样规模
-# ---------------------------------------------------------------------
-# 只要最近 100 条流式样本到位就可以开始尝试重训练
-NEW_SAMPLE_MIN = int(os.getenv("NEW_SAMPLE_MIN", "100"))
-# 但真正拿来做训练的，是最近 600 条样本
-RECENT_N       = int(os.getenv("RETRAIN_RECENT_N", "600"))
-
-
 # ---------------------------------------------------------------------
 # 6. 动态网格微调 + Early Stopping (warm-start baseline)
 # ---------------------------------------------------------------------
@@ -168,35 +136,31 @@ else:
     PATIENCE  = 8
 
 device = "cpu"
-
 def _train_one(cfg: dict) -> tuple[torch.nn.Module, float]:
     # — ① 从 baseline warm-start —
     raw = s3.get_object(Bucket=BUCKET,
                         Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
     model = torch.load(io.BytesIO(raw), map_location=device).train()
 
-    # — ② 仅解冻最后一层，加速微调 —
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.net[-1].parameters():
-        param.requires_grad = True
+    # （删除冻结/解冻逻辑，所有层都参与微调）
 
-    # — ③ 损失 & 优化器 —
-    loss_fn = (nn.MSELoss() if cfg.get("loss") == "mse"
-               else nn.SmoothL1Loss())
+    # — ② 损失 & 优化器 —
+    loss_fn = nn.MSELoss() if cfg.get("loss") == "mse" else nn.SmoothL1Loss()
     opt     = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        model.parameters(),
         lr=cfg["learning_rate"]
     )
 
     best_state, best_loss, es = None, float("inf"), 0
-    # — ④ 按 cfg.batch_size 训练 & Early Stopping —
+
+    # — ③ 按 cfg.batch_size 训练 & Early Stopping —
     for epoch in range(1, MAX_EPOCH + 1):
         perm = np.random.permutation(len(Xtr))
         for i in range(0, len(perm), cfg["batch_size"]):
             idx = perm[i : i + cfg["batch_size"]]
             xb  = torch.from_numpy(Xtr[idx]).to(device)
             yb  = torch.from_numpy(ytr[idx]).to(device)
+
             opt.zero_grad()
             loss = loss_fn(model(xb), yb)
             loss.backward()
@@ -216,9 +180,11 @@ def _train_one(cfg: dict) -> tuple[torch.nn.Module, float]:
             if es >= PATIENCE:
                 break
 
-    # — ⑤ 恢复最优权重 & 切 eval —
+    # — ④ 恢复最优权重 & 切 eval —
     model.load_state_dict(best_state)
     return model.eval(), best_loss
+
+
 
 # 6.3 执行网格搜索
 best_model, best_loss, best_cfg = None, float("inf"), None

@@ -19,7 +19,7 @@ import joblib
 import psutil
 import torch
 import torch.nn as nn
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 
 from shared.utils import _fetch, _bytes_to_model
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
@@ -35,6 +35,8 @@ from ml.model             import DynamicMLP, build_model
 from botocore.exceptions import ClientError     
 
 # ---------- 常量 & 本地路径 ---------------------------------------------
+
+RETRAIN_TOPIC = os.getenv("RETRAIN_TOPIC", KAFKA_TOPIC + "_infer_count")   # kafka topic total 100
 model_lock = threading.Lock()
 MODEL_IMPROVE_EPS = float(os.getenv("MODEL_IMPROVE_EPS", "1.0"))  # %
 
@@ -96,6 +98,7 @@ model_loading_ms = 0.0
 # ---------- 热重载 --------------------------------------------------------
 GAIN_THR_PP = float(os.getenv("GAIN_THRESHOLD_PP", "0.01"))  # ≥0.x 个百分点就换
 
+# ---------- 热重载 --------------------------------------------------------
 def _reload_model(force: bool = False):
     """
     热加载：仅当新模型相对 baseline 精度提升 >= GAIN_THR_PP
@@ -105,54 +108,59 @@ def _reload_model(force: bool = False):
     global current_model, curr_raw, model_sig, model_loading_ms
 
     try:
+        # 1) 尝试拉取 latest.txt
         latest_raw = _fetch("latest.txt")
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchKey":
+        model_key, metrics_key = latest_raw.decode().strip().splitlines()
+
+        # 2) 拉取模型字节流并计算签名
+        raw = _fetch(model_key)
+        sig = hashlib.md5(raw).hexdigest()
+
+        # 3) 非强制且签名未变 → 跳过
+        if not force and sig == model_sig:
             return
-        raise
 
-    model_key, metrics_key = latest_raw.decode().strip().splitlines()
-    raw = _fetch(model_key)
-    sig = hashlib.md5(raw).hexdigest()
+        # 4) 读取验证集准确率，计算增益
+        metrics = json.loads(_fetch(metrics_key).decode())
+        new_acc  = metrics.get("acc@0.15",    0.0)
+        base_acc = metrics.get("baseline_acc@0.15", 0.0)
+        gain_pp  = new_acc - base_acc
 
-    # 1) 如果版本未变，直接跳过
-    if not force and sig == model_sig:
-        return
+        # 5) 非强制且增益不足 → 跳过
+        if not force and gain_pp < GAIN_THR_PP:
+            print(f"[infer:{pod_name}] Δ{gain_pp:+.3f} pp < {GAIN_THR_PP} → skip reload")
+            return
 
-    # 2) 读取新旧模型在验证集上的 acc@0.15
-    metrics = json.loads(_fetch(metrics_key).decode())
-    new_acc  = metrics.get("acc@0.15", 0.0)
-    base_acc = metrics.get("baseline_acc@0.15", 0.0)
-    gain_pp  = new_acc - base_acc
+        # 6) 加载新模型并原子更新
+        t0 = time.perf_counter()
+        mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
+        with model_lock:
+            current_model      = mdl
+            current_model._val_acc15 = new_acc
+            curr_raw, model_sig     = raw, sig
+        model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
 
-    # 3) 只有当提升 >= GAIN_THR_PP 时才替换
-    if not force and gain_pp < GAIN_THR_PP:
+        log_metric(component="infer", event="hot_reload_runtime",
+                   model_loading_ms=model_loading_ms)
         print(
-            f"[infer:{pod_name}] Δ{gain_pp:+.3f} pp < {GAIN_THR_PP} → skip reload"
+            f"[infer:{pod_name}] hot-reloaded ✓  "
+            f"baseline={base_acc:.2f}% → new={new_acc:.2f}%  "
+            f"(Δ{gain_pp:+.3f} pp)  load={model_loading_ms} ms"
         )
+
+    except ClientError as e:
+        # latest.txt 不存在 → 跳过；其他 S3 错误都 log 后跳过
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "NoSuchKey":
+            print(f"[infer:{pod_name}] reload: no latest.txt → skip")
+        else:
+            print(f"[infer:{pod_name}] reload ClientError → {e}")
         return
 
-    # 4) 加载新模型并替换
-    t0 = time.perf_counter()
-    mdl = torch.load(io.BytesIO(raw), map_location=device).eval()
-    with model_lock:
-        current_model      = mdl
-        current_model._val_acc15 = new_acc
-        curr_raw, model_sig = raw, sig
-    model_loading_ms = round((time.perf_counter() - t0) * 1000, 3)
-
-    log_metric(component="infer", event="hot_reload_runtime",
-               model_loading_ms=model_loading_ms)
-    print(
-        f"[infer:{pod_name}] hot-reloaded ✓  "
-        f"baseline={base_acc:.2f}% → new={new_acc:.2f}%  "
-        f"(Δ{gain_pp:+.3f} pp)  load={model_loading_ms} ms"
-    )
-
-def hot_reload():
-    """异步触发热重载，不阻塞主推理循环。"""
-    threading.Thread(target=_reload_model, daemon=True).start()
-
+    except Exception as e:
+        # 网络中断、连接被拒等一切异常都 log 后跳过
+        print(f"[infer:{pod_name}] reload unexpected error → {e}")
+        return
 
 
 
@@ -207,6 +215,29 @@ def _listener():
 # 启动监听线程（daemon 模式，不阻塞主线程）
 threading.Thread(target=_listener, daemon=True).start()
 
+# -----------------------------------------------------------------------------
+# 周期性后台热重载（每 RELOAD_INTERVAL_S 秒调用一次 _reload_model）
+# -----------------------------------------------------------------------------
+RELOAD_INTERVAL_S = int(os.getenv("RELOAD_INTERVAL_S", "30"))
+
+def _reload_daemon():
+    while True:
+        time.sleep(RELOAD_INTERVAL_S)
+        try:
+            _reload_model()
+        except Exception as e:
+            # 理论上 _reload_model 已经吞掉所有异常，这里做兜底
+            print(f"[infer:{pod_name}] reload daemon error → {e}")
+
+# 启动守护线程
+threading.Thread(target=_reload_daemon, daemon=True).start()
+
+# 废弃原 per-batch 热重载，将 hot_reload 改为空实现
+def hot_reload():
+    # 每个 batch 不再触发热重载，改用上面的守护线程
+    pass
+# -----------------------------------------------------------------------------
+
 def _take_batch():
     buf = []
     try: buf.append(q.get(timeout=CONSUME_IDLE_S))
@@ -215,6 +246,12 @@ def _take_batch():
         try: buf.append(q.get_nowait())
         except queue.Empty: break
     return buf
+
+
+trigger_prod = KafkaProducer(
+    bootstrap_servers=",".join(KAFKA_SERVERS),
+    value_serializer=lambda m: json.dumps(m).encode(),
+)
 
 # ---------- Forecasting (demo) -------------------------------------------
 forecast_hist = deque(maxlen=300)
@@ -254,14 +291,17 @@ print(f"[infer:{pod_name}] consumer started…")
 
 while True:
     
-    hot_reload()  # 让每个 consumer 等到真正收到哨兵后再结束。这样不会因为某些分区提前耗尽而“假死”或“早退
     batch = _take_batch()
     now   = time.time()
     
     if not batch:  #  只在 “收到 producer_done” 且 “本地队列已清空” 时才优雅收尾
         if producer_done.is_set() and q.empty():
-            _reload_model(force=True)      # 最后再强制载一次最新模型
-            break                          # graceful shutdown
+            try:
+                _reload_model(force=True)   # 最后再强制载一次最新模型
+            except Exception as e:
+                print(f"[infer:{pod_name}] final reload error → {e}")
+            print(f"[infer:{pod_name}] graceful shutdown")
+            break
         time.sleep(0.3)
         continue
 
@@ -293,7 +333,7 @@ while True:
 
     # === 关键：让两路输入与各自模型首层维度匹配 ============================
     X_base = _align_to_dim(X_scaled, baseline_in_dim)   # 基线模型固定 10 维
-    X_adpt = _make_input(model_ref, X_scaled)           # adaptive 可能是 10 或 60 维
+    X_adpt = _align_to_dim(X_scaled, model_ref.net[0].in_features)
         
         
     # 3) Inference ---------------------------------------------------------
@@ -398,7 +438,10 @@ while True:
     print(f"[infer:{pod_name}] batch_metrics: "
           f"msg_total={msg_total}, latency={wall_ms:.3f}ms, "
           f"avg_rtt={avg_rtt}ms, cpu_pct={cpu_pct}/s")
-
+    try:
+        trigger_prod.send(RETRAIN_TOPIC, {"processed": batch_total})
+    except Exception:
+        pass
     # 6) Forecast & Hot-reload 保持不变
     forecast_hist.extend(preds_adpt)
     hot_reload()

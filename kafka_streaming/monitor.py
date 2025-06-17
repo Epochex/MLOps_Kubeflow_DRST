@@ -29,8 +29,13 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 # 动态的后10%combined 数据+300条训练的数据(一开始的时候就是约500多条combined数据)作为基线数据，然后跟滑动窗口为200的流数据进行js漂移值计算，
 # 一旦触发retrain，就把基线数据中300条训练的数据立刻替换retrain前的300条流数据，但仍然保留10%combined 数据，也就是10%combined 数据+300条retrain前最新数据
 # —— 窗口大小 —— 
-WINDOW_SIZE          = 200
-MIN_RETRAIN_INTERVAL = int(os.getenv("MIN_RETRAIN_INTERVAL", "3"))
+WINDOW_SIZE          = 300
+# 初始到达多少条立刻强制 retrain
+NEW_SAMPLE_MIN       = int(os.getenv("NEW_SAMPLE_MIN", "100"))
+
+
+infer_msg_count = 0    # 累计三个 inference consumer 处理的消息数
+first_forced = False   # 记录是否已经做过第一次强制 retrain
 
 # —— 声明指标 buffer、Producer 完成 flag、消息队列 q ——  
 metrics_buffer: list[dict] = []
@@ -97,7 +102,8 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 def _listener():
     cons = KafkaConsumer(
-        KAFKA_TOPIC,
+        KAFKA_TOPIC,                 # 原来的拉流 topic
+        KAFKA_TOPIC + "_infer_count",# 新增：各 consumer 发过来的 processed 计数
         bootstrap_servers=",".join(KAFKA_SERVERS),
         group_id="cg-monitor",
         auto_offset_reset=AUTO_OFFSET_RESET,
@@ -120,6 +126,9 @@ def _listener():
                     v = msg.value
                     if v.get("producer_done"):
                         producer_done.set()
+                    # 新增： inference consumer 发过来的 processed 计数
+                    elif "processed" in v:
+                        infer_msg_count += int(v["processed"])
                     else:
                         q.put(v)
         except Exception as e:
@@ -168,7 +177,12 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         np.save(local_np, np.array(snapshot_rows, dtype=object))
         print(f"[monitor] latest_batch.npy saved → {local_np}")
 
-        # 2) 同步调用 retrain 子进程，并捕获异常
+        # 2) 真正运行动态重训
+        subprocess.run(
+            ["python", "-m", "ml.dynamic_retrain", str(js_val)],
+            check=True
+        )
+        print("[monitor] dynamic_retrain finished")
         # 3) 只有 retrain 成功后，才更新 baseline_df
         with retrain_lock:
             combined_part = baseline_df.iloc[:ten_n].copy()
@@ -207,6 +221,19 @@ while True:
     win_rows.append(item)            # 加入滑动窗口
     retrain_buf.append(item)         # 缓存用于 dynamic_retrain
 
+    # —— 初始强制重训 —— 
+    # 当三个 inference consumer 累计处理量达到阈值时触发一次 retrain
+    if not first_forced and infer_msg_count >= NEW_SAMPLE_MIN:
+        first_forced = True
+        print(f"[monitor] initial force retrain at infer_msg_count={infer_msg_count}")
+        snapshot = retrain_buf.copy()
+        retrain_running = True
+        threading.Thread(
+            target=_bg_retrain,
+            args=(JS_TRIGGER_THRESH, snapshot),
+            daemon=True
+        ).start()
+
     # 保持窗口固定长度
     if len(win_rows) > WINDOW_SIZE:
         win_rows.pop(0)
@@ -233,6 +260,7 @@ while True:
         and not retrain_running):
 
         last_retrain_ts = now
+        retrain_running = True
 
         # ✅ 只用“当前滑动窗口”做 snapshot
         snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
@@ -250,6 +278,7 @@ while True:
 
         record_metric("monitor", "retrain_trigger",
                       js_val=round(js_val, 4), severity=severity)
+
 
 # ----------------------------------------------------------------------
 # 6. 收尾：写指标 & 上传
