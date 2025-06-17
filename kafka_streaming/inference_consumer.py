@@ -20,6 +20,7 @@ import psutil
 import torch
 import torch.nn as nn
 from kafka import KafkaConsumer, KafkaProducer
+from shared.config import CONTROL_TOPIC, KAFKA_TOPIC, KAFKA_SERVERS
 from shared.utils import _fetch, _bytes_to_model
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 from shared.profiler      import Timer
@@ -31,8 +32,9 @@ from shared.config        import (
 from shared.features      import FEATURE_COLS
 from ml.model             import DynamicMLP, build_model
 
-from botocore.exceptions import ClientError     
-
+from botocore.exceptions import ClientError    
+ 
+pause_event = threading.Event()
 # ---------- 常量 & 本地路径 ---------------------------------------------
 
 RETRAIN_TOPIC = os.getenv("RETRAIN_TOPIC", KAFKA_TOPIC + "_infer_count")   # kafka topic total 100
@@ -171,22 +173,21 @@ q = queue.Queue()
 producer_done = threading.Event()
 
 def _create_consumer():
-    """尝试重试连接 Kafka，多次失败后抛出 RuntimeError"""
-    for attempt in range(1, 11):  # 最多重试 10 次
+    for attempt in range(1, 11):
         try:
-            return KafkaConsumer(
-                KAFKA_TOPIC,
+            cons = KafkaConsumer(
+                KAFKA_TOPIC, CONTROL_TOPIC,
                 bootstrap_servers=",".join(KAFKA_SERVERS),
                 group_id="cg-infer",
                 auto_offset_reset=AUTO_OFFSET_RESET,
                 enable_auto_commit=ENABLE_AUTO_COMMIT,
                 value_deserializer=lambda m: json.loads(m.decode()),
-                # 限制 api_version 自动探测时间，防止卡住
                 api_version_auto_timeout_ms=10000,
             )
-        except NoBrokersAvailable as e:
-            print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
-            time.sleep(5)
+            return cons
+        except NoBrokersAvailable:
+        print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
+        time.sleep(5)
     raise RuntimeError("[infer] Kafka still unreachable after 10 retries")
 
 def _listener():
@@ -204,6 +205,15 @@ def _listener():
     # 3) 持续接收消息
     for msg in cons:
         v = msg.value
+        # —— 控制消息 —— 
+        if "retrain" in v:
+            if v["retrain"] == "start":
+                print("[infer] PAUSE consumption for retrain")
+                pause_event.set()
+            elif v["retrain"] == "end":
+                print("[infer] RESUME consumption after retrain")
+                pause_event.clear()
+            continue
         if v.get("producer_done"):
             producer_done.set()
             continue
@@ -289,7 +299,9 @@ total_count     = 0
 print(f"[infer:{pod_name}] consumer started…")
 
 while True:
-    
+    # 如果正在 retrain，则阻塞在这里，直到收到 resume 信号
+    while pause_event.is_set():
+        time.sleep(1)
     batch = _take_batch()
     now   = time.time()
     
@@ -474,4 +486,5 @@ print(f"[infer:{pod_name}] trace npz saved – total {len(arr_true)} samples")
 
 sync_all_metrics_to_minio()
 print(f"[infer:{pod_name}] all metrics synced, exiting.")
+
 
