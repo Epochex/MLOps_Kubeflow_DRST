@@ -14,12 +14,11 @@ import pandas as pd
 import psutil
 from kafka import KafkaConsumer, KafkaProducer
 from scipy.spatial.distance import jensenshannon
-
 from shared.config import (
     KAFKA_TOPIC, KAFKA_SERVERS,
     JS_TRIGGER_THRESH, JS_SEV1_THRESH, JS_SEV2_THRESH,
     CONSUME_IDLE_S, AUTO_OFFSET_RESET, ENABLE_AUTO_COMMIT,
-    RESULT_DIR
+    RESULT_DIR, CONTROL_TOPIC
 )
 from shared.features      import FEATURE_COLS
 from shared.minio_helper  import load_csv, save_bytes
@@ -36,6 +35,12 @@ MIN_RETRAIN_INTERVAL = float(os.getenv("MIN_RETRAIN_INTERVAL", "0.1"))
 
 infer_msg_count = 0    # 累计三个 inference consumer 处理的消息数
 first_forced = False   # 记录是否已经做过第一次强制 retrain
+
+# Kafka 控制消息生产者（向 CONTROL_TOPIC 广播 retrain:start/end）
+ctrl_prod = KafkaProducer(
+    bootstrap_servers=",".join(KAFKA_SERVERS),
+    value_serializer=lambda m: json.dumps(m).encode()
+)
 
 # —— 声明指标 buffer、Producer 完成 flag、消息队列 q ——  
 metrics_buffer: list[dict] = []
@@ -202,6 +207,7 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         # 4) 无论成功失败，都在这里更新触发时间 & 重置状态
         last_retrain_ts = time.time()
         retrain_running = False
+        retrain_buf.clear()
 
 # ----------------------------------------------------------------------
 # 5. 主循环（更新后）
@@ -229,10 +235,12 @@ while True:
         print(f"[monitor] initial force retrain at infer_msg_count={infer_msg_count}")
         # 1) 广播暂停
         ctrl_prod.send(CONTROL_TOPIC, {"retrain": "start"})
+        ctrl_prod.flush()
         # 2) 阻断式 retrain
         _bg_retrain(JS_TRIGGER_THRESH, retrain_buf.copy())
         # 3) 广播恢复
         ctrl_prod.send(CONTROL_TOPIC, {"retrain": "end"})
+        ctrl_prod.flush()
 
     # 保持窗口固定长度 & 未满则跳过
     if len(win_rows) > WINDOW_SIZE:
@@ -243,7 +251,8 @@ while True:
     # 计算 JS 值
     t0 = time.time()
     df_win = pd.DataFrame([r["features"] for r in win_rows])
-    js_val = _avg_js(df_win)
+    with retrain_lock:
+        js_val = _avg_js(df_win)
     js_ms  = (time.time() - t0) * 1000
 
     record_metric("monitor", "drift_calc",
@@ -255,31 +264,30 @@ while True:
 
     # ───── 触发重训 ─────────────────────────────────────────────
     now = time.time()
-    if (js_val > JS_TRIGGER_THRESH
-        and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
-        and not retrain_running):
+    with retrain_lock:
+        if (js_val > JS_TRIGGER_THRESH
+            and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
+            and not retrain_running):
+            retrain_running = True
+            # 正确切片取最近 N 条样本
+            snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
 
-        # —— 阻断式 retrain ——
-        retrain_running = True
-        snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
-
-        # 1) 通知下游：暂停生产/消费
-        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "start"})
-
-        # 2) 同步调用 retrain（内部会更新 baseline_df、last_retrain_ts 并重置 retrain_running）
-        _bg_retrain(js_val, snapshot)
-
-        # 3) retrain 完毕，通知下游恢复
-        ctrl_prod.send(CONTROL_TOPIC, {"retrain": "end"})
-
-        # 4) 记录触发事件
-        record_metric("monitor", "retrain_trigger",
-                    js_val=round(js_val, 4),
-                    severity=(
-                        "K" if js_val > JS_SEV2_THRESH else
-                        "2" if js_val > JS_SEV1_THRESH else
-                        "1"
-                    ))
+            # 1) 通知下游：暂停生产/消费
+            ctrl_prod.send(CONTROL_TOPIC, {"retrain": "start"})
+            ctrl_prod.flush()  # 确保暂停消息已发出
+            # 2) 同步调用重训（内部会更新 baseline_df、last_retrain_ts 并重置 retrain_running）
+            _bg_retrain(js_val, snapshot)
+            # 3) 重训完毕，通知下游恢复
+            ctrl_prod.send(CONTROL_TOPIC, {"retrain": "end"})
+            ctrl_prod.flush()  # 确保恢复消息已发出
+            # 4) 记录触发事件
+            record_metric("monitor", "retrain_trigger",
+                          js_val=round(js_val, 4),
+                          severity=(
+                              "K" if js_val > JS_SEV2_THRESH else
+                              "2" if js_val > JS_SEV1_THRESH else
+                              "1"
+                          ))
 
 
 # ----------------------------------------------------------------------
