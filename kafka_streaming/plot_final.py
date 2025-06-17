@@ -16,7 +16,6 @@ from shared.config       import RESULT_DIR
 from shared.minio_helper import load_np, save_bytes, s3, BUCKET
 from ml.plot_report      import draw_three_phases
 
-from shared.config import  
 CONSUMER_WAIT_S  = 100
 SLEEP_INTERVAL =  3   # 每隔 2 秒去查一次
 # 1. 等离线 bridge artefacts

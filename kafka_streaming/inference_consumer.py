@@ -186,8 +186,8 @@ def _create_consumer():
             )
             return cons
         except NoBrokersAvailable:
-        print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
-        time.sleep(5)
+            print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
+            time.sleep(5)
     raise RuntimeError("[infer] Kafka still unreachable after 10 retries")
 
 def _listener():
