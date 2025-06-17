@@ -103,20 +103,55 @@ Xval_t, yval_t = torch.from_numpy(Xval), torch.from_numpy(yval)
 # 6. 动态网格微调 + Early Stopping (warm-start baseline)
 # ---------------------------------------------------------------------
 # 6.1 定义搜索空间（保持原有三档）
+# 6.1 定义搜索空间（重塑后）
 param_grid_A = [
-    {"hidden_layers": (32,),          "activation": "relu",
-     "learning_rate": 1e-3,           "batch_size": 64, "loss": "smooth_l1"},
+    # Fast adapt 小网格 + 低正则
+    {"hidden_layers": (32,),
+     "activation": "relu",
+     "learning_rate": 1e-3,
+     "batch_size": 64,
+     "loss": "smooth_l1",
+     "weight_decay": 1e-4},
+    {"hidden_layers": (16,),
+     "activation": "relu",
+     "learning_rate": 5e-4,
+     "batch_size": 64,
+     "loss": "smooth_l1",
+     "weight_decay": 1e-4},
 ]
+
 param_grid_B = [
-    {"hidden_layers": (64, 32),       "activation": "relu",
-     "learning_rate": 5e-3,           "batch_size": 64, "loss": "smooth_l1"},
+    # 中等容量 + 少量 GELU + 强正则
+    {"hidden_layers": (64, 32),
+     "activation": "relu",
+     "learning_rate": 5e-4,
+     "batch_size": 64,
+     "loss": "smooth_l1",
+     "weight_decay": 5e-4},
+    {"hidden_layers": (64, 32),
+     "activation": "gelu",
+     "learning_rate": 1e-3,
+     "batch_size": 32,
+     "loss": "smooth_l1",
+     "weight_decay": 5e-4},
 ]
+
 param_grid_C = [
-    {"hidden_layers": (128, 64, 32),  "activation": "relu",
-     "learning_rate": 1e-2,           "batch_size": 32, "loss": "smooth_l1"},
-    {"hidden_layers": (256, 128, 64), "activation": "gelu",
-     "learning_rate": 5e-3,           "batch_size": 32, "loss": "mse"},
+    # 深网格 + 更小 batch + mix loss
+    {"hidden_layers": (128, 64, 32),
+     "activation": "relu",
+     "learning_rate": 1e-3,
+     "batch_size": 32,
+     "loss": "smooth_l1",
+     "weight_decay": 1e-3},
+    {"hidden_layers": (256, 128, 64),
+     "activation": "gelu",
+     "learning_rate": 5e-4,
+     "batch_size": 16,
+     "loss": "mse",
+     "weight_decay": 1e-3},
 ]
+
 
 # 6.2 根据漂移严重度选择网格 & 微调节奏
 if JS <= JS_SEV1_THRESH:
@@ -142,13 +177,12 @@ def _train_one(cfg: dict) -> tuple[torch.nn.Module, float]:
                         Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
     model = torch.load(io.BytesIO(raw), map_location=device).train()
 
-    # （删除冻结/解冻逻辑，所有层都参与微调）
-
     # — ② 损失 & 优化器 —
     loss_fn = nn.MSELoss() if cfg.get("loss") == "mse" else nn.SmoothL1Loss()
     opt     = torch.optim.Adam(
         model.parameters(),
-        lr=cfg["learning_rate"]
+        lr=cfg["learning_rate"],
+        weight_decay=cfg.get("weight_decay", 0.0)
     )
 
     best_state, best_loss, es = None, float("inf"), 0
@@ -203,7 +237,7 @@ if best_model is None:
 # ---------------------------------------------------------------------
 # 7.1 评估 baseline_model 在相同验证集上的表现
 base_raw = s3.get_object(Bucket=BUCKET,
-                         Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
+                            Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
 baseline_model = torch.load(io.BytesIO(base_raw), map_location="cpu").eval()
 
 with torch.no_grad():
@@ -215,17 +249,18 @@ with torch.no_grad():
     new_hat = best_model(Xval_t).detach().cpu().numpy()
 new_acc = calculate_accuracy_within_threshold(yval, new_hat, 0.15)
 
+# —— 修正这里的 trained_on，不再使用未定义的 all_rows —— 
 metrics = {
     "js_trigger":         JS,
     "val_loss":           float(best_loss),
     "acc@0.15":           float(new_acc),
     "baseline_acc@0.15":  float(baseline_acc),
-    "trained_on":         len(all_rows),
+    "trained_on":         len(latest_rows),           # ← 改成 latest_rows 的长度
     "timestamp_utc":      datetime.utcnow().isoformat() + "Z",
 }
 save_bytes(f"{MODEL_DIR}/metrics_tmp.json",
-           json.dumps(metrics).encode(),
-           "application/json")
+            json.dumps(metrics).encode(),
+            "application/json")
 
 # 在模型对象中记录新模型的验证准确率
 best_model._val_acc15 = new_acc
@@ -235,14 +270,14 @@ buf = io.BytesIO()
 torch.save(best_model.cpu(), buf)
 buf.seek(0)
 save_bytes(f"{MODEL_DIR}/model_tmp.pt",
-           buf.read(),
-           "application/octet-stream")
+            buf.read(),
+            "application/octet-stream")
 
 # 7.4 原子更新 latest.txt，让 inference_consumer 热加载
 latest_content = "model_tmp.pt\nmetrics_tmp.json"
 save_bytes(f"{MODEL_DIR}/latest.txt",
-           latest_content.encode(),
-           "text/plain")
+            latest_content.encode(),
+            "text/plain")
 
 # 7.5 上报 & 同步所有指标
 log_metric(component="retrain", event="model_pushed")
@@ -253,5 +288,5 @@ elapsed = time.time() - start_ts
 print(
     f"[dynamic] retrain done | JS={JS:.4f} | "
     f"loss={best_loss:.6f} | acc@0.15(old→new)={baseline_acc:.2f}%→{new_acc:.2f}% | "
-    f"cfg={best_cfg} | elapsed={elapsed:.2f}s"
+    f"trained_on={len(latest_rows)} | cfg={best_cfg} | elapsed={elapsed:.2f}s"
 )

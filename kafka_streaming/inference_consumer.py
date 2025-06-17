@@ -20,7 +20,6 @@ import psutil
 import torch
 import torch.nn as nn
 from kafka import KafkaConsumer, KafkaProducer
-
 from shared.utils import _fetch, _bytes_to_model
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 from shared.profiler      import Timer

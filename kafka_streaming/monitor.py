@@ -32,7 +32,7 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 WINDOW_SIZE          = 300
 # 初始到达多少条立刻强制 retrain
 NEW_SAMPLE_MIN       = int(os.getenv("NEW_SAMPLE_MIN", "100"))
-
+MIN_RETRAIN_INTERVAL = float(os.getenv("MIN_RETRAIN_INTERVAL", "0.1"))
 
 infer_msg_count = 0    # 累计三个 inference consumer 处理的消息数
 first_forced = False   # 记录是否已经做过第一次强制 retrain
@@ -48,8 +48,6 @@ retrain_lock:  threading.Lock = threading.Lock()
 retrain_running: bool         = False       # 后台重训是否正在进行
 
 # —— 基线动态配置 —— 
-# 只保留 combined.csv 的后10%，初始不加入流数据
-PCT                 = 0.1
 TRAIN_N             = 500
 BASELINE_KEY        = os.getenv("BASELINE_KEY", "datasets/combined.csv")
 
@@ -60,8 +58,8 @@ combined_df.drop(columns=["input_rate", "latency", "output_rate"],
 combined_df = combined_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
 
 # 2) 拿尾部 10% 作为 static 基线
-ten_n = max(1, int(PCT * len(combined_df)))
-base_combined = combined_df.tail(ten_n).reset_index(drop=True)
+ten_n = TRAIN_N
+base_combined = combined_df.tail(TRAIN_N).reset_index(drop=True)
 
 # ✅ 3) 初始化基线：只保留 static 部分（尾部10%）
 baseline_df = base_combined.copy()
@@ -99,8 +97,10 @@ TMP_DIR = "/tmp/monitor"                # ← 改用 /tmp 做临时存储
 os.makedirs(TMP_DIR, exist_ok=True)
 
 
-
 def _listener():
+    global infer_msg_count
+    
+    
     cons = KafkaConsumer(
         KAFKA_TOPIC,                 # 原来的拉流 topic
         KAFKA_TOPIC + "_infer_count",# 新增：各 consumer 发过来的 processed 计数
@@ -160,15 +160,17 @@ def _avg_js(df: pd.DataFrame) -> float:
                           for f in JS_FEATS])) if JS_FEATS else 0.0
 
 # ----------------------------------------------------------------------
-# 4. 重训后台线程
+# 4. 重训后台线程（更新后）
 # ----------------------------------------------------------------------
 def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
     """
     ① 把当前窗口写入 /tmp/monitor/latest_batch.npy（供 dynamic_retrain）
     ② 同步调用 dynamic_retrain，捕获成功或失败
-    ③ 成功时扩充 baseline_df；失败时重置状态，跳过更新
+    ③ 成功时扩充 baseline_df；失败时跳过更新
+    ④ 在 finally 中更新 last_retrain_ts 并重置 retrain_running
     """
-    global retrain_running, baseline_df
+    global retrain_running, baseline_df, last_retrain_ts
+
     try:
         print(f"[monitor] retrain start (JS={js_val:.4f})")
 
@@ -183,6 +185,7 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
             check=True
         )
         print("[monitor] dynamic_retrain finished")
+
         # 3) 只有 retrain 成功后，才更新 baseline_df
         with retrain_lock:
             combined_part = baseline_df.iloc[:ten_n].copy()
@@ -192,15 +195,17 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
                   .reindex(columns=FEATURE_COLS, fill_value=0.0)
             )
             baseline_df = pd.concat([combined_part, train_part], ignore_index=True)
-            retrain_running = False
 
     except Exception as exc:
         print(f"[monitor] retrain thread error: {exc}")
-        with retrain_lock:
-            retrain_running = False
+
+    finally:
+        # 4) 无论成功失败，都在这里更新触发时间 & 重置状态
+        last_retrain_ts = time.time()
+        retrain_running = False
 
 # ----------------------------------------------------------------------
-# 5. 主循环
+# 5. 主循环（更新后）
 # ----------------------------------------------------------------------
 print(f"[monitor] start, WINDOW={WINDOW_SIZE}, THR={JS_TRIGGER_THRESH}")
 win_rows: list[dict] = []
@@ -214,31 +219,29 @@ while True:
         if producer_done.is_set():
             print("[monitor] producer_done & queue empty → bye")
             break
-        # 无消息且生产者未完成，继续等待
-        continue
+        continue  # 继续等待
 
     msg_count += 1
-    win_rows.append(item)            # 加入滑动窗口
-    retrain_buf.append(item)         # 缓存用于 dynamic_retrain
+    win_rows.append(item)
+    retrain_buf.append(item)
 
     # —— 初始强制重训 —— 
-    # 当三个 inference consumer 累计处理量达到阈值时触发一次 retrain
     if not first_forced and infer_msg_count >= NEW_SAMPLE_MIN:
         first_forced = True
         print(f"[monitor] initial force retrain at infer_msg_count={infer_msg_count}")
-        snapshot = retrain_buf.copy()
         retrain_running = True
+        snapshot = retrain_buf.copy()
         threading.Thread(
             target=_bg_retrain,
             args=(JS_TRIGGER_THRESH, snapshot),
             daemon=True
         ).start()
 
-    # 保持窗口固定长度
+    # 保持窗口固定长度 & 未满则跳过
     if len(win_rows) > WINDOW_SIZE:
         win_rows.pop(0)
     if len(win_rows) < WINDOW_SIZE:
-        continue  # 窗口未满，跳过 JS 计算
+        continue
 
     # 计算 JS 值
     t0 = time.time()
@@ -252,20 +255,17 @@ while True:
                   **_sys_metrics())
 
     print(f"[monitor] JS={js_val:.4f} (thr={JS_TRIGGER_THRESH}) msgs={msg_count}")
-    
+
     # ───── 触发重训 ─────────────────────────────────────────────
     now = time.time()
     if (js_val > JS_TRIGGER_THRESH
         and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
 
-        last_retrain_ts = now
         retrain_running = True
-
-        # ✅ 只用“当前滑动窗口”做 snapshot
         snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
 
-        # 判断严重度 …
+        # 判断严重度
         if   js_val > JS_SEV2_THRESH: severity = "K"
         elif js_val > JS_SEV1_THRESH: severity = "2"
         else:                          severity = "1"
