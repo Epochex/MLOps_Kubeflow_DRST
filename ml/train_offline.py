@@ -24,6 +24,9 @@ from ml.model            import build_model
 
 
 
+#   TRAIN_TRIGGER=0 时跳过训练，直接加载 MinIO 上已有基线模型进行评估
+TRAIN_TRIGGER = int(os.getenv("TRAIN_TRIGGER", "0"))
+
 # ---------------------------------------------------------------------
 # 常量 & 目录
 # ---------------------------------------------------------------------
@@ -63,8 +66,7 @@ df_all = _read_clean(offline_path)
 corrs = df_all[FEATURE_COLS + [TARGET_COL]].corr()[TARGET_COL][FEATURE_COLS]
 SELECTED_FEATS = corrs.abs().sort_values(ascending=False).head(10).index.tolist()
 print(f"[offline] selected top10 feats: {SELECTED_FEATS}")
-
-# 保存到 MinIO，供后续 dynamic_retrain 和 inference_consumer 加载
+# 保存特征列表供后续使用
 save_bytes(
     f"{MODEL_DIR}/selected_feats.json",
     json.dumps(SELECTED_FEATS).encode(),
@@ -72,64 +74,68 @@ save_bytes(
 )
 
 # 3) StandardScaler
-# 3.1 准备训练数据（只用 SELECTED_FEATS 这 10 维）
 X_full = df_all[SELECTED_FEATS].astype(np.float32).values
 y_full = df_all[TARGET_COL].astype(np.float32).values
-
-# 3.2 训练 scaler
 scaler = StandardScaler().fit(X_full)
 X_scaled = scaler.transform(X_full)
-
-# 3.3 本地保存并上传 scaler
+# 上传 scaler
 local_scaler = f"{TMP_DIR}/scaler.pkl"
 joblib.dump(scaler, local_scaler)
 with open(local_scaler, "rb") as f:
     save_bytes(f"{MODEL_DIR}/scaler.pkl", f.read(), "application/octet-stream")
 
-# 3.4 记录输入维度
-input_dim = X_scaled.shape[1]  # 应为 10
+model = None
 
 # ---------------------------------------------------------------------
 # 4) 划分 / 训练模型
 # ---------------------------------------------------------------------
-X_tr, X_te, y_tr, y_te = train_test_split(
-    X_scaled, y_full, test_size=0.3, random_state=0
-)
-loader = DataLoader(
-    TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
-    batch_size=16, shuffle=True
-)
+if TRAIN_TRIGGER != 0:
+    # 4.1 划分 / 训练模型
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_scaled, y_full, test_size=0.3, random_state=0
+    )
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
+        batch_size=16, shuffle=True
+    )
+    model = build_model(
+        {"hidden_layers": (64, 32), "activation": "relu"},
+        input_dim=X_scaled.shape[1]
+    ).to(device)
+    opt   = Adam(model.parameters(), lr=1e-2)
+    sched = ReduceLROnPlateau(opt, factor=0.5, patience=5, min_lr=1e-5)
+    lossf = nn.SmoothL1Loss()
 
-model = build_model(
-    {"hidden_layers": (64, 32), "activation": "relu"},
-    input_dim=input_dim
-).to(device)
-opt   = Adam(model.parameters(), lr=1e-2)
-sched = ReduceLROnPlateau(opt, factor=0.5, patience=5, min_lr=1e-5)
-lossf = nn.SmoothL1Loss()
+    best_val, best_state, no_imp = float("inf"), None, 0
+    for epoch in range(1, 101):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            lossf(model(xb), yb).backward()
+            opt.step()
+        with torch.no_grad():
+            val = lossf(
+                model(torch.from_numpy(X_te).to(device)),
+                torch.from_numpy(y_te).to(device)
+            ).item()
+        sched.step(val)
+        if val + 1e-6 < best_val:
+            best_val, best_state, no_imp = val, model.state_dict(), 0
+        else:
+            no_imp += 1
+            if no_imp >= 10:
+                print(f"[offline] early-stop @ epoch {epoch}")
+                break
+    model.load_state_dict(best_state)
+else:
+    # 直接加载 MinIO 上已有 basline 模型
+    print("[offline] TRAIN_TRIGGER=0, loading existing baseline_model.pt")
+    buf = io.BytesIO(
+        s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/baseline_model.pt")["Body"].read()
+    )
+    model = torch.load(buf, map_location=device)
 
-best_val, best_state, no_imp = float("inf"), None, 0
-for epoch in range(1, 101):
-    model.train()
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        opt.zero_grad()
-        lossf(model(xb), yb).backward()
-        opt.step()
-    with torch.no_grad():
-        val = lossf(
-            model(torch.from_numpy(X_te).to(device)),
-            torch.from_numpy(y_te).to(device)
-        ).item()
-    sched.step(val)
-    if val + 1e-6 < best_val:
-        best_val, best_state, no_imp = val, model.state_dict(), 0
-    else:
-        no_imp += 1
-        if no_imp >= 10:
-            print(f"[offline] early-stop @ epoch {epoch}")
-            break
-model.load_state_dict(best_state)
 
 # ---------------------------------------------------------------------
 # 5) 精度测试

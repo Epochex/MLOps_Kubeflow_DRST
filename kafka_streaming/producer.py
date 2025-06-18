@@ -19,8 +19,8 @@ from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
 # ---------- 发送节奏 ----------
 SLEEP = float(os.getenv("MSG_SLEEP", "0.5"))
-LIM1  = int(os.getenv("LIMIT_PHASE1", "500"))
-LIM2  = int(os.getenv("LIMIT_PHASE2", "500"))
+LIM1  = int(os.getenv("LIMIT_PHASE1", "1000"))
+LIM2  = int(os.getenv("LIMIT_PHASE2", "700"))
 LIM3  = int(os.getenv("LIMIT_PHASE3", "250"))
 
 
@@ -69,9 +69,8 @@ def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
             "send_ts": datetime.datetime.utcnow().isoformat() + "Z"
         }
         # ★ 关键改动：带随机 key
-        prod.send(KAFKA_TOPIC,
-                  key=os.urandom(4),
-                  value=payload)
+        prod.send(KAFKA_TOPIC, value=payload)  # ✅ 让 RoundRobinPartitioner 接管
+
 
         sent += 1
         if sent % BATCH_SIZE == 0 or sent == total:
@@ -87,7 +86,7 @@ def send_df(df: pd.DataFrame, prod: KafkaProducer, phase: str):
 # ---------- main ----------
 def main():
     print("[producer] start …")
-
+    time.sleep(5)  # 等待其他组件准备就绪
     # —— 等 monitor 写入 MinIO readiness flag ——  
     key = f"{RESULT_DIR}/monitor_ready.flag"
     print(f"[producer] polling MinIO for {key} …")
@@ -119,6 +118,7 @@ def main():
     prod = KafkaProducer(
         bootstrap_servers=",".join(KAFKA_SERVERS),
         value_serializer=lambda m: json.dumps(m).encode(),
+        # 删除 partitioner 参数即可，默认就是轮询策略
     )
 
     # —— 逐阶段发送 ——  

@@ -20,6 +20,7 @@ import psutil
 import torch
 import torch.nn as nn
 from kafka import KafkaConsumer, KafkaProducer
+from kafka.errors import NoBrokersAvailable
 from shared.utils import _fetch, _bytes_to_model
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 from shared.profiler      import Timer
@@ -168,11 +169,28 @@ import time
 from kafka.errors import NoBrokersAvailable
 
 q = queue.Queue()
+
+# 当每个分区都收到一次 {"producer_done": true} 时才认为真正结束
+producer_done  = threading.Event()   # 兼容旧逻辑：收到任何 sentinel 就置位
+sentinel_seen  = 0                  # 已收到的 sentinel 数
+NUM_PARTITIONS = 0                  # 初始化后由 _listener() 实际填充
+sentinel_lock  = threading.Lock()   # 并发保护
 producer_done = threading.Event()
+
+# ---------- Kafka 监听线程（带重试） -----------------------------------------------
+import time
+from kafka.errors import NoBrokersAvailable
+
+q = queue.Queue()
+
+producer_done  = threading.Event()
+sentinel_seen  = 0
+NUM_PARTITIONS = 0
+sentinel_lock  = threading.Lock()
 
 def _create_consumer():
     """尝试重试连接 Kafka，多次失败后抛出 RuntimeError"""
-    for attempt in range(1, 11):  # 最多重试 10 次
+    for attempt in range(1, 11):
         try:
             return KafkaConsumer(
                 KAFKA_TOPIC,
@@ -181,33 +199,42 @@ def _create_consumer():
                 auto_offset_reset=AUTO_OFFSET_RESET,
                 enable_auto_commit=ENABLE_AUTO_COMMIT,
                 value_deserializer=lambda m: json.loads(m.decode()),
-                # 限制 api_version 自动探测时间，防止卡住
                 api_version_auto_timeout_ms=10000,
             )
-        except NoBrokersAvailable as e:
-            print(f"[infer:{pod_name}] bootstrap brokers unavailable ({attempt}/10), retrying in 5s…")
+        except NoBrokersAvailable:
+            print(f"[infer:{pod_name}] brokers unavailable ({attempt}/10), retrying in 5s…")
             time.sleep(5)
     raise RuntimeError("[infer] Kafka still unreachable after 10 retries")
 
 def _listener():
-    # 1) 创建 consumer（内含重试）
+    """
+    • 创建 KafkaConsumer（含 10 次重试）
+    • 统计 topic 分区数，记录到 NUM_PARTITIONS
+    • 每收到一条带 {"producer_done": true} 的消息就把 sentinel_seen +1
+    """
+    global NUM_PARTITIONS, sentinel_seen
+
     cons = _create_consumer()
     print(f"[infer:{pod_name}] KafkaConsumer created, beginning to poll…")
 
-    # 2) readiness flag：/tmp + MinIO
+    # 等待分区分配
+    time.sleep(1)
+    NUM_PARTITIONS = len(cons.partitions_for_topic(KAFKA_TOPIC) or [])
+    print(f"[infer:{pod_name}] topic «{KAFKA_TOPIC}» has {NUM_PARTITIONS} partitions")
+
+    # readiness flag
     flag_local = os.path.join(TMP_DIR, f"consumer_ready_{pod_name}.flag")
     open(flag_local, "w").close()
-    print(f"[infer:{pod_name}] readiness flag →", flag_local)
-    save_bytes(f"{RESULT_DIR}/consumer_ready_{pod_name}.flag",
-               b"", "text/plain")
+    save_bytes(f"{RESULT_DIR}/consumer_ready_{pod_name}.flag", b"", "text/plain")
 
-    # 3) 持续接收消息
     for msg in cons:
         v = msg.value
         if v.get("producer_done"):
+            with sentinel_lock:
+                sentinel_seen += 1
+                print(f"[infer:{pod_name}] got sentinel {sentinel_seen}/{NUM_PARTITIONS}")
             producer_done.set()
             continue
-        # 注入接收时间戳
         v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
         q.put(v)
 
@@ -280,7 +307,7 @@ def _align_to_dim(X_scaled: np.ndarray, in_dim: int) -> np.ndarray:
 # ---------------------------  主循环  ------------------------------------
 first_batch     = True
 container_start = time.perf_counter()
-IDLE_TIMEOUT_S  = 180
+IDLE_TIMEOUT_S  = 30      # 超过 30 秒无新消息就退出
 last_data_time  = time.time()
 msg_total       = 0
 correct_count   = 0
@@ -289,21 +316,33 @@ total_count     = 0
 print(f"[infer:{pod_name}] consumer started…")
 
 while True:
-    
     batch = _take_batch()
     now   = time.time()
-    
-    if not batch:  #  只在 “收到 producer_done” 且 “本地队列已清空” 时才优雅收尾
-        if producer_done.is_set() and q.empty():
+
+    # 如果这段时间既没数据又超时，就优雅退出
+    if not batch and (now - last_data_time) > IDLE_TIMEOUT_S:
+        print(f"[infer:{pod_name}] idle >{IDLE_TIMEOUT_S}s, exiting")
+        try:
+            _reload_model(force=True)
+        except Exception as e:
+            print(f"[infer:{pod_name}] final reload error → {e}")
+        print(f"[infer:{pod_name}] graceful shutdown – processed {msg_total} samples")
+        break
+
+    if not batch:
+        with sentinel_lock:
+            all_done = (sentinel_seen >= NUM_PARTITIONS) if NUM_PARTITIONS else False
+        if all_done and q.empty():
             try:
-                _reload_model(force=True)   # 最后再强制载一次最新模型
+                _reload_model(force=True)
             except Exception as e:
                 print(f"[infer:{pod_name}] final reload error → {e}")
-            print(f"[infer:{pod_name}] graceful shutdown")
+            print(f"[infer:{pod_name}] graceful shutdown – processed {msg_total} samples")
             break
         time.sleep(0.3)
         continue
 
+    # 收到数据，更新时间戳
     last_data_time = now
     if first_batch:
         cold_ms = (time.perf_counter() - container_start) * 1000

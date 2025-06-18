@@ -25,47 +25,78 @@ from shared.features      import FEATURE_COLS
 from shared.minio_helper  import load_csv, save_bytes
 from shared.metric_logger import log_metric, sync_all_metrics_to_minio
 
+from collections import deque
+
+
+
 # 0. 全局 & 初始化
-# 动态的后10%combined 数据+300条训练的数据(一开始的时候就是约500多条combined数据)作为基线数据，然后跟滑动窗口为200的流数据进行js漂移值计算，
-# 一旦触发retrain，就把基线数据中300条训练的数据立刻替换retrain前的300条流数据，但仍然保留10%combined 数据，也就是10%combined 数据+300条retrain前最新数据
+# 动态的后10% combined 数据 + 300 条训练数据（初始约 500 多条 combined 数据）作为基线，
+# 用滑动窗口为 200 的流数据计算 JS 漂移，一旦触发 retrain 就用最新 300 条流数据替换原有训练数据。
 # —— 窗口大小 —— 
 WINDOW_SIZE          = 300
-# 初始到达多少条立刻强制 retrain
+# 初始达到多少条流数据后立即强制 retrain
 NEW_SAMPLE_MIN       = int(os.getenv("NEW_SAMPLE_MIN", "100"))
+# 两次 retrain 最小时间间隔（秒）
 MIN_RETRAIN_INTERVAL = float(os.getenv("MIN_RETRAIN_INTERVAL", "0.1"))
 
-infer_msg_count = 0    # 累计三个 inference consumer 处理的消息数
-first_forced = False   # 记录是否已经做过第一次强制 retrain
+# —— 静态训练数据大小 —— 
+TRAIN_N              = 500
 
-# —— 声明指标 buffer、Producer 完成 flag、消息队列 q ——  
+# —— 缓冲区长度：取 TRAIN_N 和 WINDOW_SIZE 的最大值，自动丢弃最老样本 —— 
+from collections import deque
+MAX_BUF = max(TRAIN_N, WINDOW_SIZE)
+retrain_buf: deque[dict] = deque(maxlen=MAX_BUF)
+
+# —— 重训练状态标志 —— 
+import threading, queue
+retrain_lock    = threading.Lock()
+retrain_running = False       # 后台重训是否正在进行
+
+# —— 统计 inference consumer 处理总量，用于初始强制 retrain —— 
+infer_msg_count = 0
+first_forced    = False       # 是否已做过第一次强制 retrain
+
+# —— 指标 buffer、producer_done flag、消息队列 q —— 
 metrics_buffer: list[dict] = []
-producer_done  = threading.Event()
-q: queue.Queue = queue.Queue()
+producer_done            = threading.Event()
+q: queue.Queue           = queue.Queue()
 
-# >>>  Drift re-training state  <<<
-retrain_buf:   list[dict]     = []          # 最近收到的所有样本
-retrain_lock:  threading.Lock = threading.Lock()
-retrain_running: bool         = False       # 后台重训是否正在进行
-
-# —— 基线动态配置 —— 
-TRAIN_N             = 500
-BASELINE_KEY        = os.getenv("BASELINE_KEY", "datasets/combined.csv")
-
-# 1) 从 MinIO 取 combined.csv 并只保留 FEATURE_COLS
-combined_df = load_csv(BASELINE_KEY)
+# —— 基线数据加载 —— 
+import os
+BASELINE_KEY = os.getenv("BASELINE_KEY", "datasets/combined.csv")
+combined_df  = load_csv(BASELINE_KEY)
 combined_df.drop(columns=["input_rate", "latency", "output_rate"],
                  errors="ignore", inplace=True)
 combined_df = combined_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
 
-# 2) 拿尾部 10% 作为 static 基线
-ten_n = TRAIN_N
+# 取尾部 TRAIN_N 条作为 static 基线
+ten_n         = TRAIN_N
 base_combined = combined_df.tail(TRAIN_N).reset_index(drop=True)
+baseline_df   = base_combined.copy()
 
-# ✅ 3) 初始化基线：只保留 static 部分（尾部10%）
-baseline_df = base_combined.copy()
-
-# 全部 60 维都参与 JS 比较
+# 所有 60 维特征用于 JS 计算
 JS_FEATS = FEATURE_COLS.copy()
+
+# # —— 基线动态配置 动态混合—— 
+# STATIC_N             = 150
+# DYNAMIC_N            = 150
+# BASELINE_KEY         = os.getenv("BASELINE_KEY", "datasets/combined.csv")
+
+# # 1) 从 MinIO 取 combined.csv 并只保留 FEATURE_COLS
+# combined_df = load_csv(BASELINE_KEY)
+# combined_df.drop(columns=["input_rate", "latency", "output_rate"],
+#                  errors="ignore", inplace=True)
+# combined_df = combined_df.reindex(columns=FEATURE_COLS, fill_value=0.0)
+
+# # 2) 拿尾部 STATIC_N 条作为 static 基线
+# base_combined = combined_df.tail(STATIC_N).reset_index(drop=True)
+
+# # ✅ 3) 初始化基线：只保留 static 部分
+# baseline_df = base_combined.copy()
+
+# # 全部 60 维都参与 JS 比较
+# JS_FEATS = FEATURE_COLS.copy()
+
 
 
 # ----------------------------------------------------------------------
@@ -182,7 +213,8 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         # 2) 真正运行动态重训
         subprocess.run(
             ["python", "-m", "ml.dynamic_retrain", str(js_val)],
-            check=True
+            check=True,
+            timeout=600
         )
         print("[monitor] dynamic_retrain finished")
 
@@ -195,6 +227,19 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
                   .reindex(columns=FEATURE_COLS, fill_value=0.0)
             )
             baseline_df = pd.concat([combined_part, train_part], ignore_index=True)
+        #3) 只有 retrain 成功后，才更新 baseline_df：static + dynamic 合并
+        
+        # with retrain_lock:
+        #     # static：始终使用原始 combined 最后 STATIC_N 条
+        #     combined_part = base_combined.copy()
+        #     # dynamic：使用最新 DYNAMIC_N 条流数据
+        #     recent_features = [r["features"] for r in snapshot_rows[-DYNAMIC_N:]]
+        #     train_part = (
+        #         pd.DataFrame(recent_features)
+        #         .reindex(columns=FEATURE_COLS, fill_value=0.0)
+        #     )
+        #     baseline_df = pd.concat([combined_part, train_part], ignore_index=True)
+
 
     except Exception as exc:
         print(f"[monitor] retrain thread error: {exc}")
@@ -205,12 +250,15 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
         retrain_running = False
 
 # ----------------------------------------------------------------------
-# 5. 主循环（更新后）
+# 5. 主循环（更新后：初始快速重训使用最新 NEW_SAMPLE_MIN 条流数据）
 # ----------------------------------------------------------------------
 print(f"[monitor] start, WINDOW={WINDOW_SIZE}, THR={JS_TRIGGER_THRESH}")
 win_rows: list[dict] = []
+retrain_buf: deque = deque(maxlen=RETRAIN_RECENT_N)
 last_retrain_ts = 0.0
 msg_count = 0
+infer_msg_count = 0
+first_forced = False
 
 while True:
     try:
@@ -222,28 +270,32 @@ while True:
         continue  # 继续等待
 
     msg_count += 1
+    infer_msg_count += 1
     win_rows.append(item)
     retrain_buf.append(item)
 
-    # —— 初始强制重训 —— 
+    # —— 初始快速重训：仅用最新 NEW_SAMPLE_MIN 条流数据 ——
     if not first_forced and infer_msg_count >= NEW_SAMPLE_MIN:
         first_forced = True
-        print(f"[monitor] initial force retrain at infer_msg_count={infer_msg_count}")
+        print(f"[monitor] initial quick-retrain at infer_msg_count={infer_msg_count}")
         retrain_running = True
-        snapshot = retrain_buf.copy()
+
+        # 最新的 NEW_SAMPLE_MIN 条样本（deque 不支持 slice，需要先转 list）
+        snapshot = list(retrain_buf)[-NEW_SAMPLE_MIN:]
+
         threading.Thread(
             target=_bg_retrain,
             args=(JS_TRIGGER_THRESH, snapshot),
             daemon=True
         ).start()
 
-    # 保持窗口固定长度 & 未满则跳过
+    # —— 滑动窗口固定长度 —— 
     if len(win_rows) > WINDOW_SIZE:
         win_rows.pop(0)
     if len(win_rows) < WINDOW_SIZE:
         continue
 
-    # 计算 JS 值
+    # —— 计算 JS 距离 ——
     t0 = time.time()
     df_win = pd.DataFrame([r["features"] for r in win_rows])
     js_val = _avg_js(df_win)
@@ -256,14 +308,14 @@ while True:
 
     print(f"[monitor] JS={js_val:.4f} (thr={JS_TRIGGER_THRESH}) msgs={msg_count}")
 
-    # ───── 触发重训 ─────────────────────────────────────────────
+    # —— 达到阈值 & 不在冷却期 & 没有 retrain 正在运行 —— 
     now = time.time()
     if (js_val > JS_TRIGGER_THRESH
         and (now - last_retrain_ts) >= MIN_RETRAIN_INTERVAL
         and not retrain_running):
 
         retrain_running = True
-        snapshot = retrain_buf[-max(TRAIN_N, WINDOW_SIZE):]
+        snapshot = list(retrain_buf)[-max(TRAIN_N, WINDOW_SIZE):]
 
         # 判断严重度
         if   js_val > JS_SEV2_THRESH: severity = "K"
