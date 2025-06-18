@@ -31,10 +31,14 @@ from shared.config        import (
 )
 from shared.features      import FEATURE_COLS
 from ml.model             import DynamicMLP, build_model
-
 from botocore.exceptions import ClientError     
 
 # ---------- 常量 & 本地路径 ---------------------------------------------
+
+# —— 熔断相关常量 —— 
+ACC_WINDOW    = 300      # 要和 monitor.WINDOW_SIZE 保持一致
+ACC_THRESHOLD = 0.50     # 阈值：当滑窗准确率 < 50% 时算一次低准确
+LOW_MAX       = 2        # 连续 2 个滑窗都低准确才触
 
 RETRAIN_TOPIC = os.getenv("RETRAIN_TOPIC", KAFKA_TOPIC + "_infer_count")   # kafka topic total 100
 model_lock = threading.Lock()
@@ -210,7 +214,9 @@ def _listener():
     """
     • 创建 KafkaConsumer（含 10 次重试）
     • 统计 topic 分区数，记录到 NUM_PARTITIONS
-    • 每收到一条带 {"producer_done": true} 的消息就把 sentinel_seen +1
+    • 消费数据：
+        – {"producer_done": true}  统计分区完成
+        – 普通样本                 推到 q
     """
     global NUM_PARTITIONS, sentinel_seen
 
@@ -229,14 +235,17 @@ def _listener():
 
     for msg in cons:
         v = msg.value
-        if v.get("producer_done"):
+        if v.get("producer_done"):                  # 生产者结束标记
             with sentinel_lock:
                 sentinel_seen += 1
-                print(f"[infer:{pod_name}] got sentinel {sentinel_seen}/{NUM_PARTITIONS}")
+                print(f"[infer:{pod_name}] got sentinel "
+                      f"{sentinel_seen}/{NUM_PARTITIONS}")
             producer_done.set()
             continue
+
         v["_recv_ts"] = datetime.utcnow().isoformat() + "Z"
         q.put(v)
+
 
 # 启动监听线程（daemon 模式，不阻塞主线程）
 threading.Thread(target=_listener, daemon=True).start()
@@ -388,16 +397,20 @@ while True:
             ).cpu().numpy().ravel()
     cpu1, t1 = proc.cpu_times(), time.perf_counter()
 
-    # 4) Accuracy@0.2 统计
+    # 4) Accuracy@0.2 统计 + 熔断逻辑 -------------------------------------
     labels = np.array([r["label"] for r in rows_batch], np.float32)
     errs   = np.abs(preds_adpt - labels) / np.maximum(labels, 1e-8)
     batch_correct = int((errs <= 0.2).sum())
     batch_total   = len(labels)
+
     correct_count += batch_correct
     total_count   += batch_total
     cum_acc = correct_count / total_count
-    print(f"[infer:{pod_name}] accuracy@0.2 → batch {batch_correct}/{batch_total}, "
+
+    print(f"[infer:{pod_name}] accuracy@0.2 → "
+          f"batch {batch_correct}/{batch_total}, "
           f"cumulative {correct_count}/{total_count} = {cum_acc:.3f}")
+
     log_metric(
         component="infer",
         event="cumulative_accuracy",
@@ -408,7 +421,40 @@ while True:
         cumulative_total=total_count,
         cumulative_accuracy=round(cum_acc, 3)
     )
-    
+
+    # —— 连续窗口熔断 ------------------------------------------------------
+    if not hasattr(_align_to_dim, "acc_deque"):
+        from collections import deque
+        _align_to_dim.acc_deque = deque(maxlen=ACC_WINDOW)  # 300
+        _align_to_dim.low_seq   = 0                         # 连续低准确窗口计数
+
+    # 把当前 batch 的逐样本命中情况加入滑动窗口
+    _align_to_dim.acc_deque.extend(
+        [1] * batch_correct + [0] * (batch_total - batch_correct)
+    )
+
+    if len(_align_to_dim.acc_deque) == ACC_WINDOW:
+        win_acc = sum(_align_to_dim.acc_deque) / ACC_WINDOW
+        if win_acc < ACC_THRESHOLD:                # 低于阈值
+            _align_to_dim.low_seq += 1
+        else:
+            _align_to_dim.low_seq = 0              # 达标就清零
+
+        if _align_to_dim.low_seq >= LOW_MAX:       # 连续 LOW_MAX 次都低
+            try:
+                trigger_prod.send(
+                    RETRAIN_TOPIC,
+                    {
+                        "force_retrain": "K",       # 最高等级
+                        "win_acc": round(win_acc, 3)
+                    }
+                )
+                print(f"[infer:{pod_name}] force_retrain K sent (win_acc={win_acc:.3f})")
+            except Exception as e:
+                print(f"[infer:{pod_name}] force_retrain send error → {e}")
+            finally:
+                _align_to_dim.low_seq = 0          # 发送后立即复位
+
     # ---------- DEBUG：误差分布（基线 vs. 自适应） ----------
     # ① 相对误差
     err_base = np.abs(preds_base - labels) / np.maximum(labels, 1e-8)

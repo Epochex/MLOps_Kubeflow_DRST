@@ -130,11 +130,10 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 def _listener():
     global infer_msg_count
-    
-    
+
     cons = KafkaConsumer(
-        KAFKA_TOPIC,                 # 原来的拉流 topic
-        KAFKA_TOPIC + "_infer_count",# 新增：各 consumer 发过来的 processed 计数
+        KAFKA_TOPIC,                      # 数据流 topic
+        KAFKA_TOPIC + "_infer_count",     # 推理端上报计数 & 控制信号
         bootstrap_servers=",".join(KAFKA_SERVERS),
         group_id="cg-monitor",
         auto_offset_reset=AUTO_OFFSET_RESET,
@@ -155,15 +154,34 @@ def _listener():
             for tp, msgs in records.items():
                 for msg in msgs:
                     v = msg.value
+
+                    # producer 结束标记
                     if v.get("producer_done"):
                         producer_done.set()
-                    # 新增： inference consumer 发过来的 processed 计数
+
+                    # ------- 新增：推理端熔断信号 -------------------------
+                    elif "force_retrain" in v:
+                        print("[monitor] received force_retrain → Severity-K")
+
+                        # 取最近样本作为训练集快照
+                        snapshot = list(retrain_buf)[-max(TRAIN_N, WINDOW_SIZE):]
+
+                        # 启动后台重训线程（Severity-K 网格）
+                        threading.Thread(
+                            target=_bg_retrain,
+                            args=(JS_SEV2_THRESH + 0.01, snapshot),  # 伪造一个 > JS_SEV2_THRESH 的值
+                            daemon=True
+                        ).start()
+
+                    # ------- 推理端上报 processed 计数 --------------------
                     elif "processed" in v:
                         infer_msg_count += int(v["processed"])
+
+                    # 正常特征数据流
                     else:
                         q.put(v)
+
         except Exception as e:
-            # 打印日志但保持线程存活
             print(f"[monitor] listener error, restarting poll(): {e}")
             time.sleep(1)
             continue
