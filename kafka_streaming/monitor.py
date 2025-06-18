@@ -254,7 +254,7 @@ def _bg_retrain(js_val: float, snapshot_rows: list[dict]):
 # ----------------------------------------------------------------------
 print(f"[monitor] start, WINDOW={WINDOW_SIZE}, THR={JS_TRIGGER_THRESH}")
 win_rows: list[dict] = []
-retrain_buf: deque = deque(maxlen=RETRAIN_RECENT_N)
+retrain_buf: deque = deque(maxlen=MAX_BUF)
 last_retrain_ts = 0.0
 msg_count = 0
 infer_msg_count = 0
