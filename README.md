@@ -46,7 +46,7 @@ If you use our tools or find our work helpful, please cite the following publica
 
 ```bibtex
 @article{liu2025drst,
-  author    = {Qiong Liu and Jianke Lin and Leonardo Linguaglossa and Tianzhu Zhang.},
+  author    = {Qiong Liu and Jianke Lin and Tianzhu Zhang and Leonardo Linguaglossa.},
   title     = {DRST: a Non-Intrusive Framework for Performance Analysis in Softwarized Networks},
   journal   = {xx},
   year      = {2025}
