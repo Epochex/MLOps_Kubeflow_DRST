@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kfp-submit-PLACEHOLDER
+  namespace: kubeflow-user-example-com
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: kfp-ci
+      restartPolicy: Never
+      containers:
+      - name: submit
+        image: python:3.11-slim
+        env:
+        - name: KFP_HOST
+          value: "http://ml-pipeline.kubeflow:8888"
+        - name: KFP_NAMESPACE
+          value: "kubeflow-user-example-com"
+        - name: KFP_EXPERIMENT
+          value: "CI"
+        - name: REPO_URL
+          value: "https://github.com/Epochex/MLOps_Kubeflow_ONVM_Monitor.git"  # ← 确认仓库名对
+        - name: REPO_REF
+          value: ""
+        command: ["/bin/bash","-lc"]
+        args:
+        - |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          python -m pip install --no-cache-dir kfp==2.4.0
+          git clone --depth 1 "$REPO_URL" src
+          cd src
+          if [ -n "$REPO_REF" ]; then git fetch origin "$REPO_REF" && git checkout FETCH_HEAD; fi
+          python - <<'PY'
+          import os, time
+          from kfp import Client, compiler
+          from pipeline.pipeline import drift_stream
+          compiler.Compiler().compile(pipeline_func=drift_stream, package_path="drift_demo_v6.yaml")
+          c = Client(host=os.getenv("KFP_HOST"), namespace=os.getenv("KFP_NAMESPACE"))
+          # 注意这里：用位置参数（或改成 pipeline_file="drift_demo_v6.yaml"）
+          run = c.create_run_from_pipeline_package(
+              "drift_demo_v6.yaml",
+              arguments={},
+              experiment_name=os.getenv("KFP_EXPERIMENT"),
+              run_name=f"ci-run-{int(time.time())}",
+          )
+          print("✓ Submitted Run:", run.run_id)
+          PY

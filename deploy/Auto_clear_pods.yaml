@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-gc
+  namespace: kubeflow-user-example-com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-gc
+  namespace: kubeflow-user-example-com
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get","list","delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBindingeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+metadata:
+  name: pod-gc
+  namespace: kubeflow-user-example-com
+subjects:
+- kind: ServiceAccount
+  name: pod-gc
+roleRef:
+  kind: Role
+  name: pod-gc
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kfp-pod-gc
+  namespace: kubeflow-user-example-com
+spec:
+  schedule: "0 */12 * * *"   # 每 12 小时
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: pod-gc
+          restartPolicy: Never
+          containers:
+          - name: gc
+            image: lachlanevenson/k8s-kubectl:v1.32.0
+            command: ["/bin/sh","-lc"]
+            args:
+            - |
+              RETAIN_SECS=$((12*3600))  # 12 小时可改
+              now=$(date +%s)
+              kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.status.startTime}{"\n"}{end}' \
+              | while IFS='|' read -r name phase start; do
+                  [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] || continue
+                  [ -n "$start" ] || continue
+                  start_epoch=$(date -d "$start" +%s)
+                  age=$((now - start_epoch))
+                  if [ $age -gt $RETAIN_SECS ]; then
+                    echo "deleting $name (age=${age}s, phase=$phase)"
+                    kubectl delete pod "$name"
+                  fi
+                done

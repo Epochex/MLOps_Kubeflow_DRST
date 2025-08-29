@@ -1,0 +1,18 @@
+# /data/mlops/DRST-SoftwarizedNetworks/.dockerignore
+.git
+.notebooks
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+results/
+datasets/*
+!datasets/.gitkeep
+experiments/kubeflow/yamls/
+deploy/
+docs/
