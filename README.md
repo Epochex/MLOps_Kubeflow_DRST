@@ -99,23 +99,27 @@ This repository is organized as follows:
   Messaging is JSON payloads with partition awareness and per-partition sentinels for deterministic shutdown.  
   Metrics are **local-first CSV/JSONL** append (latency/throughput/cold-start/JS ticks/RTT/CPU%) with batched sync upstream, while tiny readiness flags and minimal pipeline metadata keep orchestration observable without coupling.  
 
-  Utilities close the loop: fault-tolerant model deserialization; thresholded accuracy defined on relative error  
+  Utilities close the loop: fault-tolerant model deserialization; thresholded accuracy defined on relative error
+
   $$
   e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
   $$
-  with  
+
+  with
+
   $$
-  \mathrm{accuracy}@\tau = \mathrm{mean}\!\left(e \le \tau\right).
+  \mathrm{accuracy}@\tau = \mathrm{mean}\!\left(e \le \tau\right)
   $$
 
-  Histogram-based Jensen–Shannon divergence for drift  
+  Histogram-based Jensen–Shannon divergence for drift
+
   $$
-  \mathrm{JSD}(P\|Q)=\tfrac{1}{2}\,\mathrm{KL}(P\|M)+\tfrac{1}{2}\,\mathrm{KL}(Q\|M),\quad M=\tfrac{1}{2}(P+Q),
+  \mathrm{JSD}(P\|Q)=\tfrac{1}{2}\,\mathrm{KL}(P\|M)+\tfrac{1}{2}\,\mathrm{KL}(Q\|M),\quad M=\tfrac{1}{2}(P+Q)
   $$
+
   and a micro profiler that wraps critical sections and emits `runtime_ms` into the same metric stream.  
 
   The result is a single, cohesive plane—configuration, artifacts, messaging, metrics—where components share only pointers and facts (not state), enabling safe model rollouts, predictable lifecycles, and stable p95 latency under streaming load.  
-
 
 
 
