@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # drst_drift/monitor.py
-# Fixed sliding window=300 + stride=50: every 50 new samples, compute JS using last 300.
-# Trigger policy (改造版):
-#   仅当 JS_now > JS_mean 且 JS_now 落入分段阈值时触发：
-#     JS<0.40 → no retrain; [0.40,0.60) → A; [0.60,0.75) → B; ≥0.75 → C。
-#   触发后写锁，直到重训完成前不再计算/触发。
+# Streaming drift monitor with data-driven thresholds:
+# - Sliding window (size=DRIFT_WINDOW, stride=EVAL_STRIDE)
+# - Histogram (fixed bins from baseline) + Jensen–Shannon divergence
+# - Thresholds are calibrated via bootstrap on the baseline window (quantile-based A/B/C)
+# - On retrain_done: refresh baseline to the last triggered window and re-calibrate
 from __future__ import annotations
 import os, json, time, queue, threading
 from collections import deque
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 
 from drst_common.config import (
     KAFKA_TOPIC, RESULT_DIR, TARGET_COL,
     DRIFT_WINDOW, EVAL_STRIDE,
-    RETRAIN_JS_NO_RETRAIN, RETRAIN_JS_GRID_A, RETRAIN_JS_GRID_B,
 )
 from drst_common.kafka_io import create_consumer, partitions_count
 from drst_common.runtime import touch_ready, write_kfp_metadata
@@ -25,29 +24,47 @@ from drst_common.artefacts import load_selected_feats, load_scaler
 from drst_common.utils import jensen_shannon_divergence, make_prob_hist
 from drst_common.config import BUCKET
 
-# ---------------- Parameters ----------------
-IDLE_TIMEOUT_S    = int(os.getenv("IDLE_TIMEOUT_S", "60"))
-HIST_BINS         = int(os.getenv("HIST_BINS", "64"))
+# ---------------- Parameters (overridable via env) ----------------
+IDLE_TIMEOUT_S       = int(os.getenv("IDLE_TIMEOUT_S", "60"))
+HIST_BINS            = int(os.getenv("HIST_BINS", "64"))
+JS_CALIB_SAMPLES     = int(os.getenv("JS_CALIB_SAMPLES", "400"))   # bootstrap iterations
+JS_QUANTILES_RAW     = os.getenv("JS_QUANTILES", "0.90,0.97,0.995")
+BASELINE_REFRESH_MODE= os.getenv("BASELINE_REFRESH_MODE", "on_retrain").lower()  # on_retrain|never
 pod_name = os.getenv("HOSTNAME", "monitor")
+
+# Parse quantiles for A/B/C
+def _parse_quantiles(s: str) -> Tuple[float, float, float]:
+    try:
+        q = [float(x.strip()) for x in s.split(",")]
+        q = (q + [0.9, 0.97, 0.995])[:3]
+        qa, qb, qc = q[0], q[1], q[2]
+        qa, qb, qc = max(0.0, min(qa, 0.999)), max(0.0, min(qb, 0.999)), max(0.0, min(qc, 0.999))
+        qa, qb, qc = sorted([qa, qb, qc])
+        return qa, qb, qc
+    except Exception:
+        return 0.90, 0.97, 0.995
+
+Q_A, Q_B, Q_C = _parse_quantiles(JS_QUANTILES_RAW)
 
 # ---------------- State & Queues ----------------
 q_data = queue.Queue()
 data_partitions = 0
 data_sentinel_seen = 0
 sentinel_lock = threading.Lock()
-processed_total = 0
 
 SELECTED_FEATS = load_selected_feats()
 scaler = load_scaler()
 
-baseline_buf: deque[np.ndarray] = deque(maxlen=DRIFT_WINDOW)  # Reference distribution (first filled baseline)
+baseline_buf: deque[np.ndarray] = deque(maxlen=DRIFT_WINDOW)   # first filled baseline
 baseline_ready = False
 window_buf:   deque[np.ndarray] = deque(maxlen=DRIFT_WINDOW)
 label_buf:    deque[float]      = deque(maxlen=DRIFT_WINDOW)
 _hist_range_per_feat: Optional[List[Tuple[float,float]]] = None
 
 samples_since_eval = 0
-js_history: List[float] = []
+
+# Calibrated thresholds (filled after baseline_ready)
+_js_thr: Dict[str, float] = {}   # {"A": thr_A, "B": thr_B, "C": thr_C}
 
 retrain_in_progress = False
 lock_started_ts = 0.0
@@ -61,19 +78,22 @@ def _features_from_msg(msg) -> Tuple[np.ndarray, Optional[float]]:
         y = None
     return x, y
 
-def _compute_js(baseline_arr: np.ndarray, window_arr: np.ndarray) -> float:
+def _init_hist_ranges(baseline_arr: np.ndarray) -> None:
+    """Freeze per-feature histogram ranges from the baseline."""
     global _hist_range_per_feat
-    n0, d = baseline_arr.shape
-    n1, d2 = window_arr.shape
-    assert d == d2, "dim mismatch"
-    if _hist_range_per_feat is None:
-        _hist_range_per_feat = []
-        for j in range(d):
-            mn = float(np.min(baseline_arr[:, j])); mx = float(np.max(baseline_arr[:, j]))
-            if mn == mx:
-                eps = (abs(mn) * 1e-6) or 1e-6
-                mn, mx = mn - eps, mx + eps
-            _hist_range_per_feat.append((mn, mx))
+    d = baseline_arr.shape[1]
+    _hist_range_per_feat = []
+    for j in range(d):
+        mn = float(np.min(baseline_arr[:, j])); mx = float(np.max(baseline_arr[:, j]))
+        if mn == mx:
+            eps = (abs(mn) * 1e-6) or 1e-6
+            mn, mx = mn - eps, mx + eps
+        _hist_range_per_feat.append((mn, mx))
+
+def _compute_js(baseline_arr: np.ndarray, window_arr: np.ndarray) -> float:
+    """Mean JSD over features using fixed histogram ranges (frozen at baseline)."""
+    assert _hist_range_per_feat is not None, "hist ranges not initialized"
+    d = baseline_arr.shape[1]
     vals = []
     for j in range(d):
         rng = _hist_range_per_feat[j]
@@ -81,6 +101,40 @@ def _compute_js(baseline_arr: np.ndarray, window_arr: np.ndarray) -> float:
         q = make_prob_hist(window_arr[:, j],   bins=HIST_BINS, range=rng)
         vals.append(jensen_shannon_divergence(p, q))
     return float(np.mean(vals))
+
+def _bootstrap_calibrate(baseline_arr: np.ndarray) -> Dict[str, float]:
+    """
+    Estimate natural JS variability under 'no drift' using bootstrap resamples of the baseline.
+    Returns quantile-based thresholds for A/B/C.
+    """
+    # Ensure histogram ranges are frozen from the baseline
+    _init_hist_ranges(baseline_arr)
+    js_vals = []
+    n = baseline_arr.shape[0]
+    rng = np.random.default_rng(12345)
+    for _ in range(max(50, JS_CALIB_SAMPLES)):
+        idx = rng.integers(0, n, size=n)              # resample size = window size
+        boot = baseline_arr[idx]
+        js = _compute_js(baseline_arr, boot)
+        js_vals.append(js)
+    js_vals = np.sort(np.asarray(js_vals, np.float64))
+    thr_A = float(np.quantile(js_vals, Q_A))
+    thr_B = float(np.quantile(js_vals, Q_B))
+    thr_C = float(np.quantile(js_vals, Q_C))
+    # Monotonic safety
+    thr_B = max(thr_B, thr_A + 1e-12)
+    thr_C = max(thr_C, thr_B + 1e-12)
+    # Persist thresholds for audit
+    payload = {
+        "quantiles": {"A": Q_A, "B": Q_B, "C": Q_C},
+        "thresholds": {"A": thr_A, "B": thr_B, "C": thr_C},
+        "bins": HIST_BINS, "window": DRIFT_WINDOW, "samples": JS_CALIB_SAMPLES,
+    }
+    save_bytes(f"{RESULT_DIR}/js_calib.json", json.dumps(payload, ensure_ascii=False, indent=2).encode(), "application/json")
+    log_metric(component="monitor", event="js_calibrated",
+               thr_A=round(thr_A,6), thr_B=round(thr_B,6), thr_C=round(thr_C,6),
+               qA=Q_A, qB=Q_B, qC=Q_C, window=DRIFT_WINDOW, bins=HIST_BINS, samples=JS_CALIB_SAMPLES)
+    return {"A": thr_A, "B": thr_B, "C": thr_C}
 
 def _save_latest_batch(X: np.ndarray, y: Optional[np.ndarray]):
     cols = list(SELECTED_FEATS)
@@ -95,11 +149,14 @@ def _save_latest_batch(X: np.ndarray, y: Optional[np.ndarray]):
                "application/json")
 
 def _grid_letter(js_val: float) -> str | None:
-    if js_val < RETRAIN_JS_NO_RETRAIN:
+    """Map current JS to grid by calibrated thresholds."""
+    if not _js_thr:
         return None
-    if js_val < RETRAIN_JS_GRID_A:
+    if js_val < _js_thr["A"]:
+        return None
+    if js_val < _js_thr["B"]:
         return "A"
-    if js_val < RETRAIN_JS_GRID_B:
+    if js_val < _js_thr["C"]:
         return "B"
     return "C"
 
@@ -135,10 +192,26 @@ print(f"[monitor:{pod_name}] started…")
 last_data_time = time.time()
 
 while True:
-    # 解锁检查：重训完成？
+    # Unlock check: retrain finished?
     if retrain_in_progress and _retrain_done_after(lock_started_ts):
         retrain_in_progress = False
         print(f"[monitor:{pod_name}] retrain done detected → unlock")
+        # Optional: refresh baseline after retrain
+        if BASELINE_REFRESH_MODE == "on_retrain":
+            try:
+                # Reuse the last window as the new baseline
+                X_win = np.vstack(window_buf) if len(window_buf) == DRIFT_WINDOW else None
+                if X_win is not None and X_win.size > 0:
+                    baseline_buf.clear()
+                    for row in X_win:
+                        baseline_buf.append(row.copy())
+                    # Re-calibrate thresholds on the new baseline
+                    base_arr = np.vstack(baseline_buf)
+                    _js_thr = _bootstrap_calibrate(base_arr)
+                    log_metric(component="monitor", event="baseline_refreshed")
+                    print(f"[monitor:{pod_name}] baseline refreshed & thresholds recalibrated")
+            except Exception as e:
+                print(f"[monitor:{pod_name}] baseline refresh failed: {e}")
 
     try:
         rec = q_data.get(timeout=1.0)
@@ -158,24 +231,26 @@ while True:
     feats, y = _features_from_msg(rec)
     feats_scaled = scaler.transform(feats.reshape(1, -1)).ravel()
 
-    # 建立基线（首 300 个样本）
+    # Build baseline (first DRIFT_WINDOW samples)
     if not baseline_ready:
         baseline_buf.append(feats_scaled)
         if len(baseline_buf) >= DRIFT_WINDOW:
             baseline_ready = True
-            log_metric(component="monitor", event="baseline_ready",
-                       train_rows=DRIFT_WINDOW)
+            base_arr = np.vstack(baseline_buf)
+            # Freeze bins and calibrate quantile thresholds
+            _js_thr = _bootstrap_calibrate(base_arr)
+            log_metric(component="monitor", event="baseline_ready", train_rows=DRIFT_WINDOW)
             print(f"[monitor:{pod_name}] baseline ready with {DRIFT_WINDOW} rows")
         continue
 
-    # 基线已就绪，进入滑窗
+    # Baseline ready → append to sliding window
     window_buf.append(feats_scaled)
     if y is not None:
         label_buf.append(float(y))
     if len(window_buf) < DRIFT_WINDOW:
         continue
 
-    # 重训锁定中：暂停评估与触发
+    # Locked during retrain → skip evaluation
     if retrain_in_progress:
         continue
 
@@ -187,23 +262,18 @@ while True:
     X_base = np.vstack(baseline_buf)
     X_win  = np.vstack(window_buf)
     js_val = _compute_js(X_base, X_win)
-    js_mean = float(np.mean(js_history)) if js_history else 0.0
-    js_history.append(js_val)
 
     log_metric(component="monitor", event="js_tick",
                js_val=round(js_val, 6),
-               js_mean=round(js_mean, 6),
+               thr_A=_js_thr.get("A",""), thr_B=_js_thr.get("B",""), thr_C=_js_thr.get("C",""),
                window=DRIFT_WINDOW, eval_stride=EVAL_STRIDE)
 
-    # 仅当“相对历史抬升”且“绝对阈值分段”同时满足时触发
-    if not (js_val > js_mean):
-        continue
-
+    # Absolute calibrated thresholds (no historical-mean gate)
     letter = _grid_letter(js_val)
     if letter is None:
-        continue  # 绝对阈值不足
+        continue
 
-    # 触发：保存窗口数据 + 写网格标志 + 上锁
+    # Trigger: snapshot current window + write tier flag + lock
     y_latest = np.array(label_buf, dtype=np.float32) if len(label_buf) == len(window_buf) else None
     _save_latest_batch(X_win, y_latest)
     save_bytes(f"{RESULT_DIR}/retrain_grid.flag", letter.encode(), "text/plain")
@@ -213,9 +283,9 @@ while True:
     lock_started_ts = time.time()
 
     log_metric(component="monitor", event="drift_triggered",
-               js_val=round(js_val, 6), js_mean=round(js_mean, 6), grid=letter)
+               js_val=round(js_val, 6), grid=letter)
 
-# 收尾
+# Finalize
 sync_all_metrics_to_minio()
 write_kfp_metadata()
 print(f"[monitor:{pod_name}] metrics synced; bye.")

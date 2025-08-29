@@ -90,10 +90,11 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 
 ![Infra Overview](<docs/structure_infra.png>)
 
-This repository is organized as follows:
-- ### **datasets/**  
+---
+### **This repository is organized as follows:**
+- ### datasets/  
   Network-flow datasets. Offline training uses combined.csv to produce the baseline model. Stage 1 uses random_rates.csv for initial adaptation. Stage 2 injects resource_stimulus_global_A-B-C_modified.csv to simulate inference under CPU resource contention.
-- ### **drst_common/**  
+- ### drst_common/  
   The runtime backbone that turns the whole system into a low-latency, loosely-coupled graph: rules live as code with env-overrides (drift tiers → on-the-fly A/B/C search spaces), artifacts flow through an **immutable-object + mutable-pointer** pattern (timestamped model/metrics with a 2-line “latest” head for atomic hot reloads and easy rollback), and storage follows **PVC-first write → async S3 upload** so training/inference never stall on the network.  
   Messaging is JSON payloads with partition awareness and per-partition sentinels for deterministic shutdown.  
   Metrics are **local-first CSV/JSONL** append (latency/throughput/cold-start/JS ticks/RTT/CPU%) with batched sync upstream, while tiny readiness flags and minimal pipeline metadata keep orchestration observable without coupling.  
@@ -122,7 +123,7 @@ This repository is organized as follows:
 
 
 
-- ### **drst_inference/**  
+- ### drst_inference/  
   - **Execution Path & Parallel Consumption**  
     The offline phase produces a baseline model and an initial adaptive model, and publishes a small “release pointer” that designates the active version. The streaming phase then launches parallel consumers matched to the topic’s partitions. Each consumer pulls records, standardizes them with a shared scaler, aligns inputs to both the baseline and adaptive networks, and emits **two predictions per batch**. Input dimensions are strictly reconciled with each network’s first layer (padding or truncation as needed) so the two paths remain comparable on the same data.
 
@@ -137,22 +138,28 @@ This repository is organized as follows:
 
 
 
-
-- **drst_forecasting/**  
+- ### drst_forecasting/  
   Placeholder and baselines for short-term trend forecasting: baseline_mean.py provides a moving-average baseline to quickly validate whether latency/throughput evolves predictably over time; lstm_placeholder.py sketches a minimal LSTM regressor for future time-series modeling of online error or system state. This package is optional in the main pipeline and can be wired in as an auxiliary predictor in the inference stage or as a forward-error estimator in the monitor.
 
-- **drst_drift/**  
-  The monitoring–retraining control loop lives here. The monitor first establishes a reference distribution, then using a fixed window and stride computes histogram-based distribution deltas on the stream. Triggering uses a conservative strategy that compares the latest measurement against the historical baseline and acts on the more severe signal. On trigger, it persists the current window’s feature matrix and any available labels, writes a tier flag per policy, and places a lock to prevent duplicate triggers during the retrain window. The retrainer reads the frozen window and tier, pulls the three-tier grid from configuration, runs a quick warm-up scoring pass to shrink the search space, then performs full training and validation on the remaining candidates. It writes the best model and metrics back to the model store, updates the latest pointer, and removes the lock so the monitor resumes sliding-window evaluation. Interpretability runs as a side path on the same window: it defaults to permutation importance for a fast signal and automatically switches to a kernel-based method when available; results are persisted for audit and reporting but do not affect the main decision loop.
+- ### drst_drift/   
+  - **Monitor — continuous sensing & safe triggering.**  
+    A lightweight listener threads records into an in-memory queue; the main loop standardizes features and advances a fixed-size sliding window by a regular stride. It builds an initial baseline window and freezes per-feature histogram ranges from that snapshot so later comparisons aren’t skewed by moving bins. At each step it computes a per-feature histogram JSD to the baseline and averages them into one drift signal. Triggering is data-driven: thresholds for A/B/C are bootstrap-calibrated from the baseline’s own variability (quantile cutoffs), not hand-tuned or smoothed by moving means. On trigger the monitor snapshots the entire current window (features + any labels), writes a tier flag, and sets a lock to suppress duplicate triggers while retraining runs. When the retrainer writes a completion flag, the lock is released and—by policy—the baseline is refreshed to that last window and thresholds are re-calibrated, letting “normal” follow the new regime. Deterministic shutdown uses partition sentinels plus an idle timeout, and metrics are local-first with batched, async uplink.
+
+  - **Retrainer — tiered search & atomic rollout.**  
+    The retrainer consumes the frozen window and tier flag, reuses the offline scaler and selected features, and makes a train/validation split. It loads the current latest model and, when architecture/activation are compatible, fine-tunes; otherwise it trains from scratch. A centralized config provides the A/B/C grids. The retrainer does a quick warm-up scoring to rank candidates, then fully trains only the shortlist with early stopping, selecting the best by validation error. It writes model bytes and metrics, atomically updates the “latest” pointer for online hot-reload, and emits a retrain-done flag that unlocks the monitor. Detection stays histogram-JSD with frozen bins and calibrated thresholds for stability and interpretability; adaptation focuses on the latest window, keeping responses sharp without chasing noise.
 
 - **experiments/**  
   Reproducible experiments and Kubeflow Pipelines assembly. kubeflow/pipeline.py defines the full KFP DAG — offline → (monitor | producer | infer) → plot — with an 8-minute wall-clock cap per streaming stage and consumer auto-shutdown on idle. submit_pipeline.py compiles drift_demo_v2.yaml and submits it to KFP (KFP host/namespace/experiment are provided via environment variables). yamls/ contains example manifests for observability (e.g., Prometheus and Kafka Exporter). The folder enables a one-command workflow to compile and submit an end-to-end run: offline training, streaming drift detection and adaptive updates, and final charts/report generation.
 
-- **deploy/**  
-  Infrastructure and platform automation scripts:  
-  Auto_deployment_k8s_kubeflow.sh — Installs Kubernetes 1.32 on a single bare-metal node (containerd runtime, Calico CNI, local-path-provisioner as the default StorageClass), then uses Kustomize to fetch and deploy the full Kubeflow v1.10 stack (cert-manager, Istio with oauth2-proxy and Dex, Knative/KServe, Pipelines, Jupyter, Katib, etc.). The script waits for CRDs/Pods, applies required patches for idempotency and stability, and finally exposes istio-ingressgateway and MinIO via NodePort. It also adjusts policies to keep MinIO reachable (disable Envoy TLS to MinIO; relax peer mTLS to PERMISSIVE), resulting in a fully functional, browser-accessible Kubeflow setup on a single machine.  
-  Auto_disable_auth.sh — Strips the authN/authZ chain for a dev/test environment. At the Istio gateway and selected in-namespace entry points, EnvoyFilters inject a fixed user identity (kubeflow-userid and x-goog-authenticated-user-email with the accounts.google.com: prefix). Authorization headers are removed only at the gateway to bypass residual OIDC/JWT checks. In the Kubeflow namespace, an allow-all AuthorizationPolicy is applied; WebApps are set with APP_DISABLE_AUTH=True and configured to read the injected headers; the KFP backend is set with KUBEFLOW_USERID_HEADER=kubeflow-userid and an empty prefix. Sidecar injection is enforced so filters take effect; Lua headers():replace is used for compatibility with your Envoy version. A matching Profile is created for the impersonated user. Net result: any request that reaches the NodePort is treated as the fixed user—suitable only for fast local testing and CI/CD bring-up.  
+- ### **deploy/**  
+  - **Infrastructure and platform automation scripts:**  
+  **Auto_deployment_k8s_kubeflow.sh** — Installs Kubernetes 1.32 on a single bare-metal node (containerd runtime, Calico CNI, local-path-provisioner as the default StorageClass), then uses Kustomize to fetch and deploy the full Kubeflow v1.10 stack (cert-manager, Istio with oauth2-proxy and Dex, Knative/KServe, Pipelines, Jupyter, Katib, etc.). The script waits for CRDs/Pods, applies required patches for idempotency and stability, and finally exposes istio-ingressgateway and MinIO via NodePort. It also adjusts policies to keep MinIO reachable (disable Envoy TLS to MinIO; relax peer mTLS to PERMISSIVE), resulting in a fully functional, browser-accessible Kubeflow setup on a single machine. 
 
-  - **docker/**  
+  **Auto_disable_auth.sh** — Strips the authN/authZ chain for a dev/test environment. At the Istio gateway and selected in-namespace entry points, EnvoyFilters inject a fixed user identity (kubeflow-userid and x-goog-authenticated-user-email with the accounts.google.com: prefix). Authorization headers are removed only at the gateway to bypass residual OIDC/JWT checks. In the Kubeflow namespace, an allow-all AuthorizationPolicy is applied; WebApps are set with APP_DISABLE_AUTH=True and configured to read the injected headers; the KFP backend is set with KUBEFLOW_USERID_HEADER=kubeflow-userid and an empty prefix. Sidecar injection is enforced so filters take effect; Lua headers():replace is used for compatibility with your Envoy version. A matching Profile is created for the impersonated user. Net result: any request that reaches the NodePort is treated as the fixed user—suitable only for fast local testing and CI/CD bring-up.  
+
+  **Auto_deploy_kafka.sh** Installs Kafka bootstrap via Bitnami Helm. Ensures Helm and target namespace, adds and updates repo, renders a minimal values.yaml: single-broker (tunable), PLAINTEXT listeners (no SASL/TLS), KRaft (chart default), ClusterIP Service, configurable JVM heap. Installs and upgrades the release, waits for rollout, prints the in-cluster bootstrap address, and smoke-creates latencyTopic (3 partitions). 
+  
+- ### **docker/**  
   Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the in-cluster bootstrap address, and runs an idempotent smoke test, aligning with the repo’s default KAFKA_SERVERS. Includes helpers like Auto_clear_pods.yaml for basic cleanup/ops.
 
 ---
