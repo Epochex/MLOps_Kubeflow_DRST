@@ -91,11 +91,10 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 ![Infra Overview](<docs/structure_infra.png>)
 
 This repository is organized as follows:
-
-- **datasets/**  
+- ### **datasets/**  
   Network-flow datasets. Offline training uses combined.csv to produce the baseline model. Stage 1 uses random_rates.csv for initial adaptation. Stage 2 injects resource_stimulus_global_A-B-C_modified.csv to simulate inference under CPU resource contention.
-
-  **drst_common** is the runtime backbone that turns the whole system into a low-latency, loosely-coupled graph: rules live as code with env-overrides (drift tiers → on-the-fly A/B/C search spaces), artifacts flow through an **immutable-object + mutable-pointer** pattern (timestamped model/metrics with a 2-line “latest” head for atomic hot reloads and easy rollback), and storage follows **PVC-first write → async S3 upload** so training/inference never stall on the network.  
+- ### **drst_common/**  
+  The runtime backbone that turns the whole system into a low-latency, loosely-coupled graph: rules live as code with env-overrides (drift tiers → on-the-fly A/B/C search spaces), artifacts flow through an **immutable-object + mutable-pointer** pattern (timestamped model/metrics with a 2-line “latest” head for atomic hot reloads and easy rollback), and storage follows **PVC-first write → async S3 upload** so training/inference never stall on the network.  
   Messaging is JSON payloads with partition awareness and per-partition sentinels for deterministic shutdown.  
   Metrics are **local-first CSV/JSONL** append (latency/throughput/cold-start/JS ticks/RTT/CPU%) with batched sync upstream, while tiny readiness flags and minimal pipeline metadata keep orchestration observable without coupling.  
 
@@ -123,26 +122,20 @@ This repository is organized as follows:
 
 
 
-- **drst_inference/**  
-  it drives a dual-path predictor that stays accurate and stable under streaming load.
+- ### **drst_inference/**  
+  - **Execution Path & Parallel Consumption**  
+    The offline phase produces a baseline model and an initial adaptive model, and publishes a small “release pointer” that designates the active version. The streaming phase then launches parallel consumers matched to the topic’s partitions. Each consumer pulls records, standardizes them with a shared scaler, aligns inputs to both the baseline and adaptive networks, and emits **two predictions per batch**. Input dimensions are strictly reconciled with each network’s first layer (padding or truncation as needed) so the two paths remain comparable on the same data.
 
-  After offline training publishes a baseline and an initial adaptive model (plus a 2-line pointer to the current release), the streaming phase spins up three parallel consumers to cover topic partitions.
+  - **Online Metrics & Observability**  
+    The system continuously tracks batch-level and cumulative accuracy at a fixed relative-error threshold of 0.2, and logs error quantiles (p50/80/90/95/99), throughput, wall-clock latency, and CPU time. End-to-end RTT is reconstructed from send/receive timestamps to expose network jitter. A lightweight timer wraps critical sections and emits `runtime_ms` into the same metric stream. All metrics are appended locally first and only then batched upstream, ensuring observability never back-pressures inference under load.
 
-  Each consumer pulls rows, standardizes them with the shared scaler, aligns inputs to both the baseline and adaptive networks, and emits two predictions per batch.
+  - **Hot Swap & Latency Control**  
+    A background guard thread periodically reads the release pointer. A model swap is triggered only when the **validation gain over the baseline** exceeds a configured margin (in percentage points). The swap is an atomic pointer replacement: loading and verification occur under a narrow lock, while inference threads continue to serve on the previous handle until the new weights are fully materialized, keeping tail latency flat. If fetching fails or the gain is insufficient, the update is skipped and the current model remains in service.
 
-  It tracks relative-error accuracy with threshold τ=0.2, using
+  - **Deterministic Shutdown & Closed-Loop Data**  
+    Termination is deterministic: the consumers exit cleanly once **all per-partition sentinels** have arrived or an extended idle timeout is reached. On exit, each consumer writes a compact time-series trace (timestamps, ground truth, baseline prediction, adaptive prediction) for downstream aggregation and plotting. This stitches the offline bridge and the online phases onto a single timeline, enabling full replay of the experiment and phase-level diagnosis.
 
-  $$
-  e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
-  $$
 
-  logging batch and cumulative accuracy, error quantiles (p50/80/90/95/99), throughput, wall/CPU time, and RTT reconstructed from send/receive timestamps.
-
-  A lightweight guard thread periodically reads the release pointer; a hot-swap occurs only when the new model’s validation gain over baseline exceeds a configured margin (percentage points).
-
-  The swap is lock-safe and atomic: inference continues on the previous handle until the new weights are fully materialized, keeping tail latency flat.
-
-  Termination is deterministic: per-partition sentinels and an idle timeout stop consumers cleanly; on exit, each writes a compact trace (timestamps, truth, baseline, adaptive) for plotting.
 
 
 - **drst_forecasting/**  
