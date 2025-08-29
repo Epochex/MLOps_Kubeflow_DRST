@@ -17,7 +17,7 @@ from drst_common.metric_logger import log_metric
 
 def _read_training_table() -> pd.DataFrame:
     """
-    Prefer to read from MinIO (TRAIN_MINIO_KEY); otherwise read local file (TRAIN_LOCAL_PATH, default datasets/train.csv).
+    优先从 MinIO 读取（TRAIN_MINIO_KEY），否则读本地 CSV（TRAIN_LOCAL_PATH，默认 datasets/train.csv）。
     """
     key = os.getenv("TRAIN_MINIO_KEY", "").strip()
     if key:
@@ -29,6 +29,19 @@ def _read_training_table() -> pd.DataFrame:
             df = df.drop(columns=["Unnamed: 0"])
     return df
 
+def _restrict_to_feature_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    若设置 FEATURE_COLS（逗号分隔），则仅保留该集合交集；否则返回原 df。
+    """
+    raw = os.getenv("FEATURE_COLS", "").strip()
+    if not raw:
+        return df
+    allow = [c.strip() for c in raw.split(",") if c.strip()]
+    keep = [c for c in df.columns if c in allow]
+    if not keep:
+        return df
+    return df[keep + ([TARGET_COL] if TARGET_COL in df.columns else [])]
+
 def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -36,9 +49,10 @@ def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 def select_features(df: pd.DataFrame, topk: Optional[int] = None) -> List[str]:
     """
-    Simple/robust: compute absolute Pearson correlation between numeric columns and TARGET, sort descending, pick topk;
-    if topk not set, use all non-TARGET columns (excluding EXCLUDE_COLS).
+    绝对 Pearson 相关性：对候选数值列与 TARGET 求 |corr|，降序取前 topk。
+    若未设 topk，使用全部候选列。
     """
+    # 候选：排除 EXCLUDE_COLS 与 TARGET
     cand = [c for c in df.columns if c not in set(EXCLUDE_COLS + [TARGET_COL])]
     num = df[cand].select_dtypes(include=["number"])
     corr = num.corrwith(df[TARGET_COL]).abs().sort_values(ascending=False)
@@ -50,13 +64,16 @@ def select_features(df: pd.DataFrame, topk: Optional[int] = None) -> List[str]:
 def prepare_dataset(topk: Optional[int] = None, val_frac: float = 0.2, seed: int = 42
                     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], StandardScaler]:
     """
-    Returns Xtr, Xva, Ytr, Yva, selected_feats, scaler.
-    Side effect: save selected_feats.json + scaler.pkl to models/.
+    返回 Xtr, Xva, Ytr, Yva, selected_feats, scaler。
+    副作用：将 selected_feats.json 与 scaler.pkl 写入 models/ 供在线侧热加载。
     """
     df = _read_training_table()
+    # 可选限制在 FEATURE_COLS 集合
+    df = _restrict_to_feature_cols(df)
     df = _coerce_numeric(df)
     df = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
-    # Drop EXCLUDE_COLS
+
+    # 丢弃无意义/高泄露列（配置中已包含 input_rate/latency 等）
     cols = [c for c in df.columns if c not in EXCLUDE_COLS]
     df = df[cols]
 
@@ -65,7 +82,7 @@ def prepare_dataset(topk: Optional[int] = None, val_frac: float = 0.2, seed: int
     X = df[selected].values.astype(np.float32)
     y = df[TARGET_COL].values.astype(np.float32)
 
-    # Train/validation split
+    # 训练/验证划分
     rng = np.random.default_rng(seed)
     idx = np.arange(len(X))
     rng.shuffle(idx)
@@ -79,7 +96,7 @@ def prepare_dataset(topk: Optional[int] = None, val_frac: float = 0.2, seed: int
     Ytr = y[tr_idx]
     Yva = y[va_idx]
 
-    # Save artefacts: selected_feats.json + scaler.pkl
+    # 持久化工件：selected_feats.json + scaler.pkl
     save_bytes(f"{MODEL_DIR}/selected_feats.json",
                json.dumps(selected, ensure_ascii=False, indent=2).encode(),
                "application/json")

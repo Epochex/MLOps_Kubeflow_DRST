@@ -94,8 +94,30 @@ This repository is organized as follows:
 
 - **datasets/**  
   Network-flow datasets. Offline training uses combined.csv to produce the baseline model. Stage 1 uses random_rates.csv for initial adaptation. Stage 2 injects resource_stimulus_global_A-B-C_modified.csv to simulate inference under CPU resource contention.
-- **drst_common/**  
-  Designed to consolidate four cross-cutting concerns—configuration, artifacts, messaging, and metrics—so monitoring, retraining, and inference are loosely coupled via shared artifacts and flags with low latency. At runtime this layer centralizes rules and artifact access: the config module defines the mapping from drift tiers to retraining grids (and generates those grids), replacing ad-hoc JSON/env handshakes with local writes and flag files. The Kafka wrapper handles reliable produce/consume, partition awareness, and per-partition end-of-stream signaling. The MinIO helper implements “write to local PVC then async upload” to keep training/inference threads off the I/O hot path. The artifacts module standardizes reading/writing models, metrics, selected features, and scalers while maintaining the latest pointer used for online hot reloads and retraining. The metric logger writes all instrumentation to local tables and periodically archives/syncs them. The runtime module exposes readiness signals and pipeline metadata. Utilities include fault-tolerant model deserialization, thresholded accuracy, and distribution-distance calculations; the profiler provides a lightweight timing context.
+
+  **drst_common** is the runtime backbone that turns the whole system into a low-latency, loosely-coupled graph: rules live as code with env-overrides (drift tiers → on-the-fly A/B/C search spaces), artifacts flow through an **immutable-object + mutable-pointer** pattern (timestamped model/metrics with a 2-line “latest” head for atomic hot reloads and easy rollback), and storage follows **PVC-first write → async S3 upload** so training/inference never stall on the network.  
+  Messaging is JSON payloads with partition awareness and per-partition sentinels for deterministic shutdown.  
+  Metrics are **local-first CSV/JSONL** append (latency/throughput/cold-start/JS ticks/RTT/CPU%) with batched sync upstream, while tiny readiness flags and minimal pipeline metadata keep orchestration observable without coupling.  
+
+  Utilities close the loop: fault-tolerant model deserialization; thresholded accuracy defined on relative error  
+  $$
+  e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
+  $$
+  with  
+  $$
+  \mathrm{accuracy}@\tau = \mathrm{mean}\!\left(e \le \tau\right).
+  $$
+
+  Histogram-based Jensen–Shannon divergence for drift  
+  $$
+  \mathrm{JSD}(P\|Q)=\tfrac{1}{2}\,\mathrm{KL}(P\|M)+\tfrac{1}{2}\,\mathrm{KL}(Q\|M),\quad M=\tfrac{1}{2}(P+Q),
+  $$
+  and a micro profiler that wraps critical sections and emits `runtime_ms` into the same metric stream.  
+
+  The result is a single, cohesive plane—configuration, artifacts, messaging, metrics—where components share only pointers and facts (not state), enabling safe model rollouts, predictable lifecycles, and stable p95 latency under streaming load.  
+
+
+
 
 - **drst_inference/**  
   In offline/, features.py loads the training table (MinIO first, local fallback), performs column cleanup, feature selection, and StandardScaler normalization, and persists selected_feats.json and scaler.pkl. model.py provides a compact MLP regressor with an explicit first layer in_features to simplify input alignment online. train_offline.py trains both the baseline (linear) and adaptive (multi-layer MLP), evaluates MAE/RMSE/acc@0.15, and produces baseline_model.pt plus timestamped model_*.pt as the initial model set for online inference. When the pipeline enters streaming, it runs alongside drst_drift/: in online/, producer.py sends data in phased rates from MinIO to Kafka and emits a per-partition end-of-stream sentinel, while inference_consumer.py launches three parallel consumer workers (to cover multiple partitions). Each consumer auto-stops after a configurable inactivity window (default 60s) to indicate readiness. Once data flows, consumers enter steady-state streaming: they compute the Jensen–Shannon divergence on a sliding window (at the sampling interval) for the retraining controller, run dual-path baseline+adaptive predictions, log error quantiles/throughput/CPU and cumulative accuracy, and periodically check latest.txt to hot-swap to a new model only if it outperforms the baseline by a configured margin; until a swap completes, inference continues on the previous model to preserve stability. Drift detection and retraining are initiated by drst_drift/: when the JS distance triggers a retrain, the system freezes the current window statistics and suppresses new triggers to avoid thrash, then—after retraining succeeds and writes back the new model/metrics—consumers detect the update and switch seamlessly. After the stream naturally drains, the three streaming components (producer/consumer/monitor) exit, and plotting/ takes over: plot_final.py reads each consumer’s *_inference_trace.npz to generate time-series overlays and a relative-error histogram; plot_report.py assembles report.md and uploads all artifacts to results/ in MinIO. Interactions with MinIO are minimized and asynchronous (initial reads during training, local write-through then async upload, and async writes at publish time) to reduce resource contention; within the streaming path, data is kept in memory or on local PVC to cut I/O overhead, increase throughput, and maintain inference continuity during retrain and hot reload.

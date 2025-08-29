@@ -29,7 +29,7 @@ from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.runtime import touch_ready, write_kfp_metadata
 
 # Hyperparameters (overridable via env)
-TOPK          = int(os.getenv("OFFLINE_TOPK", "0")) or None  # 0 means use all
+TOPK          = int(os.getenv("OFFLINE_TOPK", "10")) or None  # 默认 Top-10 相关特征
 VAL_FRAC      = float(os.getenv("OFFLINE_VAL_FRAC", "0.2"))
 SEED          = int(os.getenv("OFFLINE_SEED", "42"))
 
@@ -64,7 +64,6 @@ def _train_regressor(model: nn.Module, Xtr: np.ndarray, Ytr: np.ndarray,
             loss.backward()
             opt.step()
             ep_loss += float(loss.detach().cpu())
-        # optional logging
         print(f"[offline] epoch {ep+1}/{epochs} loss={ep_loss/len(dl):.6f}")
     train_time = time.perf_counter() - t0
 
@@ -124,7 +123,6 @@ def main():
         "model_size_mb": round(len(buf_a.getvalue())/(1024*1024), 4),
         "hidden": list(HIDDEN), "dropout": float(DROPOUT),
     }
-    # unified write latest (uploads model & metrics, updates latest.txt)
     write_latest(buf_a.getvalue(), metrics, model_key=model_key, metrics_key=metrics_key)
 
     # 6) Metrics logging

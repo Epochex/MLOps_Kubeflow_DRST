@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # drst_drift/monitor.py
 # Fixed sliding window=300 + stride=50: every 50 new samples, compute JS using last 300.
-# Trigger thresholds: JS<0.40 → no retrain; [0.40,0.60) → A; [0.60,0.75) → B; ≥0.75 → C.
-# Upon trigger, write:
-#   - results/latest_batch.npy (+columns.json)
-#   - results/retrain_grid.flag  (text content: A|B|C)
-#   - results/retrain_lock.flag  (unlocked when retrain writes retrain_done.flag)
+# Trigger policy (改造版):
+#   仅当 JS_now > JS_mean 且 JS_now 落入分段阈值时触发：
+#     JS<0.40 → no retrain; [0.40,0.60) → A; [0.60,0.75) → B; ≥0.75 → C。
+#   触发后写锁，直到重训完成前不再计算/触发。
 from __future__ import annotations
 import os, json, time, queue, threading
 from collections import deque
@@ -104,10 +103,6 @@ def _grid_letter(js_val: float) -> str | None:
         return "B"
     return "C"
 
-def _write_grid_flag(letter: str, js_val: float):
-    save_bytes(f"{RESULT_DIR}/retrain_grid.flag", letter.encode(), "text/plain")
-    save_bytes(f"{RESULT_DIR}/last_js.txt", f"{js_val:.6f}\n".encode(), "text/plain")
-
 def _retrain_done_after(ts0: float) -> bool:
     key = f"{RESULT_DIR}/retrain_done.flag"
     try:
@@ -140,7 +135,7 @@ print(f"[monitor:{pod_name}] started…")
 last_data_time = time.time()
 
 while True:
-    # Unlock check: retrain finished?
+    # 解锁检查：重训完成？
     if retrain_in_progress and _retrain_done_after(lock_started_ts):
         retrain_in_progress = False
         print(f"[monitor:{pod_name}] retrain done detected → unlock")
@@ -163,7 +158,7 @@ while True:
     feats, y = _features_from_msg(rec)
     feats_scaled = scaler.transform(feats.reshape(1, -1)).ravel()
 
-    # Establish baseline (first 300 samples)
+    # 建立基线（首 300 个样本）
     if not baseline_ready:
         baseline_buf.append(feats_scaled)
         if len(baseline_buf) >= DRIFT_WINDOW:
@@ -173,15 +168,16 @@ while True:
             print(f"[monitor:{pod_name}] baseline ready with {DRIFT_WINDOW} rows")
         continue
 
-    # Baseline ready, use rolling window
+    # 基线已就绪，进入滑窗
     window_buf.append(feats_scaled)
     if y is not None:
         label_buf.append(float(y))
     if len(window_buf) < DRIFT_WINDOW:
         continue
 
+    # 重训锁定中：暂停评估与触发
     if retrain_in_progress:
-        continue  # Retrain ongoing, skip trigger
+        continue
 
     samples_since_eval += 1
     if samples_since_eval < EVAL_STRIDE:
@@ -191,28 +187,35 @@ while True:
     X_base = np.vstack(baseline_buf)
     X_win  = np.vstack(window_buf)
     js_val = _compute_js(X_base, X_win)
+    js_mean = float(np.mean(js_history)) if js_history else 0.0
     js_history.append(js_val)
 
     log_metric(component="monitor", event="js_tick",
                js_val=round(js_val, 6),
+               js_mean=round(js_mean, 6),
                window=DRIFT_WINDOW, eval_stride=EVAL_STRIDE)
+
+    # 仅当“相对历史抬升”且“绝对阈值分段”同时满足时触发
+    if not (js_val > js_mean):
+        continue
 
     letter = _grid_letter(js_val)
     if letter is None:
-        continue  # below retrain threshold
+        continue  # 绝对阈值不足
 
-    # Trigger: save window data + write flag + lock
+    # 触发：保存窗口数据 + 写网格标志 + 上锁
     y_latest = np.array(label_buf, dtype=np.float32) if len(label_buf) == len(window_buf) else None
     _save_latest_batch(X_win, y_latest)
-    _write_grid_flag(letter, js_val)
+    save_bytes(f"{RESULT_DIR}/retrain_grid.flag", letter.encode(), "text/plain")
+    save_bytes(f"{RESULT_DIR}/last_js.txt", f"{js_val:.6f}\n".encode(), "text/plain")
     save_bytes(f"{RESULT_DIR}/retrain_lock.flag", b"", "text/plain")
     retrain_in_progress = True
     lock_started_ts = time.time()
 
     log_metric(component="monitor", event="drift_triggered",
-               js_val=round(js_val, 6), grid=letter)
+               js_val=round(js_val, 6), js_mean=round(js_mean, 6), grid=letter)
 
-# Finalization
+# 收尾
 sync_all_metrics_to_minio()
 write_kfp_metadata()
 print(f"[monitor:{pod_name}] metrics synced; bye.")
