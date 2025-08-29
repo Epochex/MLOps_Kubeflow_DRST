@@ -132,9 +132,9 @@ This repository is organized as follows:
 
   It tracks relative-error accuracy with threshold τ=0.2, using
 
-$$
-e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
-$$
+  > $$
+  > e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
+  > $$
 
   logging batch and cumulative accuracy, error quantiles (p50/80/90/95/99), throughput, wall/CPU time, and RTT reconstructed from send/receive timestamps.
 
