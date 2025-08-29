@@ -124,7 +124,26 @@ This repository is organized as follows:
 
 
 - **drst_inference/**  
-  In offline/, features.py loads the training table (MinIO first, local fallback), performs column cleanup, feature selection, and StandardScaler normalization, and persists selected_feats.json and scaler.pkl. model.py provides a compact MLP regressor with an explicit first layer in_features to simplify input alignment online. train_offline.py trains both the baseline (linear) and adaptive (multi-layer MLP), evaluates MAE/RMSE/acc@0.15, and produces baseline_model.pt plus timestamped model_*.pt as the initial model set for online inference. When the pipeline enters streaming, it runs alongside drst_drift/: in online/, producer.py sends data in phased rates from MinIO to Kafka and emits a per-partition end-of-stream sentinel, while inference_consumer.py launches three parallel consumer workers (to cover multiple partitions). Each consumer auto-stops after a configurable inactivity window (default 60s) to indicate readiness. Once data flows, consumers enter steady-state streaming: they compute the Jensen–Shannon divergence on a sliding window (at the sampling interval) for the retraining controller, run dual-path baseline+adaptive predictions, log error quantiles/throughput/CPU and cumulative accuracy, and periodically check latest.txt to hot-swap to a new model only if it outperforms the baseline by a configured margin; until a swap completes, inference continues on the previous model to preserve stability. Drift detection and retraining are initiated by drst_drift/: when the JS distance triggers a retrain, the system freezes the current window statistics and suppresses new triggers to avoid thrash, then—after retraining succeeds and writes back the new model/metrics—consumers detect the update and switch seamlessly. After the stream naturally drains, the three streaming components (producer/consumer/monitor) exit, and plotting/ takes over: plot_final.py reads each consumer’s *_inference_trace.npz to generate time-series overlays and a relative-error histogram; plot_report.py assembles report.md and uploads all artifacts to results/ in MinIO. Interactions with MinIO are minimized and asynchronous (initial reads during training, local write-through then async upload, and async writes at publish time) to reduce resource contention; within the streaming path, data is kept in memory or on local PVC to cut I/O overhead, increase throughput, and maintain inference continuity during retrain and hot reload.
+  it drives a dual-path predictor that stays accurate and stable under streaming load.
+
+  After offline training publishes a baseline and an initial adaptive model (plus a 2-line pointer to the current release), the streaming phase spins up three parallel consumers to cover topic partitions.
+
+  Each consumer pulls rows, standardizes them with the shared scaler, aligns inputs to both the baseline and adaptive networks, and emits two predictions per batch.
+
+  It tracks relative-error accuracy with threshold τ=0.2, using
+
+  $$
+  e = \frac{|\hat y - y|}{\max\bigl(|y|,\varepsilon\bigr)}
+  $$
+
+  logging batch and cumulative accuracy, error quantiles (p50/80/90/95/99), throughput, wall/CPU time, and RTT reconstructed from send/receive timestamps.
+
+  A lightweight guard thread periodically reads the release pointer; a hot-swap occurs only when the new model’s validation gain over baseline exceeds a configured margin (percentage points).
+
+  The swap is lock-safe and atomic: inference continues on the previous handle until the new weights are fully materialized, keeping tail latency flat.
+
+  Termination is deterministic: per-partition sentinels and an idle timeout stop consumers cleanly; on exit, each writes a compact trace (timestamps, truth, baseline, adaptive) for plotting.
+
 
 - **drst_forecasting/**  
   Placeholder and baselines for short-term trend forecasting: baseline_mean.py provides a moving-average baseline to quickly validate whether latency/throughput evolves predictably over time; lstm_placeholder.py sketches a minimal LSTM regressor for future time-series modeling of online error or system state. This package is optional in the main pipeline and can be wired in as an auxiliary predictor in the inference stage or as a forward-error estimator in the monitor.
