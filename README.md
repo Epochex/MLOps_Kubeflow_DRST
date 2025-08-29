@@ -9,28 +9,92 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 
 ## 📘 Overview
 
-### Overview of Infra
+## Overview of Infra
 This system relies on the Kubernetes architecture and its primary related features as follows:
 
-## Orchestration & Platform Support Chain (Kubeadm/K8s → Calico/StorageClass → Istio/cert-manager → Kubeflow/KFP)
-The base layer is a kubeadm-initialized single-node control plane (containerd with SystemdCgroup, swap disabled, `pod-network-cidr` with Calico CNI). The `local-path` StorageClass is set as default for `/mnt/pvc`. Istio provides the ingress gateway and sidecars (NodePort 30080/30443 for UIs); an EnvoyFilter at the gateway injects a user header to bypass login in development, and a DestinationRule disables mTLS toward MinIO. cert-manager is installed with CRDs first and then an Issuer to keep Kubeflow 1.10 install stable; KServe/Knative use server-side apply and CRD readiness waits to avoid race conditions. The pipeline defined in `experiments/kubeflow/pipeline.py` is compiled and submitted to KFP v2; the DAG schedules one pod per stage (offline, monitor, producer, three consumers, plot). An ExitHandler guarantees a report even on failure paths. Components write placeholder metadata to `/tmp/kfp_outputs/`, and metrics are consolidated to object storage for observability and audit, yielding platform-level orchestration with data/model planes cleanly decoupled.
+#### Streaming & Online Compute Plane    
+*Kafka/KRaft partitions, consumer groups, and Kubernetes parallelism*  
 
-## Data & Model Artifact Plane (MinIO/S3 ↔ PVC/StorageClass ↔ pointer file)
-MinIO is the single source of truth for datasets, evaluation outputs, and online results. Pods reach it via `*.svc.cluster.local:9000`, and the Console/API can be exposed through the Istio gateway (Console 9001). The default StorageClass (local-path) backs `/mnt/pvc` inside containers; every artifact is first written locally and then uploaded asynchronously so reads/writes survive network hiccups. Model distribution uses immutable objects plus a mutable pointer: each release uploads timestamped `model_*.pt` and `metrics_*.json`, then overwrites `models/latest.txt` (two lines: model key and metrics key). Consumers read only this pointer for pull-based hot reloads. Traffic to MinIO has an Istio `DestinationRule` that disables mTLS toward the backend to avoid TLS being enforced on a plaintext service. Objects are separated by prefixes `datasets_old/`, `models/`, and `results/` for lifecycle control and audit.
+**Base Layer**  
+The environment is bootstrapped with `kubeadm` on a single-node control plane. The container runtime is containerd with `SystemdCgroup`, swap is disabled to comply with kubelet requirements, and Calico CNI provides the pod network (`pod-network-cidr`). Local persistence is handled by the `local-path` StorageClass, mounted under `/mnt/pvc`, ensuring every pod can access PVC-backed volumes for dataset caching and artifact storage.
 
-## Streaming & Online Compute Plane (Kafka/KRaft ↔ partitions/consumer groups ↔ Kubernetes parallelism)
-Kafka runs in KRaft mode and is exposed as a ClusterIP service; the topic is sharded into three partitions. Multiple Consumer pods join the same consumer group to gain exclusive ownership of partitions, ensuring per-partition ordering and exactly one processor within the group. Producers send a per-partition end-of-stream sentinel; consumers shut down gracefully when the in-process queue drains and an idle timeout elapses, or after all sentinels are seen, then write a trace to storage. Failover and rebalances follow at-least-once semantics; idempotent metrics and final aggregation avoid double-count side effects. Horizontal scale follows “throughput ≈ partitions × schedulable replicas,” with Kubernetes handling placement and cluster DNS providing service discovery, without relying on external load balancers.
+**Service Mesh and Ingress**  
+Istio provides both ingress gateway and sidecar injection. User-facing UIs are exposed through NodePorts **30080/30443**, enabling external access without a LoadBalancer. At the gateway layer, an EnvoyFilter injects static user headers to bypass authentication in development mode, while a dedicated DestinationRule disables mTLS for MinIO traffic to prevent Envoy from enforcing TLS against a plaintext backend. This setup preserves service-to-service security elsewhere while keeping MinIO compatible.
 
-## Drift Monitoring → Model Update Control Plane (sliding window → trigger flags → grid retrain → hot reload)
-The monitor builds a fixed sliding window from the Kafka stream and, at a configured stride, computes the Jensen–Shannon distance of feature distributions. When thresholds (A/B/C) are crossed, it writes `latest_batch.npy` and `retrain_grid.flag` to object storage and sets a lock to prevent duplicate triggers. The retrainer then runs the corresponding grid search (prefer fine-tune when the structure matches; fall back to from-scratch when needed). After evaluation, it publishes the new model/metrics to MinIO and only updates the pointer, while consumers perform atomic hot reloads via polling, md5 deduplication, and an accuracy-gain threshold. This separates the data plane (Kafka) from the artifact plane (MinIO) and uses flags plus a lock to achieve single-shot triggering with restart safety, with rollback done by pointing `latest.txt` back to a prior model.
+**Certificates and Stability**  
+cert-manager is introduced with CRDs applied first, followed by the Issuer configuration. This sequence prevents dependency races and stabilizes Kubeflow 1.10 deployment. KServe and Knative are installed using server-side apply with CRD readiness checks, ensuring that controllers only proceed once all APIs are available, avoiding startup failures and guaranteeing reproducibility of the deployment.
+
+**Pipeline Execution**  
+The end-to-end workflow is encoded in `experiments/kubeflow/pipeline.py` and compiled for KFP v2. The DAG launches one pod per stage:  
+- **offline training** for baseline and adaptive models  
+- **drift monitor** for sliding-window JS evaluation  
+- **Kafka producer** to simulate streaming input  
+- **three inference consumers** running in parallel for partition-exclusive processing  
+- **plotting/reporting** for final visualization and markdown report generation  
+
+An ExitHandler guarantees that reporting runs even if any upstream stage fails, while each component writes placeholder metadata to `/tmp/kfp_outputs/` for orchestration compliance.
+
+**Observability and Decoupling**  
+All metrics are written locally under `/mnt/pvc` and asynchronously uploaded to object storage. This provides durable audit trails and consolidated observability across pods. By decoupling orchestration (pipeline scheduling), the data plane (datasets and streams), and the model plane (training and inference artifacts), the system ensures modularity, robustness under failure conditions, and clean separation of responsibilities.
+
+
+
+#### Data & Model Artifact Plane    
+*MinIO/S3 ↔ PVC/StorageClass ↔ pointer file*  
+
+**MinIO as Source of Truth**  
+MinIO serves as the single source of truth for datasets, evaluation outputs, and online results. Pods access it internally via `*.svc.cluster.local:9000`, while the Console/API can also be exposed through the Istio gateway (Console on 9001).
+
+**Storage and Reliability**  
+The default `local-path` StorageClass backs `/mnt/pvc` inside containers. All artifacts are first written locally and then uploaded asynchronously, ensuring read/write resilience against transient network issues.
+
+**Model Distribution**  
+Models are distributed using immutable objects plus a mutable pointer: each release uploads timestamped `model_*.pt` and `metrics_*.json`, then overwrites `models/latest.txt` with two lines (model key and metrics key). Consumers read only this pointer, enabling pull-based hot reloads.
+
+**Traffic and Security**  
+An Istio `DestinationRule` disables mTLS toward MinIO, preventing Envoy from enforcing TLS on a plaintext backend service.
+
+**Object Organization**  
+Data is structured with prefixes `datasets_old/`, `models/`, and `results/`, supporting lifecycle management, separation of concerns, and auditability.
+
+
+#### Streaming & Online Compute Plane
+*Kafka/KRaft ↔ partitions / consumer groups ↔ Kubernetes parallelism*    
+**Kafka Runtime**  
+Kafka operates in KRaft mode and is deployed as a ClusterIP service within the cluster. The target topic is pre-sharded into three partitions, establishing the parallelism baseline for downstream consumers.
+
+**Consumers and Partition Ownership**  
+Consumer pods are launched in parallel under a single consumer group. Kafka’s group coordinator assigns each partition to exactly one consumer, ensuring strict ordering within partitions while preventing duplicate processing. This mechanism guarantees exclusivity of partition ownership across replicas.
+
+**Sentinel Signaling and Graceful Shutdown**  
+Producers append an explicit per-partition end-of-stream sentinel. Consumers monitor both the internal processing queue and the count of received sentinels:  
+- If all sentinels are observed, the consumer terminates.  
+- If no new data arrives beyond the idle timeout, the consumer also exits.  
+In either case, the pod finalizes by writing a trace artifact to storage, enabling deterministic downstream analysis.
+
+**Reliability and Processing Semantics**  
+Rebalances and failover events adhere to Kafka’s at-least-once delivery semantics. To mitigate side effects, all metrics are designed to be idempotent, and aggregation logic is structured to tolerate replayed events without double counting.
+
+**Horizontal Scalability**  
+Effective throughput scales with the formula `throughput ≈ partitions × active replicas`. Partition count defines the maximum parallelism, while Kubernetes schedules replicas onto available nodes and provides DNS-based service discovery. No external load balancer is required, as the Kafka service is resolved directly within the cluster network.
+
+
+### Drift Monitoring → Model Update Control Plane  
+*sliding window → trigger flags → grid retrain → hot reload*  
+The monitor maintains a fixed sliding window over the Kafka stream and, at a defined stride, evaluates feature distribution drift via Jensen–Shannon distance. When thresholds (A/B/C) are crossed, it writes `latest_batch.npy` and `retrain_grid.flag` to object storage and sets a lock to prevent duplicate triggers.  
+
+The retrainer consumes these signals to launch grid search: it fine-tunes when the structure is compatible, and falls back to from-scratch training otherwise. After evaluation, it publishes timestamped model and metrics files to MinIO and updates only the mutable pointer, while inference consumers perform atomic hot reloads through periodic polling, md5-based deduplication, and accuracy-gain thresholds.  
+
+This design separates the data plane (Kafka) from the artifact plane (MinIO), relying on flag files and lock semantics to ensure single-shot triggering with restart safety. Rollback is achieved by resetting `latest.txt` to reference a prior model version.
+
 
 ![Infra Overview](<docs/structure_infra.png>)
 
 This repository is organized as follows:
 
-- **datasets//**  
+- **datasets/**  
   Network-flow datasets. Offline training uses combined.csv to produce the baseline model. Stage 1 uses random_rates.csv for initial adaptation. Stage 2 injects resource_stimulus_global_A-B-C_modified.csv to simulate inference under CPU resource contention.
-- **drst_common//**  
+- **drst_common/**  
   Designed to consolidate four cross-cutting concerns—configuration, artifacts, messaging, and metrics—so monitoring, retraining, and inference are loosely coupled via shared artifacts and flags with low latency. At runtime this layer centralizes rules and artifact access: the config module defines the mapping from drift tiers to retraining grids (and generates those grids), replacing ad-hoc JSON/env handshakes with local writes and flag files. The Kafka wrapper handles reliable produce/consume, partition awareness, and per-partition end-of-stream signaling. The MinIO helper implements “write to local PVC then async upload” to keep training/inference threads off the I/O hot path. The artifacts module standardizes reading/writing models, metrics, selected features, and scalers while maintaining the latest pointer used for online hot reloads and retraining. The metric logger writes all instrumentation to local tables and periodically archives/syncs them. The runtime module exposes readiness signals and pipeline metadata. Utilities include fault-tolerant model deserialization, thresholded accuracy, and distribution-distance calculations; the profiler provides a lightweight timing context.
 
 - **drst_inference/**  
