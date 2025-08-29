@@ -12,7 +12,7 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 ## 1.1 Overview of Infra
 This system relies on the Kubernetes architecture and its primary related features as follows:
 
-### 1.1.0 Streaming & Online Compute Plane (context)    
+### 1.1.0 Streaming & Online Compute Plane  
 *Kafka/KRaft partitions, consumer groups, and Kubernetes parallelism*  
 
 ### 1.1.1 Base Layer  
