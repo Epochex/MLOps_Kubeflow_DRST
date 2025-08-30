@@ -98,7 +98,7 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 ![Infra Overview](<docs/structure_infra.png>)
 
 ## 2. Software Overview
-**This repository is organized as follows.** Where helpful, wording has been slightly simplified for readability without changing the meaning.
+**This repository is organized as follows.** 
 
 ### 2.1 `datasets/`
 Network-flow datasets. Offline training uses `combined.csv` to produce the baseline model. Stage 1 uses `random_rates.csv` for initial adaptation. Stage 2 injects `resource_stimulus_global_A-B-C_modified.csv` to simulate inference under CPU resource contention.
