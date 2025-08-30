@@ -15,7 +15,7 @@ rules:
   verbs: ["get","list","delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBindingeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+kind: RoleBinding
 metadata:
   name: pod-gc
   namespace: kubeflow-user-example-com
@@ -23,9 +23,9 @@ subjects:
 - kind: ServiceAccount
   name: pod-gc
 roleRef:
+  apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: pod-gc
-  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -33,7 +33,10 @@ metadata:
   name: kfp-pod-gc
   namespace: kubeflow-user-example-com
 spec:
-  schedule: "0 */12 * * *"   # 每 12 小时
+  schedule: "0 */12 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
       template:
@@ -42,13 +45,17 @@ spec:
           restartPolicy: Never
           containers:
           - name: gc
-            image: lachlanevenson/k8s-kubectl:v1.32.0
-            command: ["/bin/sh","-lc"]
+            image: bitnami/kubectl:1.33.4-debian-12-r0
+            imagePullPolicy: Always
+            command: ["sh","-c"]
             args:
             - |
-              RETAIN_SECS=$((12*3600))  # 12 小时可改
+              set -e
+              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              RETAIN_SECS=$((12*3600))
               now=$(date +%s)
-              kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.status.startTime}{"\n"}{end}' \
+              kubectl -n "$NS" get pods -l 'pipelines.kubeflow.org/v2_component' \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.status.startTime}{"\n"}{end}' \
               | while IFS='|' read -r name phase start; do
                   [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ] || continue
                   [ -n "$start" ] || continue
@@ -56,6 +63,6 @@ spec:
                   age=$((now - start_epoch))
                   if [ $age -gt $RETAIN_SECS ]; then
                     echo "deleting $name (age=${age}s, phase=$phase)"
-                    kubectl delete pod "$name"
+                    kubectl -n "$NS" delete pod "$name"
                   fi
                 done
