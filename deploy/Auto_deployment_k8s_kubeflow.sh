@@ -359,3 +359,171 @@ spec:
     tls:
       mode: DISABLE
 --
+
+
+
+###############################################################################
+# KFP auth-bypass + UI status sync (switchable RBAC_MODE)
+###############################################################################
+set -Eeuo pipefail
+
+USER_EMAIL=${USER_EMAIL:-user@example.com}           # fix the login user, same as gateway
+RBAC_MODE=${RBAC_MODE:-A}                            # A=cluster-admin  B=minimal
+NS_KF=${NS_KF:-kubeflow}
+NS_ISTIO=${NS_ISTIO:-istio-system}
+NS_USER=${NS_USER:-kubeflow-user-example-com}
+
+echo "[kfp] allow-all AuthorizationPolicy in ${NS_KF} ..."
+cat <<YAML | kubectl apply -f -
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-all-kubeflow
+  namespace: ${NS_KF}
+spec:
+  rules:
+  - {}
+YAML
+
+echo "[kfp] EnvoyFilter@gateway: force user headers + strip Authorization ..."
+cat <<YAML | kubectl apply -f -
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: force-kubeflow-user
+  namespace: ${NS_ISTIO}
+spec:
+  workloadSelector:
+    labels:
+      app: istio-ingressgateway
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            function envoy_on_request(handle)
+              local uid = "${USER_EMAIL}"
+              local h = handle:headers()
+              h:replace("kubeflow-userid", uid)
+              h:replace("x-auth-request-email", uid)
+              h:replace("x-goog-authenticated-user-email", "accounts.google.com:" .. uid)
+              h:remove("authorization")
+            end
+YAML
+
+echo "[kfp] EnvoyFilter@ml-pipeline inbound: fallback user headers ..."
+cat <<YAML | kubectl apply -f -
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: add-userid-to-ml-pipeline-inbound
+  namespace: ${NS_KF}
+spec:
+  workloadSelector:
+    labels:
+      app: ml-pipeline
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            function envoy_on_request(handle)
+              local uid = "${USER_EMAIL}"
+              local h = handle:headers()
+              if not h:get("kubeflow-userid") then h:replace("kubeflow-userid", uid) end
+              if not h:get("x-auth-request-email") then h:replace("x-auth-request-email", uid) end
+              if not h:get("x-goog-authenticated-user-email") then
+                h:replace("x-goog-authenticated-user-email", "accounts.google.com:" .. uid)
+              end
+            end
+YAML
+
+echo "[kfp] disable app auth + unify user headers ..."
+kubectl -n "${NS_KF}" set env deployment/centraldashboard                APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= || true
+kubectl -n "${NS_KF}" set env deployment/jupyter-web-app-deployment      APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= || true
+kubectl -n "${NS_KF}" set env deployment/tensorboards-web-app-deployment APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= || true
+kubectl -n "${NS_KF}" set env deployment/volumes-web-app-deployment      APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= || true
+kubectl -n "${NS_KF}" set env deployment/kserve-models-web-app           APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= || true
+kubectl -n "${NS_KF}" set env deployment/ml-pipeline-ui                  APP_DISABLE_AUTH=True USERID_HEADER=kubeflow-userid USERID_PREFIX= DISABLE_GKE_METADATA=true || true
+kubectl -n "${NS_KF}" set env deployment/ml-pipeline                     KUBEFLOW_USERID_HEADER=kubeflow-userid KUBEFLOW_USERID_PREFIX= || true
+# watch all the namespace
+kubectl -n "${NS_KF}" set env deployment/ml-pipeline-persistenceagent    NAMESPACE= || true
+
+echo "[kfp] mysql: disable istio sidecar + restart ..."
+kubectl -n "${NS_KF}" annotate deploy/mysql sidecar.istio.io/inject="false" --overwrite || true
+kubectl -n "${NS_KF}" rollout restart deploy/mysql || true
+kubectl -n "${NS_KF}" rollout status  deploy/mysql --timeout=300s || true
+
+echo "[kfp] RBAC mode = ${RBAC_MODE} ..."
+if [ "${RBAC_MODE}" = "A" ]; then
+  # all pass: cluster-admin（test env）
+  kubectl create clusterrolebinding kfp-user-admin \
+    --clusterrole=cluster-admin --user="${USER_EMAIL}" 2>/dev/null || true
+else
+  # Least Privilege: Only allow all verbs for pipelines.kubeflow.org/workflows
+  kubectl delete clusterrolebinding kfp-user-admin --ignore-not-found
+  cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kfp-workflows-any
+rules:
+- apiGroups: ["pipelines.kubeflow.org"]
+  resources: ["workflows"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kfp-workflows-any-$(echo "${USER_EMAIL}" | tr '@' '-' | tr '/' '-')
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kfp-workflows-any
+subjects:
+- kind: User
+  name: ${USER_EMAIL}
+EOF
+fi
+
+echo "[kfp] ensure MinIO default bucket (mlpipeline) exists ..."
+kubectl -n "${NS_KF}" exec deploy/minio -- sh -c '
+mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --api s3v4 &&
+mc mb -p local/mlpipeline || true
+' || true
+
+echo "[kfp] restart KFP core to pick up changes ..."
+for d in ml-pipeline ml-pipeline-persistenceagent ml-pipeline-ui; do
+  kubectl -n "${NS_KF}" rollout restart deploy/$d || true
+  kubectl -n "${NS_KF}" rollout status  deploy/$d --timeout=300s || true
+done
+
+echo "[kfp] optional: scale down oauth2-proxy / dex to avoid interference ..."
+kubectl -n oauth2-proxy scale deploy -l app.kubernetes.io/name=oauth2-proxy --replicas=0 || true
+kubectl -n auth         scale deploy -l app=dex                         --replicas=0 || true
+
+echo "[kfp] done. UI should now reflect real run states."

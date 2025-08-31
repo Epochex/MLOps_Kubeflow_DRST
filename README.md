@@ -158,7 +158,29 @@ Reproducible experiments and Kubeflow Pipelines assembly. `kubeflow/pipeline.py`
 
 ### 2.7 `deploy/`
 #### 2.7.1 `Auto_deployment_k8s_kubeflow.sh`
-Installs Kubernetes 1.32 on a single bare-metal node (containerd runtime, Calico CNI, local-path-provisioner as the default StorageClass), then uses Kustomize to fetch and deploy the full Kubeflow v1.10 stack (cert-manager, Istio with oauth2-proxy and Dex, Knative/KServe, Pipelines, Jupyter, Katib, etc.). The script waits for CRDs/Pods, applies required patches for idempotency and stability, and finally exposes istio-ingressgateway and MinIO via NodePort. It also adjusts policies to keep MinIO reachable (disable Envoy TLS to MinIO; relax peer mTLS to PERMISSIVE), resulting in a fully functional, browser-accessible Kubeflow setup on a single machine.
+
+Provision a single-node **Kubernetes v1.32** cluster (containerd runtime, **Calico** CNI, `local-path` as the default `StorageClass`), then fetch and deploy **Kubeflow v1.10** via Kustomize (**cert-manager** with issuer, **Istio** + oauth2-proxy + **Dex**, **Knative/KServe**, **Pipelines**, **Jupyter**, **Katib**, **Training Operator**, etc.).  
+The script waits for CRDs/Pods, applies idempotent patches, and exposes **istio-ingressgateway** as **NodePort 30080/30443**.
+
+**Object storage normalization.** MinIO is pinned and exposed; Envoy `DestinationRule`s **disable TLS toward MinIO** to avoid TLS to a plaintext backend, and the script **creates the `mlpipeline` bucket** so KFP drivers don’t fail with “bucket does not exist”.
+
+**KFP auth-bypass + UI status-sync (test-only).**
+- Inject a fixed user at the **gateway** (`kubeflow-userid`, `x-auth-request-email`, `x-goog-authenticated-user-email`) and strip `Authorization`.
+- Add an **inbound fallback header** filter on the `ml-pipeline` sidecar.
+- Disable app-level auth on all Kubeflow WebApps and **unify the user header**; set the KFP backend to the same header and make the **persistenceagent watch all namespaces**.
+- **Disable Istio sidecar** on MySQL to prevent DB connectivity issues.
+
+**RBAC_MODE switch**
+- **A** – grant the fixed user **cluster-admin** (quick & dirty for tests).
+- **B (default)** – minimal RBAC: a `ClusterRole` that allows `pipelines.kubeflow.org/workflows` with `verbs: ["*"]`, so the backend’s SAR (`report` check) passes.  
+This resolves the **“runs stay Pending in UI”** problem by allowing the persistence agent to write real run states back to the DB.
+
+> **Usage**
+> ```bash
+> USER_EMAIL=user@example.com RBAC_MODE=B ./deploy/Auto_deployment_k8s_kubeflow.sh
+> ```
+> ⚠️ Auth-bypass is for **development/testing only**. For production, remove the EnvoyFilters, re-enable WebApp auth, and integrate with your real IdP/RBAC.
+
 
 #### 2.7.2 `Auto_disable_auth.sh`
 Strips the authN/authZ chain for a dev/test environment. At the Istio gateway and selected in-namespace entry points, EnvoyFilters inject a fixed user identity (`kubeflow-userid` and `x-goog-authenticated-user-email` with the `accounts.google.com:` prefix). Authorization headers are removed only at the gateway to bypass residual OIDC/JWT checks. In the Kubeflow namespace, an allow-all AuthorizationPolicy is applied; WebApps are set with `APP_DISABLE_AUTH=True` and configured to read the injected headers; the KFP backend is set with `KUBEFLOW_USERID_HEADER=kubeflow-userid` and an empty prefix. Sidecar injection is enforced so filters take effect; Lua `headers():replace` is used for compatibility with your Envoy version. A matching Profile is created for the impersonated user. Net result: any request that reaches the NodePort is treated as the fixed user—suitable only for fast local testing and CI/CD bring-up.

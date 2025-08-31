@@ -1,0 +1,22 @@
+# kfp-report-rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kfp-workflows-report
+rules:
+- apiGroups: ["pipelines.kubeflow.org"]
+  resources: ["workflows"]
+  verbs: ["report"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kfp-workflows-report-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kfp-workflows-report
+subjects:
+- kind: User
+  name: user@example.com   # 和你网关/后端使用的用户完全一致
+
