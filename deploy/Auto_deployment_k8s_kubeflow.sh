@@ -333,9 +333,8 @@ if kubectl -n kubeflow get svc minio-service >/dev/null 2>&1; then
   fi
 fi
 
-echo "[minio] disable TLS-to-MinIO (ingress & in-namespace) and relax mTLS on MinIO pods..."
-# Disable TLS towards MinIO (prevent Envoy from handshaking TLS to plaintext backend) and set MinIO to PERMISSIVE
 
+echo "[minio] disable TLS-to-MinIO (ingress & in-namespace) ..."
 cat <<'YAML' | kubectl apply -f -
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
@@ -358,8 +357,47 @@ spec:
   trafficPolicy:
     tls:
       mode: DISABLE
---
+YAML
 
+
+
+# --- Compute nip.io hosts for this node and expose MinIO via Istio ---
+NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+if [[ -z "${NODE_IP}" ]]; then NODE_IP=$(hostname -I | awk '{print $1}'); fi
+NIP_DOMAIN="${NODE_IP}.nip.io"
+S3_HOST="s3.${NIP_DOMAIN}"
+MINIO_HOST="minio.${NIP_DOMAIN}"
+
+echo "[minio] creating/refreshing VirtualServices for Console and S3 ..."
+cat <<YAML | kubectl -n kubeflow apply -f -
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: minio-console-host
+spec:
+  gateways: [kubeflow-gateway]
+  hosts: ["${MINIO_HOST}"]
+  http:
+  - route:
+    - destination:
+        host: minio-service.kubeflow.svc.cluster.local
+        port:
+          number: 9001
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: minio-s3-host
+spec:
+  gateways: [kubeflow-gateway]
+  hosts: ["${S3_HOST}"]
+  http:
+  - route:
+    - destination:
+        host: minio-service.kubeflow.svc.cluster.local
+        port:
+          number: 9000
+YAML
 
 
 ###############################################################################
@@ -385,7 +423,9 @@ spec:
   - {}
 YAML
 
-echo "[kfp] EnvoyFilter@gateway: force user headers + strip Authorization ..."
+
+
+echo "[kfp] EnvoyFilter@gateway: force user headers (keep Authorization for S3 host) ..."
 cat <<YAML | kubectl apply -f -
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
@@ -416,12 +456,26 @@ spec:
             function envoy_on_request(handle)
               local uid = "${USER_EMAIL}"
               local h = handle:headers()
+              local host = h:get(":authority") or h:get("host") or ""
+              -- 固定 Kubeflow 用户头
               h:replace("kubeflow-userid", uid)
               h:replace("x-auth-request-email", uid)
               h:replace("x-goog-authenticated-user-email", "accounts.google.com:" .. uid)
-              h:remove("authorization")
+              -- 仅当不是 S3 Host 时才移除 Authorization，避免破坏 S3 签名
+              if not string.match(host, "^s3%..-%.nip%.io$") then
+                h:remove("authorization")
+              end
             end
 YAML
+
+
+echo "[check] probing MinIO S3 via gateway ..."
+curl -s -I -H "Host: ${S3_HOST}" "http://${NODE_IP}:30080/minio/health/ready" | head -n1 || true
+
+echo -e "\n==> MinIO Console:   http://${MINIO_HOST}:30080"
+echo    "==> MinIO S3 (boto3): http://${S3_HOST}:30080"
+
+
 
 echo "[kfp] EnvoyFilter@ml-pipeline inbound: fallback user headers ..."
 cat <<YAML | kubectl apply -f -

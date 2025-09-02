@@ -1,0 +1,33 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: minio-s3-host
+  namespace: kubeflow
+spec:
+  hosts:
+  - "s3.45.149.207.13.nip.io"
+  # 绑定到两个网关，避免被 kubeflow 的兜底 gateway 抢走
+  gateways:
+  - minio-gw
+  - kubeflow-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: minio-service.kubeflow.svc.cluster.local
+        port:
+          number: 9000
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: minio-backend-plain
+  namespace: kubeflow
+spec:
+  host: minio-service.kubeflow.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+
