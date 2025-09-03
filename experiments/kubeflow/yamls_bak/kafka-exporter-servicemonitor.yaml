@@ -4,15 +4,15 @@ metadata:
   name: kafka-exporter-sm
   namespace: monitoring
   labels:
-    release: monitoring  # ⚠️ 必须与 Prometheus Operator 的 selector 匹配
+    release: monitoring  
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: prometheus-kafka-exporter  # ← 确保和 Service 匹配
+      app.kubernetes.io/name: prometheus-kafka-exporter 
   namespaceSelector:
     matchNames:
       - monitoring
   endpoints:
-    - port: exporter-port       # ← ⬅️ 这里改成你刚刚查到的端口名
+    - port: exporter-port      
       interval: 30s
 

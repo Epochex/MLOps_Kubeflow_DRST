@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # experiments/kubeflow/pipeline.py
 
-from __future__ import annotations
-
-from kfp import compiler
-from kfp.v2.dsl import component, pipeline, OutputPath
+from kfp import dsl, compiler
 
 # ======== Images ========
 IMAGE_OFFLINE  = "hirschazer/offline:latest"
@@ -15,21 +12,18 @@ IMAGE_PLOT     = "hirschazer/plot:latest"
 
 # ======== Components ========
 
-@component(base_image=IMAGE_OFFLINE)
+@dsl.component(base_image=IMAGE_OFFLINE)
 def offline_op(
-    output_metadata: OutputPath(str),
-    train_minio_key: str = "datasets_old/offline/combined.csv",
+    train_minio_key: str = "datasets/combined.csv",
 ):
     """Phase-1 Offline training: writes model artifacts into models/ (baseline, model.pt, metrics, latest.txt)"""
     import os, subprocess
     os.environ["TRAIN_MINIO_KEY"] = train_minio_key
     subprocess.run(["python", "drst_inference/offline/train_offline.py"], check=True)
-    with open(output_metadata, "w") as f:
-        f.write("{}")
 
-@component(base_image=IMAGE_OFFLINE)
+
+@dsl.component(base_image=IMAGE_MONITOR)
 def monitor_op(
-    output_metadata: OutputPath(str),
     kafka_topic: str = "latencyTopic",
     idle_timeout_s: int = 60,
     max_wall_secs: int = 480,
@@ -42,7 +36,7 @@ def monitor_op(
     eval_stride: int = 50,
 ):
     """Phase-2 Drift monitoring (sliding-window JSD with bootstrap-calibrated thresholds)"""
-    import os, subprocess, shlex, signal, time
+    import os, subprocess, shlex, time
     env = os.environ.copy()
     env["KAFKA_TOPIC"]            = kafka_topic
     env["IDLE_TIMEOUT_S"]         = str(idle_timeout_s)
@@ -53,7 +47,7 @@ def monitor_op(
     env["JS_QUANTILES"]           = js_quantiles
     env["BASELINE_REFRESH_MODE"]  = baseline_refresh_mode
 
-    cmd = f"python drst_drift/monitor.py"
+    cmd = "python drst_drift/monitor.py"
     p = subprocess.Popen(shlex.split(cmd), env=env)
     t0 = time.time()
     while p.poll() is None:
@@ -61,12 +55,10 @@ def monitor_op(
             p.kill()
             break
         time.sleep(1)
-    with open(output_metadata, "w") as f:
-        f.write("{}")
 
-@component(base_image=IMAGE_OFFLINE)
+
+@dsl.component(base_image=IMAGE_PRODUCER)
 def producer_op(
-    output_metadata: OutputPath(str),
     kafka_topic: str = "latencyTopic",
     interval_ms: int = 100,
     s1_n: int = 3000,
@@ -83,12 +75,10 @@ def producer_op(
     env["STAGE3_N"]            = str(s3_n)
 
     subprocess.run(["python", "drst_inference/online/producer.py"], check=True, env=env)
-    with open(output_metadata, "w") as f:
-        f.write("{}")
 
-@component(base_image=IMAGE_OFFLINE)
+
+@dsl.component(base_image=IMAGE_INFER)
 def inference_op(
-    output_metadata: OutputPath(str),
     kafka_topic: str = "latencyTopic",
     idle_timeout_s: int = 60,
     reload_interval_s: int = 30,
@@ -111,23 +101,20 @@ def inference_op(
             p.kill()
             break
         time.sleep(1)
-    with open(output_metadata, "w") as f:
-        f.write("{}")
 
-@component(base_image=IMAGE_OFFLINE)
-def plot_op(output_metadata: OutputPath(str)):
+
+@dsl.component(base_image=IMAGE_PLOT)
+def plot_op():
     """Phase-5 Summary plotting and reporting (reads *_inference_trace.npz; generates PNG + report.md to MinIO)"""
     import subprocess
     subprocess.run(["python", "drst_inference/plotting/plot_final.py"],  check=True)
     subprocess.run(["python", "drst_inference/plotting/plot_report.py"], check=True)
-    with open(output_metadata, "w") as f:
-        f.write("{}")
 
 # ======== Pipeline ========
-@pipeline(name="drift-stream-v2")
+@dsl.pipeline(name="drift-stream-v2")
 def drift_stream(
     image: str = IMAGE_OFFLINE,
-    offline_key: str = "datasets_old/offline/combined.csv",
+    offline_key: str = "datasets/combined.csv",
     kafka_topic: str = "latencyTopic",
     interval_ms: int = 100,
     s1_n: int = 3000, s2_n: int = 1000, s3_n: int = 1000,
@@ -137,39 +124,40 @@ def drift_stream(
     """
     Topology:
       offline → (monitor || producer || infer×3) → plot
-    Behavior highlights:
-      • Monitor uses bootstrap-calibrated JSD thresholds and refreshes baseline after successful retraining;
-      • Components auto-stop on idle; producer sends partitioned sentinels; plot summarizes artifacts.
     """
     off = offline_op(train_minio_key=offline_key).set_display_name("offline-training").set_caching_options(False)
 
-    final_plot = plot_op().set_display_name("plot-and-report").set_caching_options(False)
+    mon = monitor_op(
+        kafka_topic=kafka_topic,
+        idle_timeout_s=idle_timeout_s,
+        max_wall_secs=max_wall_secs,
+    ).after(off).set_display_name("drift-monitor").set_caching_options(False)
 
-    from kfp.v2.dsl import ExitHandler
-    with ExitHandler(final_plot):
-        mon = monitor_op(
+    prod = producer_op(
+        kafka_topic=kafka_topic,
+        interval_ms=interval_ms,
+        s1_n=s1_n, s2_n=s2_n, s3_n=s3_n,
+    ).after(off).set_display_name("kafka-producer").set_caching_options(False)
+
+    consumers = []
+    for i in range(3):
+        c = inference_op(
             kafka_topic=kafka_topic,
             idle_timeout_s=idle_timeout_s,
+            instance_id=i,
             max_wall_secs=max_wall_secs,
-        ).after(off).set_display_name("drift-monitor").set_caching_options(False)
+        ).after(off).set_display_name(f"online-infer-{i}").set_caching_options(False)
+        consumers.append(c)
 
-        prod = producer_op(
-            kafka_topic=kafka_topic,
-            interval_ms=interval_ms,
-            s1_n=s1_n, s2_n=s2_n, s3_n=s3_n,
-        ).after(off).set_display_name("kafka-producer").set_caching_options(False)
+    final_plot = plot_op().set_display_name("plot-and-report").set_caching_options(False)
+    final_plot.after(prod, mon, *consumers)
 
-        consumers = []
-        for i in range(3):
-            c = inference_op(
-                kafka_topic=kafka_topic,
-                idle_timeout_s=idle_timeout_s,
-                instance_id=i,
-                max_wall_secs=max_wall_secs,
-            ).after(off).set_display_name(f"online-infer-{i}").set_caching_options(False)
-            consumers.append(c)
-
-        final_plot.after(prod, mon, *consumers)
+    # ===== 让所有组件走 in-cluster MinIO，避免 ingress 依赖 =====
+    for t in [off, mon, prod, *consumers, final_plot]:
+        t.set_env_variable(name="MINIO_ACCESS_MODE", value="cluster")
+        t.set_env_variable(name="MINIO_ENDPOINT",   value="minio-service.kubeflow.svc.cluster.local:9000")
+        t.set_env_variable(name="MINIO_SCHEME",     value="http")
+        t.set_env_variable(name="MINIO_BUCKET",     value="onvm-demo2")
 
 if __name__ == "__main__":
     compiler.Compiler().compile(

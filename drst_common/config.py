@@ -33,7 +33,7 @@ BATCH_SIZE         = int(os.getenv("BATCH_SIZE", "5"))
 CONSUME_IDLE_S     = int(os.getenv("CONSUME_IDLE_S", "5"))
 
 # ---------------- Project paths ----------------
-DATA_DIR   = os.getenv("DATA_DIR",   "datasets_old")
+DATA_DIR   = os.getenv("DATA_DIR",   "datasets")
 MODEL_DIR  = os.getenv("MODEL_DIR",  "models")
 RESULT_DIR = os.getenv("RESULT_DIR", "results")
 

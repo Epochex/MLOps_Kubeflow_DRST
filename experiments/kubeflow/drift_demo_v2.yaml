@@ -1,0 +1,650 @@
+# PIPELINE DEFINITION
+# Name: drift-stream-v2
+# Description: Topology:
+#              offline → (monitor || producer || infer×3) → plot
+# Inputs:
+#    idle_timeout_s: int [Default: 60.0]
+#    image: str [Default: 'hirschazer/offline:latest']
+#    interval_ms: int [Default: 100.0]
+#    kafka_topic: str [Default: 'latencyTopic']
+#    max_wall_secs: int [Default: 480.0]
+#    offline_key: str [Default: 'datasets/combined.csv']
+#    s1_n: int [Default: 3000.0]
+#    s2_n: int [Default: 1000.0]
+#    s3_n: int [Default: 1000.0]
+components:
+  comp-inference-op:
+    executorLabel: exec-inference-op
+    inputDefinitions:
+      parameters:
+        idle_timeout_s:
+          defaultValue: 60.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        instance_id:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        kafka_topic:
+          defaultValue: latencyTopic
+          isOptional: true
+          parameterType: STRING
+        max_wall_secs:
+          defaultValue: 480.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        reload_interval_s:
+          defaultValue: 30.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-inference-op-2:
+    executorLabel: exec-inference-op-2
+    inputDefinitions:
+      parameters:
+        idle_timeout_s:
+          defaultValue: 60.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        instance_id:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        kafka_topic:
+          defaultValue: latencyTopic
+          isOptional: true
+          parameterType: STRING
+        max_wall_secs:
+          defaultValue: 480.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        reload_interval_s:
+          defaultValue: 30.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-inference-op-3:
+    executorLabel: exec-inference-op-3
+    inputDefinitions:
+      parameters:
+        idle_timeout_s:
+          defaultValue: 60.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        instance_id:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        kafka_topic:
+          defaultValue: latencyTopic
+          isOptional: true
+          parameterType: STRING
+        max_wall_secs:
+          defaultValue: 480.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        reload_interval_s:
+          defaultValue: 30.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-monitor-op:
+    executorLabel: exec-monitor-op
+    inputDefinitions:
+      parameters:
+        baseline_refresh_mode:
+          defaultValue: on_retrain
+          isOptional: true
+          parameterType: STRING
+        drift_window:
+          defaultValue: 300.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        eval_stride:
+          defaultValue: 50.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        hist_bins:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        idle_timeout_s:
+          defaultValue: 60.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        js_calib_samples:
+          defaultValue: 400.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        js_quantiles:
+          defaultValue: 0.90,0.97,0.995
+          isOptional: true
+          parameterType: STRING
+        kafka_topic:
+          defaultValue: latencyTopic
+          isOptional: true
+          parameterType: STRING
+        max_wall_secs:
+          defaultValue: 480.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-offline-op:
+    executorLabel: exec-offline-op
+    inputDefinitions:
+      parameters:
+        train_minio_key:
+          defaultValue: datasets/combined.csv
+          isOptional: true
+          parameterType: STRING
+  comp-plot-op:
+    executorLabel: exec-plot-op
+  comp-producer-op:
+    executorLabel: exec-producer-op
+    inputDefinitions:
+      parameters:
+        interval_ms:
+          defaultValue: 100.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        kafka_topic:
+          defaultValue: latencyTopic
+          isOptional: true
+          parameterType: STRING
+        s1_n:
+          defaultValue: 3000.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        s2_n:
+          defaultValue: 1000.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        s3_n:
+          defaultValue: 1000.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+deploymentSpec:
+  executors:
+    exec-inference-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - inference_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef inference_op(\n    kafka_topic: str = \"latencyTopic\",\n   \
+          \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
+          \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
+          \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
+          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
+          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
+          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
+          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
+          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
+          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
+          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
+          \        time.sleep(1)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/infer:latest
+    exec-inference-op-2:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - inference_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef inference_op(\n    kafka_topic: str = \"latencyTopic\",\n   \
+          \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
+          \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
+          \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
+          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
+          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
+          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
+          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
+          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
+          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
+          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
+          \        time.sleep(1)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/infer:latest
+    exec-inference-op-3:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - inference_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef inference_op(\n    kafka_topic: str = \"latencyTopic\",\n   \
+          \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
+          \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
+          \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
+          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
+          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
+          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
+          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
+          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
+          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
+          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
+          \        time.sleep(1)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/infer:latest
+    exec-monitor-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - monitor_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef monitor_op(\n    kafka_topic: str = \"latencyTopic\",\n    idle_timeout_s:\
+          \ int = 60,\n    max_wall_secs: int = 480,\n    # Drift/JSD settings (calibrated\
+          \ thresholds)\n    js_calib_samples: int = 400,\n    js_quantiles: str =\
+          \ \"0.90,0.97,0.995\",   # A,B,C quantiles\n    baseline_refresh_mode: str\
+          \ = \"on_retrain\",# on_retrain|never\n    hist_bins: int = 64,\n    drift_window:\
+          \ int = 300,\n    eval_stride: int = 50,\n):\n    \"\"\"Phase-2 Drift monitoring\
+          \ (sliding-window JSD with bootstrap-calibrated thresholds)\"\"\"\n    import\
+          \ os, subprocess, shlex, time\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"\
+          ]            = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"]         = str(idle_timeout_s)\n\
+          \    env[\"HIST_BINS\"]              = str(hist_bins)\n    env[\"DRIFT_WINDOW\"\
+          ]           = str(drift_window)\n    env[\"EVAL_STRIDE\"]            = str(eval_stride)\n\
+          \    env[\"JS_CALIB_SAMPLES\"]       = str(js_calib_samples)\n    env[\"\
+          JS_QUANTILES\"]           = js_quantiles\n    env[\"BASELINE_REFRESH_MODE\"\
+          ]  = baseline_refresh_mode\n\n    cmd = \"python drst_drift/monitor.py\"\
+          \n    p = subprocess.Popen(shlex.split(cmd), env=env)\n    t0 = time.time()\n\
+          \    while p.poll() is None:\n        if time.time() - t0 > max_wall_secs:\n\
+          \            p.kill()\n            break\n        time.sleep(1)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/monitor:latest
+    exec-offline-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - offline_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef offline_op(\n    train_minio_key: str = \"datasets/combined.csv\"\
+          ,\n):\n    \"\"\"Phase-1 Offline training: writes model artifacts into models/\
+          \ (baseline, model.pt, metrics, latest.txt)\"\"\"\n    import os, subprocess\n\
+          \    os.environ[\"TRAIN_MINIO_KEY\"] = train_minio_key\n    subprocess.run([\"\
+          python\", \"drst_inference/offline/train_offline.py\"], check=True)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/offline:latest
+    exec-plot-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - plot_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef plot_op():\n    \"\"\"Phase-5 Summary plotting and reporting\
+          \ (reads *_inference_trace.npz; generates PNG + report.md to MinIO)\"\"\"\
+          \n    import subprocess\n    subprocess.run([\"python\", \"drst_inference/plotting/plot_final.py\"\
+          ],  check=True)\n    subprocess.run([\"python\", \"drst_inference/plotting/plot_report.py\"\
+          ], check=True)\n\n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/plot:latest
+    exec-producer-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - producer_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef producer_op(\n    kafka_topic: str = \"latencyTopic\",\n    interval_ms:\
+          \ int = 100,\n    s1_n: int = 3000,\n    s2_n: int = 1000,\n    s3_n: int\
+          \ = 1000,\n):\n    \"\"\"Phase-3 Kafka producer (send data in stages, then\
+          \ broadcast termination sentinels by partition)\"\"\"\n    import os, subprocess\n\
+          \    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]         = kafka_topic\n\
+          \    env[\"PRODUCE_INTERVAL_MS\"] = str(interval_ms)\n    env[\"STAGE1_N\"\
+          ]            = str(s1_n)\n    env[\"STAGE2_N\"]            = str(s2_n)\n\
+          \    env[\"STAGE3_N\"]            = str(s3_n)\n\n    subprocess.run([\"\
+          python\", \"drst_inference/online/producer.py\"], check=True, env=env)\n\
+          \n"
+        env:
+        - name: MINIO_ACCESS_MODE
+          value: cluster
+        - name: MINIO_ENDPOINT
+          value: minio-service.kubeflow.svc.cluster.local:9000
+        - name: MINIO_SCHEME
+          value: http
+        - name: MINIO_BUCKET
+          value: onvm-demo2
+        image: hirschazer/producer:latest
+pipelineInfo:
+  description: "Topology:\noffline \u2192 (monitor || producer || infer\xD73) \u2192\
+    \ plot"
+  name: drift-stream-v2
+root:
+  dag:
+    tasks:
+      inference-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-inference-op
+        dependentTasks:
+        - offline-op
+        inputs:
+          parameters:
+            idle_timeout_s:
+              componentInputParameter: idle_timeout_s
+            instance_id:
+              runtimeValue:
+                constant: 0.0
+            kafka_topic:
+              componentInputParameter: kafka_topic
+            max_wall_secs:
+              componentInputParameter: max_wall_secs
+        taskInfo:
+          name: online-infer-0
+      inference-op-2:
+        cachingOptions: {}
+        componentRef:
+          name: comp-inference-op-2
+        dependentTasks:
+        - offline-op
+        inputs:
+          parameters:
+            idle_timeout_s:
+              componentInputParameter: idle_timeout_s
+            instance_id:
+              runtimeValue:
+                constant: 1.0
+            kafka_topic:
+              componentInputParameter: kafka_topic
+            max_wall_secs:
+              componentInputParameter: max_wall_secs
+        taskInfo:
+          name: online-infer-1
+      inference-op-3:
+        cachingOptions: {}
+        componentRef:
+          name: comp-inference-op-3
+        dependentTasks:
+        - offline-op
+        inputs:
+          parameters:
+            idle_timeout_s:
+              componentInputParameter: idle_timeout_s
+            instance_id:
+              runtimeValue:
+                constant: 2.0
+            kafka_topic:
+              componentInputParameter: kafka_topic
+            max_wall_secs:
+              componentInputParameter: max_wall_secs
+        taskInfo:
+          name: online-infer-2
+      monitor-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-monitor-op
+        dependentTasks:
+        - offline-op
+        inputs:
+          parameters:
+            idle_timeout_s:
+              componentInputParameter: idle_timeout_s
+            kafka_topic:
+              componentInputParameter: kafka_topic
+            max_wall_secs:
+              componentInputParameter: max_wall_secs
+        taskInfo:
+          name: drift-monitor
+      offline-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-offline-op
+        inputs:
+          parameters:
+            train_minio_key:
+              componentInputParameter: offline_key
+        taskInfo:
+          name: offline-training
+      plot-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-plot-op
+        dependentTasks:
+        - inference-op
+        - inference-op-2
+        - inference-op-3
+        - monitor-op
+        - producer-op
+        taskInfo:
+          name: plot-and-report
+      producer-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-producer-op
+        dependentTasks:
+        - offline-op
+        inputs:
+          parameters:
+            interval_ms:
+              componentInputParameter: interval_ms
+            kafka_topic:
+              componentInputParameter: kafka_topic
+            s1_n:
+              componentInputParameter: s1_n
+            s2_n:
+              componentInputParameter: s2_n
+            s3_n:
+              componentInputParameter: s3_n
+        taskInfo:
+          name: kafka-producer
+  inputDefinitions:
+    parameters:
+      idle_timeout_s:
+        defaultValue: 60.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      image:
+        defaultValue: hirschazer/offline:latest
+        isOptional: true
+        parameterType: STRING
+      interval_ms:
+        defaultValue: 100.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      kafka_topic:
+        defaultValue: latencyTopic
+        isOptional: true
+        parameterType: STRING
+      max_wall_secs:
+        defaultValue: 480.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      offline_key:
+        defaultValue: datasets/combined.csv
+        isOptional: true
+        parameterType: STRING
+      s1_n:
+        defaultValue: 3000.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      s2_n:
+        defaultValue: 1000.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      s3_n:
+        defaultValue: 1000.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.12.2

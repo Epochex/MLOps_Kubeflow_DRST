@@ -431,7 +431,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   name: force-kubeflow-user
-  namespace: ${NS_ISTIO}
+  namespace: istio-system
 spec:
   workloadSelector:
     labels:
@@ -454,10 +454,10 @@ spec:
           "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
           inline_code: |
             function envoy_on_request(handle)
-              local uid = "${USER_EMAIL}"
+              local uid = "user@example.com"
               local h = handle:headers()
               local host = h:get(":authority") or h:get("host") or ""
-              -- 固定 Kubeflow 用户头
+              -- 固定用户头
               h:replace("kubeflow-userid", uid)
               h:replace("x-auth-request-email", uid)
               h:replace("x-goog-authenticated-user-email", "accounts.google.com:" .. uid)
@@ -466,6 +466,7 @@ spec:
                 h:remove("authorization")
               end
             end
+
 YAML
 
 

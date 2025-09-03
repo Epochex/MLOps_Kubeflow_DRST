@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# recall pipeline，automatically compile and submit a run
 from __future__ import annotations
 import os, time, importlib.util, types
 from kfp import Client, compiler
