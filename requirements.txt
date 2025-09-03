@@ -1,5 +1,5 @@
 # Core
-numpy>=1.24
+numpy==1.26.4
 pandas>=2.1
 scikit-learn>=1.3
 joblib>=1.3
@@ -7,6 +7,9 @@ matplotlib>=3.8
 
 # Torch (CPU)
 torch==2.2.2
+
+# HTTP utils
+requests>=2.31
 
 # Kafka & S3
 kafka-python>=2.0.2

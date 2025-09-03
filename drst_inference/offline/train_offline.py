@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # drst_inference/offline/train_offline.py
 """
-离线训练脚本（已移除旧项目 shared/* 与 ml/* 依赖）
+离线训练脚本（仅依赖本仓库的 drst_common / drst_inference）
 - 从 MinIO 读取 TRAIN_MINIO_KEY（默认 datasets/combined.csv）
 - 通过 features.prepare_dataset() 选择特征并写入 models/selected_feats.json & models/scaler.pkl
 - 训练 MLPRegressor（或在 TRAIN_TRIGGER=0 且存在 baseline 时跳过训练）
@@ -10,14 +10,25 @@
 """
 
 from __future__ import annotations
+
 import os
 import io
+import sys
 import json
 import shutil
 from datetime import datetime
 from typing import Optional, List, Tuple
 
+# ---- NumPy / Torch 兼容性提示：当前 PyTorch 轮子通常要求 numpy<2 ----
 import numpy as np
+if tuple(int(x) for x in np.__version__.split(".", 2)[:2]) >= (2, 0):
+    print(
+        f"[FATAL] NumPy {np.__version__} detected. 该镜像的 PyTorch 与 NumPy 2 不兼容；"
+        "请在 requirements.txt 固定 numpy<2 并重建镜像。",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -27,9 +38,9 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import joblib
 
 from drst_common.minio_helper import load_csv, save_bytes, s3, BUCKET
-from drst_common.config       import MODEL_DIR, RESULT_DIR, TARGET_COL, EXCLUDE_COLS
+from drst_common.config import MODEL_DIR, RESULT_DIR, TARGET_COL, EXCLUDE_COLS
 from drst_common.metric_logger import log_metric
-from drst_common.utils        import calculate_accuracy_within_threshold
+from drst_common.utils import calculate_accuracy_within_threshold
 from drst_inference.offline.model import MLPRegressor
 from drst_inference.offline.features import prepare_dataset
 
