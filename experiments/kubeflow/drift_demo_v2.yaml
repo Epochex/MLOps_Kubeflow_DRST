@@ -9,9 +9,7 @@
 #    kafka_topic: str [Default: 'latencyTopic']
 #    max_wall_secs: int [Default: 480.0]
 #    offline_key: str [Default: 'datasets/combined.csv']
-#    s1_n: int [Default: 3000.0]
-#    s2_n: int [Default: 1000.0]
-#    s3_n: int [Default: 1000.0]
+#    producer_stages: str [Default: '']
 components:
   comp-inference-op:
     executorLabel: exec-inference-op
@@ -147,18 +145,10 @@ components:
           defaultValue: latencyTopic
           isOptional: true
           parameterType: STRING
-        s1_n:
-          defaultValue: 3000.0
+        producer_stages:
+          defaultValue: ''
           isOptional: true
-          parameterType: NUMBER_INTEGER
-        s2_n:
-          defaultValue: 1000.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        s3_n:
-          defaultValue: 1000.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
+          parameterType: STRING
 deploymentSpec:
   executors:
     exec-inference-op:
@@ -191,14 +181,18 @@ deploymentSpec:
           \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
           \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
           \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
-          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
-          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
-          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
-          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
-          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
-          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
-          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
-          \        time.sleep(1)\n\n"
+          \n    import os, sys, subprocess, time\n    app_dir = os.environ.get(\"\
+          APP_DIR\", \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
+          \ app_dir)\n\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]    \
+          \    = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"]     = str(idle_timeout_s)\n\
+          \    env[\"RELOAD_INTERVAL_S\"]  = str(reload_interval_s)\n    env[\"HOSTNAME\"\
+          ]           = f\"infer-{instance_id}\"\n\n    p = subprocess.Popen(\n  \
+          \      [\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ],\n        cwd=app_dir,\n        env=env,\n    )\n    t0 = time.time()\n\
+          \    try:\n        while p.poll() is None:\n            if time.time() -\
+          \ t0 > max_wall_secs:\n                p.kill()\n                break\n\
+          \            time.sleep(1)\n    finally:\n        try:\n            p.terminate()\n\
+          \        except Exception:\n            pass\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -239,14 +233,18 @@ deploymentSpec:
           \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
           \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
           \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
-          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
-          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
-          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
-          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
-          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
-          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
-          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
-          \        time.sleep(1)\n\n"
+          \n    import os, sys, subprocess, time\n    app_dir = os.environ.get(\"\
+          APP_DIR\", \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
+          \ app_dir)\n\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]    \
+          \    = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"]     = str(idle_timeout_s)\n\
+          \    env[\"RELOAD_INTERVAL_S\"]  = str(reload_interval_s)\n    env[\"HOSTNAME\"\
+          ]           = f\"infer-{instance_id}\"\n\n    p = subprocess.Popen(\n  \
+          \      [\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ],\n        cwd=app_dir,\n        env=env,\n    )\n    t0 = time.time()\n\
+          \    try:\n        while p.poll() is None:\n            if time.time() -\
+          \ t0 > max_wall_secs:\n                p.kill()\n                break\n\
+          \            time.sleep(1)\n    finally:\n        try:\n            p.terminate()\n\
+          \        except Exception:\n            pass\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -287,14 +285,18 @@ deploymentSpec:
           \ idle_timeout_s: int = 60,\n    reload_interval_s: int = 30,\n    instance_id:\
           \ int = 0,\n    max_wall_secs: int = 480,\n):\n    \"\"\"Phase-4 Online\
           \ inference consumer (dual-path baseline+adaptive with hot-reload)\"\"\"\
-          \n    import os, subprocess, shlex, time\n    env = os.environ.copy()\n\
-          \    env[\"KAFKA_TOPIC\"]       = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"\
-          ]    = str(idle_timeout_s)\n    env[\"RELOAD_INTERVAL_S\"] = str(reload_interval_s)\n\
-          \    env[\"HOSTNAME\"]          = f\"infer-{instance_id}\"\n\n    cmd =\
-          \ \"python drst_inference/online/inference_consumer.py\"\n    p = subprocess.Popen(shlex.split(cmd),\
-          \ env=env)\n    t0 = time.time()\n    while p.poll() is None:\n        if\
-          \ time.time() - t0 > max_wall_secs:\n            p.kill()\n            break\n\
-          \        time.sleep(1)\n\n"
+          \n    import os, sys, subprocess, time\n    app_dir = os.environ.get(\"\
+          APP_DIR\", \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
+          \ app_dir)\n\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]    \
+          \    = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"]     = str(idle_timeout_s)\n\
+          \    env[\"RELOAD_INTERVAL_S\"]  = str(reload_interval_s)\n    env[\"HOSTNAME\"\
+          ]           = f\"infer-{instance_id}\"\n\n    p = subprocess.Popen(\n  \
+          \      [\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ],\n        cwd=app_dir,\n        env=env,\n    )\n    t0 = time.time()\n\
+          \    try:\n        while p.poll() is None:\n            if time.time() -\
+          \ t0 > max_wall_secs:\n                p.kill()\n                break\n\
+          \            time.sleep(1)\n    finally:\n        try:\n            p.terminate()\n\
+          \        except Exception:\n            pass\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -338,16 +340,20 @@ deploymentSpec:
           \ = \"on_retrain\",# on_retrain|never\n    hist_bins: int = 64,\n    drift_window:\
           \ int = 300,\n    eval_stride: int = 50,\n):\n    \"\"\"Phase-2 Drift monitoring\
           \ (sliding-window JSD with bootstrap-calibrated thresholds)\"\"\"\n    import\
-          \ os, subprocess, shlex, time\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"\
-          ]            = kafka_topic\n    env[\"IDLE_TIMEOUT_S\"]         = str(idle_timeout_s)\n\
-          \    env[\"HIST_BINS\"]              = str(hist_bins)\n    env[\"DRIFT_WINDOW\"\
-          ]           = str(drift_window)\n    env[\"EVAL_STRIDE\"]            = str(eval_stride)\n\
-          \    env[\"JS_CALIB_SAMPLES\"]       = str(js_calib_samples)\n    env[\"\
-          JS_QUANTILES\"]           = js_quantiles\n    env[\"BASELINE_REFRESH_MODE\"\
-          ]  = baseline_refresh_mode\n\n    cmd = \"python drst_drift/monitor.py\"\
-          \n    p = subprocess.Popen(shlex.split(cmd), env=env)\n    t0 = time.time()\n\
-          \    while p.poll() is None:\n        if time.time() - t0 > max_wall_secs:\n\
-          \            p.kill()\n            break\n        time.sleep(1)\n\n"
+          \ os, sys, subprocess, time\n    app_dir = os.environ.get(\"APP_DIR\", \"\
+          /app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0, app_dir)\n\
+          \n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]           = kafka_topic\n\
+          \    env[\"IDLE_TIMEOUT_S\"]        = str(idle_timeout_s)\n    env[\"HIST_BINS\"\
+          ]             = str(hist_bins)\n    env[\"DRIFT_WINDOW\"]          = str(drift_window)\n\
+          \    env[\"EVAL_STRIDE\"]           = str(eval_stride)\n    env[\"JS_CALIB_SAMPLES\"\
+          ]      = str(js_calib_samples)\n    env[\"JS_QUANTILES\"]          = js_quantiles\n\
+          \    env[\"BASELINE_REFRESH_MODE\"] = baseline_refresh_mode\n\n    p = subprocess.Popen(\n\
+          \        [\"python\", \"-m\", \"drst_drift.monitor\"],\n        cwd=app_dir,\n\
+          \        env=env,\n    )\n    t0 = time.time()\n    try:\n        while\
+          \ p.poll() is None:\n            if time.time() - t0 > max_wall_secs:\n\
+          \                p.kill()\n                break\n            time.sleep(1)\n\
+          \    finally:\n        try:\n            p.terminate()\n        except Exception:\n\
+          \            pass\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -385,10 +391,12 @@ deploymentSpec:
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef offline_op(\n    train_minio_key: str = \"datasets/combined.csv\"\
-          ,\n):\n    \"\"\"Phase-1 Offline training: writes model artifacts into models/\
-          \ (baseline, model.pt, metrics, latest.txt)\"\"\"\n    import os, subprocess\n\
-          \    os.environ[\"TRAIN_MINIO_KEY\"] = train_minio_key\n    subprocess.run([\"\
-          python\", \"drst_inference/offline/train_offline.py\"], check=True)\n\n"
+          ,\n):\n    \"\"\"Phase-1 Offline training\"\"\"\n    import os, sys, subprocess\n\
+          \    app_dir = os.environ.get(\"APP_DIR\", \"/app\")\n    if app_dir not\
+          \ in sys.path:\n        sys.path.insert(0, app_dir)\n\n    env = os.environ.copy()\n\
+          \    env[\"TRAIN_MINIO_KEY\"] = train_minio_key\n\n    subprocess.run(\n\
+          \        [\"python\", \"-m\", \"drst_inference.offline.train_offline\"],\n\
+          \        check=True,\n        cwd=app_dir,\n        env=env,\n    )\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -425,11 +433,13 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef plot_op():\n    \"\"\"Phase-5 Summary plotting and reporting\
-          \ (reads *_inference_trace.npz; generates PNG + report.md to MinIO)\"\"\"\
-          \n    import subprocess\n    subprocess.run([\"python\", \"drst_inference/plotting/plot_final.py\"\
-          ],  check=True)\n    subprocess.run([\"python\", \"drst_inference/plotting/plot_report.py\"\
-          ], check=True)\n\n"
+          \ *\n\ndef plot_op():\n    \"\"\"Phase-5 Summary plotting and reporting\"\
+          \"\"\n    import os, sys, subprocess\n    app_dir = os.environ.get(\"APP_DIR\"\
+          , \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
+          \ app_dir)\n\n    subprocess.run(\n        [\"python\", \"-m\", \"drst_inference.plotting.plot_final\"\
+          ],\n        check=True,\n        cwd=app_dir,\n    )\n    subprocess.run(\n\
+          \        [\"python\", \"-m\", \"drst_inference.plotting.plot_report\"],\n\
+          \        check=True,\n        cwd=app_dir,\n    )\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -467,14 +477,15 @@ deploymentSpec:
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef producer_op(\n    kafka_topic: str = \"latencyTopic\",\n    interval_ms:\
-          \ int = 100,\n    s1_n: int = 3000,\n    s2_n: int = 1000,\n    s3_n: int\
-          \ = 1000,\n):\n    \"\"\"Phase-3 Kafka producer (send data in stages, then\
-          \ broadcast termination sentinels by partition)\"\"\"\n    import os, subprocess\n\
-          \    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]         = kafka_topic\n\
-          \    env[\"PRODUCE_INTERVAL_MS\"] = str(interval_ms)\n    env[\"STAGE1_N\"\
-          ]            = str(s1_n)\n    env[\"STAGE2_N\"]            = str(s2_n)\n\
-          \    env[\"STAGE3_N\"]            = str(s3_n)\n\n    subprocess.run([\"\
-          python\", \"drst_inference/online/producer.py\"], check=True, env=env)\n\
+          \ int = 100,\n    producer_stages: str = \"\",   # \u53EF\u9009\uFF1A\u8986\
+          \u76D6 config.PRODUCER_STAGES\n):\n    \"\"\"Phase-3 Kafka producer\"\"\"\
+          \n    import os, sys, subprocess\n    app_dir = os.environ.get(\"APP_DIR\"\
+          , \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
+          \ app_dir)\n\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]    \
+          \     = kafka_topic\n    env[\"PRODUCE_INTERVAL_MS\"] = str(interval_ms)\n\
+          \    if producer_stages:\n        env[\"PRODUCER_STAGES\"] = producer_stages\n\
+          \n    subprocess.run(\n        [\"python\", \"-m\", \"drst_inference.online.producer\"\
+          ],\n        check=True,\n        cwd=app_dir,\n        env=env,\n    )\n\
           \n"
         env:
         - name: MINIO_ACCESS_MODE
@@ -600,12 +611,8 @@ root:
               componentInputParameter: interval_ms
             kafka_topic:
               componentInputParameter: kafka_topic
-            s1_n:
-              componentInputParameter: s1_n
-            s2_n:
-              componentInputParameter: s2_n
-            s3_n:
-              componentInputParameter: s3_n
+            producer_stages:
+              componentInputParameter: producer_stages
         taskInfo:
           name: kafka-producer
   inputDefinitions:
@@ -634,17 +641,9 @@ root:
         defaultValue: datasets/combined.csv
         isOptional: true
         parameterType: STRING
-      s1_n:
-        defaultValue: 3000.0
+      producer_stages:
+        defaultValue: ''
         isOptional: true
-        parameterType: NUMBER_INTEGER
-      s2_n:
-        defaultValue: 1000.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      s3_n:
-        defaultValue: 1000.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
+        parameterType: STRING
 schemaVersion: 2.1.0
 sdkVersion: kfp-2.12.2

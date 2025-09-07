@@ -1,94 +1,124 @@
-# /data/mlops/DRST-SoftwarizedNetworks/drst_common/metric_logger.py
-# Unified lightweight metric logger for persistence (local write, upload on demand)
-import csv
-import json
-import os
-import datetime
-import tempfile
-import shutil
-from typing import List, Dict, Any
-from .config import RESULT_DIR
-from .minio_helper import save_bytes
-import glob
+#!/usr/bin/env python3
+# drst_common/metric_logger.py
+from __future__ import annotations
+import os, json, time, threading
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
 
-_CSV_PATH  = f"/mnt/pvc/{RESULT_DIR}/metrics_summary.csv"
-_JSONL_PATH = f"/mnt/pvc/{RESULT_DIR}/metrics_summary.jsonl"
+from .minio_helper import s3, save_bytes
+from .config import RESULT_DIR, BUCKET
 
-# Default column order (extendable)
-_BASE_ORDER: List[str] = [
-    "utc", "component", "event",
-    "value",
-    # training
-    "train_rows", "train_time_s", "model_size_mb", "mae", "rmse", "accuracy",
-    # inference
-    "batch_size", "latency_ms", "model_loading_ms", "cpu_pct", "gpu_mem_pct",
-    # drift
-    "js_val", "kafka_lag", "update_trigger_delay_s",
-    # runtime
-    "runtime_ms", "cpu_time_ms",
-    # cold start & container
-    "cold_start_ms", "rtt_ms", "container_latency_ms",
-]
+# 可控行为（环境变量）：
+_METRICS_STREAM_STDOUT   = os.getenv("METRICS_STREAM_STDOUT", "0").strip().lower() in ("1","true","yes","on")
+_METRICS_FLUSH_EVERY     = int(os.getenv("METRICS_FLUSH_EVERY", "0"))
+_METRICS_FLUSH_INTERVALS = int(os.getenv("METRICS_FLUSH_INTERVAL_S", "0"))
 
-def _ensure_dir() -> None:
-    os.makedirs(os.path.dirname(_CSV_PATH), exist_ok=True)
+_SHARD_PREFIX = os.getenv("METRICS_SHARD_PREFIX", f"{RESULT_DIR}/metrics")
+_SUMMARY_KEY  = os.getenv("METRICS_SUMMARY_KEY",  f"{RESULT_DIR}/metrics_summary.csv")
 
-def _read_all_rows(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="") as fp:
-        return list(csv.DictReader(fp))
+CSV_HEADER = "ts,component,event,pod,kv\n"
 
-def _rewrite_csv(path: str, header: List[str], rows: List[Dict[str, Any]]):
-    with tempfile.NamedTemporaryFile("w", delete=False, newline="") as tmp:
-        writer = csv.DictWriter(tmp, fieldnames=header, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    shutil.move(tmp.name, path)
+_BUF: List[Dict[str, Any]] = []
+_LOCK = threading.Lock()
+_LAST_FLUSH = time.time()
 
-def log_metric(component: str, **kw) -> None:
-    """Write metrics to local CSV/JSONL; uploading is not blocked here."""
-    _ensure_dir()
-    kw["utc"] = kw.get("utc") or datetime.datetime.utcnow().isoformat() + "Z"
-    kw["component"] = component
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Global summary.csv
-    rows_all = _read_all_rows(_CSV_PATH)
-    header = list(rows_all[0].keys()) if rows_all else _BASE_ORDER.copy()
-    for k in kw:
-        if k not in header:
-            header.append(k)
-    rows_all.append({k: kw.get(k, "") for k in header})
-    _rewrite_csv(_CSV_PATH, header, rows_all)
+def _pod() -> str:
+    return os.getenv("HOSTNAME", "pod")
 
-    # Component-specific CSV
-    comp_path = f"/mnt/pvc/{RESULT_DIR}/{component}_metrics.csv"
-    rows_comp = _read_all_rows(comp_path)
-    header_comp = list(rows_comp[0].keys()) if rows_comp else header.copy()
-    for k in kw:
-        if k not in header_comp:
-            header_comp.append(k)
-    rows_comp.append({k: kw.get(k, "") for k in header_comp})
-    _rewrite_csv(comp_path, header_comp, rows_comp)
+def _row_line(r: Dict[str, Any]) -> str:
+    kv = json.dumps(r.get("kv", {}), ensure_ascii=False, separators=(",", ":"))
+    def safe(x): return str(x).replace("\n", " ").replace("\r", " ")
+    return f"{safe(r['ts'])},{safe(r['component'])},{safe(r['event'])},{safe(r['pod'])},{kv}"
 
-    # JSONL append
-    with open(_JSONL_PATH, "a", encoding="utf-8") as fp:
-        fp.write(json.dumps(kw, ensure_ascii=False) + "\n")
+def _append_lines(key: str, lines: List[str]) -> None:
+    try:
+        old = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode("utf-8", "ignore")
+    except Exception:
+        old = ""
+    if not old:
+        payload = CSV_HEADER + "\n".join(lines) + "\n"
+    else:
+        if not old.splitlines()[0].startswith("ts,component,event,pod,kv"):
+            old = CSV_HEADER + old
+        payload = old + ("" if old.endswith("\n") else "\n") + "\n".join(lines) + "\n"
+    save_bytes(key, payload.encode("utf-8"), "text/csv")
+
+def _flush_locked():
+    global _BUF, _LAST_FLUSH
+    if not _BUF:
+        return
+    buckets: Dict[str, List[str]] = {}
+    for r in _BUF:
+        comp = r.get("component", "misc")
+        buckets.setdefault(comp, []).append(_row_line(r))
+    pod = _pod()
+    for comp, lines in buckets.items():
+        shard = f"{_SHARD_PREFIX}/{comp}-{pod}.csv"
+        _append_lines(shard, lines)
+    _BUF.clear()
+    _LAST_FLUSH = time.time()
+
+def log_metric(*, component: str, event: str, **kwargs) -> None:
+    row = {
+        "ts": _now_iso(),
+        "component": component,
+        "event": event,
+        "pod": _pod(),
+        "kv": kwargs or {},
+    }
+    if _METRICS_STREAM_STDOUT:
+        kv_pairs = " ".join(f"{k}={v}" for k, v in (kwargs or {}).items())
+        print(f"[metrics:{row['component']}/{row['pod']}] {row['event']} | {kv_pairs}", flush=True)
+
+    do_flush = False
+    with _LOCK:
+        _BUF.append(row)
+        if _METRICS_FLUSH_EVERY and len(_BUF) >= _METRICS_FLUSH_EVERY:
+            do_flush = True
+        elif _METRICS_FLUSH_INTERVALS and (time.time() - _LAST_FLUSH) >= _METRICS_FLUSH_INTERVALS:
+            do_flush = True
+    if do_flush:
+        with _LOCK:
+            _flush_locked()
+
+def _list_shards(prefix: str) -> List[str]:
+    keys: List[str] = []
+    token: Optional[str] = None
+    while True:
+        resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, ContinuationToken=token) if token \
+            else s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+        for o in (resp.get("Contents") or []):
+            if o["Key"].endswith(".csv"):
+                keys.append(o["Key"])
+        if not resp.get("IsTruncated"): break
+        token = resp.get("NextContinuationToken")
+    return keys
+
+def _merge_to_summary():
+    shards = _list_shards(_SHARD_PREFIX.rstrip("/") + "/")
+    if not shards:
+        return
+    parts: List[str] = [CSV_HEADER.rstrip("\n")]
+    for k in shards:
+        try:
+            txt = s3.get_object(Bucket=BUCKET, Key=k)["Body"].read().decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if not txt: continue
+        lines = txt.splitlines()
+        if lines and lines[0].startswith("ts,component,event,pod,kv"):
+            lines = lines[1:]
+        parts.extend(lines)
+    payload = "\n".join([ln for ln in parts if ln.strip()]) + "\n"
+    save_bytes(_SUMMARY_KEY, payload.encode("utf-8"), "text/csv")
 
 def sync_all_metrics_to_minio() -> None:
-    """Upload all local metric files to MinIO in one batch."""
-    files = [
-        (_CSV_PATH, "text/csv"),
-        (_JSONL_PATH, "application/json")
-    ]
-    files += [
-        (path, "text/csv")
-        for path in glob.glob(f"/mnt/pvc/{RESULT_DIR}/*_metrics.csv")
-    ]
-    for path, mime in files:
-        if not os.path.exists(path):
-            continue
-        key = f"{RESULT_DIR}/{os.path.basename(path)}"
-        with open(path, "rb") as f:
-            data = f.read()
-        save_bytes(key, data, mime)
+    with _LOCK:
+        _flush_locked()
+    try:
+        _merge_to_summary()
+    except Exception as e:
+        print(f"[metric_logger] merge shards failed: {e}")

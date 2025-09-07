@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, time, json
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 
@@ -32,7 +32,6 @@ def _try_load_manifest_stages() -> List[Tuple[str, int]] | None:
         obj = s3.get_object(Bucket=BUCKET, Key=MANIFEST_KEY)
         m = json.loads(obj["Body"].read().decode())
         if isinstance(m.get("stages"), list):
-            # 允许 [["key", 100], ["key2", 200]] 或 [{"key":..., "rows":...}, ...]
             out: List[Tuple[str, int]] = []
             for it in m["stages"]:
                 if isinstance(it, (list, tuple)) and len(it) >= 2:
@@ -43,6 +42,28 @@ def _try_load_manifest_stages() -> List[Tuple[str, int]] | None:
     except Exception:
         pass
     return None
+
+def _normalize_stages(stages) -> List[Dict]:
+    out: List[Dict] = []
+    for it in stages or []:
+        if isinstance(it, dict):
+            key = str(it.get("key") or "")
+            rows = int(it.get("rows", 0))
+            take = str(it.get("take", "head")).lower()
+            seed = it.get("seed", None)
+            if key and rows > 0:
+                out.append({"key": key, "rows": rows, "take": take, "seed": seed})
+        elif isinstance(it, (list, tuple)) and len(it) >= 2:
+            out.append({"key": str(it[0]), "rows": int(it[1]), "take": "head", "seed": None})
+    return out
+
+def _subset_df(df: pd.DataFrame, rows: int, take: str, seed: Optional[int]):
+    n = min(int(rows), len(df))
+    if take == "tail":
+        return df.tail(n)
+    if take == "random":
+        return df.sample(n=n, random_state=seed)
+    return df.head(n)
 
 def _iter_rows(df: pd.DataFrame, feats: List[str]):
     numdf = df.copy()
@@ -62,27 +83,30 @@ def main():
     prod  = create_producer()
     touch_ready("producer", POD_NAME)
 
-    stages = _try_load_manifest_stages() or PRODUCER_STAGES
+    stages_manifest = _try_load_manifest_stages()
+    stages = _normalize_stages(stages_manifest if stages_manifest else PRODUCER_STAGES)
     if not stages:
         raise RuntimeError("no producer stages defined (empty PRODUCER_STAGES and manifest missing)")
 
     total = 0
-    for idx, (key, rows) in enumerate(stages, 1):
+    for idx, spec in enumerate(stages, 1):
+        key, rows, take, seed = spec["key"], spec["rows"], spec.get("take", "head"), spec.get("seed", None)
         try:
             df = _load_df_from_key(key)
         except Exception as e:
             print(f"[producer:{POD_NAME}] fail {key}: {e} (skip stage {idx})")
             continue
-        n = min(len(df), int(rows))
-        print(f"[producer:{POD_NAME}] stage{idx}: {key} -> {n} rows")
-        for j, msg in enumerate(_iter_rows(df.head(n), feats), 1):
+
+        df_sub = _subset_df(df, rows, take, seed)
+        n = len(df_sub)
+        print(f"[producer:{POD_NAME}] stage{idx}: key={key} take={take} rows={n}")
+        for j, msg in enumerate(_iter_rows(df_sub, feats), 1):
             prod.send(TOPIC, msg)
             total += 1
             if PRODUCE_INTERVAL_MS > 0:
                 time.sleep(PRODUCE_INTERVAL_MS / 1000.0)
         log_metric(component="producer", event=f"stage{idx}_done", value=n, kafka_topic=TOPIC)
 
-    # 广播终止哨兵（每个分区 1 条）
     cons = create_consumer(TOPIC, group_id="cg-producer-probe")
     time.sleep(1.0)
     parts = cons.partitions_for_topic(TOPIC) or []

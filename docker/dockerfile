@@ -1,43 +1,45 @@
 # /data/mlops/DRST-SoftwarizedNetworks/docker/dockerfile
 # syntax=docker/dockerfile:1.6
 
-# 0) deps — only responsible for installing dependencies
+######## 0) deps — 安装依赖到独立 venv（便于层复用） ########
 FROM python:3.10-slim AS deps
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-# Build-time dependencies stay only in the build layer, not in the final image
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc g++ curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-# Independent venv for easy copying
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/src
 COPY requirements.txt .
-# Use BuildKit pip cache
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && pip install -r requirements.txt
 
-# 1) base — runtime base layer (reuse venv, copy common code only)
+######## 1) base — 运行时基础层 ########
 FROM python:3.10-slim AS base
 ENV PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-# Copy venv only, avoid bringing build tools
+# 在基础层固定 APP_DIR 和 PYTHONPATH，让组件里无需再设置
+ENV APP_DIR=/app PYTHONPATH=/app
+
+# 仅带上依赖（不带编译工具）
 COPY --from=deps /opt/venv /opt/venv
+
 WORKDIR /app
 
-# Shared code (as stable as possible to reduce rebuilds)
+# 共享代码（尽量稳定，减少重建）
 COPY drst_common ./drst_common
 COPY requirements.txt ./requirements.txt
+# 如需把本地包安装成可编辑包，可在这里 pip install -e .
+# 但通常我们直接靠 PYTHONPATH=/app + 包内 __init__.py 即可。
 
-# 2) component images — copy only their own code
+######## 2) 各组件镜像（只拷贝自身代码） ########
+
 # 2.1 offline
 FROM base AS offline
-# Copy only code needed for offline
 COPY drst_inference/offline ./drst_inference/offline
-COPY drst_inference/offline/__init__.py ./drst_inference/offline/__init__.py
-# During training datasets may be needed locally (currently you mostly use MinIO, can leave empty)
+# 若离线训练需要本地样例数据，可一并拷贝（可选）
 COPY datasets ./datasets
 CMD ["bash","-lc","python -V && echo offline image ready"]
 
@@ -54,6 +56,7 @@ CMD ["bash","-lc","python -V && echo producer image ready"]
 # 2.4 infer
 FROM base AS infer
 COPY drst_inference/online ./drst_inference/online
+COPY drst_inference/offline ./drst_inference/offline
 CMD ["bash","-lc","python -V && echo infer image ready"]
 
 # 2.5 plot

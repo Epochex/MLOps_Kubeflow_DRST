@@ -1,24 +1,26 @@
 # drst_common/minio_helper.py
 # MinIO client + PVC direct write + async upload; supports both Ingress/Cluster modes
+from __future__ import annotations
+
 import os
 import io
+import re
 import boto3
 import threading
 import concurrent.futures
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import numpy as np
 from botocore.config import Config as BotoConfig
 
 from .config import (
-    ENDPOINT, ACCESS_KEY, SECRET_KEY, BUCKET, DATA_DIR, RESULT_DIR,
-    MINIO_SCHEME, MINIO_VERIFY_SSL, MINIO_CONSOLE_URL
+    ENDPOINT, ACCESS_KEY, SECRET_KEY, BUCKET,
+    DATA_DIR, RESULT_DIR, MINIO_SCHEME, MINIO_VERIFY_SSL, MINIO_CONSOLE_URL
 )
 
 # ---------- S3 client ----------
 _sess = boto3.session.Session()
-
 _endpoint_url = f"{MINIO_SCHEME}://{ENDPOINT}"
 
 # path-style for custom domains compatibility; keep retry config
@@ -48,7 +50,7 @@ s3 = _sess.client(
 
 _upload_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-def _async_upload(key: str, data: bytes, ctype: str):
+def _async_upload(key: str, data: bytes, ctype: str) -> None:
     try:
         s3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=ctype)
     except Exception as e:
@@ -57,43 +59,81 @@ def _async_upload(key: str, data: bytes, ctype: str):
 
 def save_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
     """
-    ① Write to PVC (/mnt/pvc/...) first so local processes can read immediately  
-    ② Then upload asynchronously to MinIO to reduce blocking  
-    Convention: store locally only as basename(key), to avoid permission/cleanup issues from nested paths
+    ① 优先写入本地 PVC（/mnt/pvc/<RESULT_DIR>/<basename>），便于同 Pod 即时读取；
+    ② 同步提交后台线程异步上传到 MinIO，减少阻塞。
+    约定：本地仅以 basename(key) 命名，避免深层目录权限/清理问题。
     """
     pvc_root = os.getenv("PVC_ROOT", "/mnt/pvc")
-    local_base = os.path.basename(key)
-    local_path = os.path.join(pvc_root, RESULT_DIR, local_base)
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    with open(local_path, "wb") as fp:
-        fp.write(data)
+    try:
+        local_dir = os.path.join(pvc_root, RESULT_DIR)
+        os.makedirs(local_dir, exist_ok=True)
+        local_path = os.path.join(local_dir, os.path.basename(key))
+        with open(local_path, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        # 本地写失败不阻断远端上传
+        print(f"[minio] WARN local write failed: {e}")
 
+    # 异步上传到 MinIO
     _upload_pool.submit(_async_upload, key, data, content_type)
 
-# ---------- Load / Save utilities ----------
-def load_csv(key: str) -> pd.DataFrame:
-    """Fetch CSV from MinIO into a local cache under DATA_DIR with the same basename, then read as DataFrame."""
-    local = os.path.join(DATA_DIR, os.path.basename(key))
+def save_np(key: str, arr: np.ndarray, allow_pickle: bool = False) -> None:
+    """保存 Numpy 数组到 MinIO（并本地留存一份）。"""
+    bio = io.BytesIO()
+    # np.save 不允许直接设置 content-type，这里由 save_bytes 处理
+    np.save(bio, arr, allow_pickle=allow_pickle)
+    save_bytes(key, bio.getvalue(), "application/octet-stream")
+
+def _cache_local_path_for_csv(key: str) -> str:
+    """
+    统一的 CSV 本地缓存位置：<DATA_DIR>/<basename(key)>
+    不创建子目录以简化权限和清理。
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, os.path.basename(key))
+
+def load_csv(key: str, *, encoding: Optional[str] = None) -> pd.DataFrame:
+    """
+    从 MinIO 拉取 CSV 到本地缓存再读。
+    放宽清洗策略：不全表 dropna，只清理哨兵字符串和多余索引列。
+    - 去掉类似 'Unnamed: 0' 的 pandas 索引残留列
+    - 将字符串哨兵（如 '<not counted>'）置为 NaN，但不强制丢行
+    """
+    local = _cache_local_path_for_csv(key)
+
+    # 若本地不存在则下载
     if not os.path.exists(local):
         obj = s3.get_object(Bucket=BUCKET, Key=key)
-        os.makedirs(DATA_DIR, exist_ok=True)
         with open(local, "wb") as f:
             f.write(obj["Body"].read())
-    return (pd.read_csv(local, index_col=0)
-              .replace({'<not counted>': None}).dropna())
 
-def load_np(key: str) -> np.ndarray:
-    """Fetch .npy from MinIO into a local cache under RESULT_DIR, then load with np.load."""
-    local = os.path.join(RESULT_DIR, os.path.basename(key))
-    if not os.path.exists(local):
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        os.makedirs(RESULT_DIR, exist_ok=True)
-        with open(local, "wb") as f:
-            f.write(obj["Body"].read())
-    return np.load(local)
+    # 读取
+    df = pd.read_csv(local, encoding=encoding)  # 不默认 index_col，避免误删列
 
-def save_np(key: str, arr: Any) -> None:
-    buf = io.BytesIO()
-    np.save(buf, arr)
-    buf.seek(0)
-    save_bytes(key, buf.read(), "application/npy")
+    # 清理“多余索引列”：匹配 Unnamed: 0, Unnamed: 0.1 等
+    unnamed_cols = [c for c in df.columns if re.match(r"^Unnamed:\s*\d+(\.\d+)?$", str(c))]
+    if unnamed_cols:
+        df = df.drop(columns=unnamed_cols)
+
+    # 替换常见哨兵字符串为 NaN（保留行，后续流程自行决定如何处理）
+    if df.select_dtypes(include=["object"]).shape[1] > 0:
+        df = df.replace({"<not counted>": np.nan})
+
+    return df
+
+def load_np(key: str, *, allow_pickle: bool = False) -> np.ndarray:
+    """从 MinIO 读取 .npy / .npz 到内存并加载为 numpy 对象。"""
+    obj = s3.get_object(Bucket=BUCKET, Key=key)
+    data = obj["Body"].read()
+    bio = io.BytesIO(data)
+    # 自动兼容 npy/npz：np.load 都能处理
+    return np.load(bio, allow_pickle=allow_pickle)
+
+# ——（可选）便捷函数：保存文本/JSON——
+def save_text(key: str, text: str, encoding: str = "utf-8") -> None:
+    save_bytes(key, text.encode(encoding), "text/plain; charset=utf-8")
+
+def save_json(key: str, payload: Any) -> None:
+    import json
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    save_bytes(key, data, "application/json")

@@ -3,7 +3,7 @@
 
 from kfp import dsl, compiler
 
-# ======== Images ========
+# ======== Images (与你 push 的镜像标签一致) ========
 IMAGE_OFFLINE  = "hirschazer/offline:latest"
 IMAGE_MONITOR  = "hirschazer/monitor:latest"
 IMAGE_PRODUCER = "hirschazer/producer:latest"
@@ -16,10 +16,21 @@ IMAGE_PLOT     = "hirschazer/plot:latest"
 def offline_op(
     train_minio_key: str = "datasets/combined.csv",
 ):
-    """Phase-1 Offline training: writes model artifacts into models/ (baseline, model.pt, metrics, latest.txt)"""
-    import os, subprocess
-    os.environ["TRAIN_MINIO_KEY"] = train_minio_key
-    subprocess.run(["python", "drst_inference/offline/train_offline.py"], check=True)
+    """Phase-1 Offline training"""
+    import os, sys, subprocess
+    app_dir = os.environ.get("APP_DIR", "/app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+
+    env = os.environ.copy()
+    env["TRAIN_MINIO_KEY"] = train_minio_key
+
+    subprocess.run(
+        ["python", "-m", "drst_inference.offline.train_offline"],
+        check=True,
+        cwd=app_dir,
+        env=env,
+    )
 
 
 @dsl.component(base_image=IMAGE_MONITOR)
@@ -36,45 +47,64 @@ def monitor_op(
     eval_stride: int = 50,
 ):
     """Phase-2 Drift monitoring (sliding-window JSD with bootstrap-calibrated thresholds)"""
-    import os, subprocess, shlex, time
-    env = os.environ.copy()
-    env["KAFKA_TOPIC"]            = kafka_topic
-    env["IDLE_TIMEOUT_S"]         = str(idle_timeout_s)
-    env["HIST_BINS"]              = str(hist_bins)
-    env["DRIFT_WINDOW"]           = str(drift_window)
-    env["EVAL_STRIDE"]            = str(eval_stride)
-    env["JS_CALIB_SAMPLES"]       = str(js_calib_samples)
-    env["JS_QUANTILES"]           = js_quantiles
-    env["BASELINE_REFRESH_MODE"]  = baseline_refresh_mode
+    import os, sys, subprocess, time
+    app_dir = os.environ.get("APP_DIR", "/app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
 
-    cmd = "python drst_drift/monitor.py"
-    p = subprocess.Popen(shlex.split(cmd), env=env)
+    env = os.environ.copy()
+    env["KAFKA_TOPIC"]           = kafka_topic
+    env["IDLE_TIMEOUT_S"]        = str(idle_timeout_s)
+    env["HIST_BINS"]             = str(hist_bins)
+    env["DRIFT_WINDOW"]          = str(drift_window)
+    env["EVAL_STRIDE"]           = str(eval_stride)
+    env["JS_CALIB_SAMPLES"]      = str(js_calib_samples)
+    env["JS_QUANTILES"]          = js_quantiles
+    env["BASELINE_REFRESH_MODE"] = baseline_refresh_mode
+
+    p = subprocess.Popen(
+        ["python", "-m", "drst_drift.monitor"],
+        cwd=app_dir,
+        env=env,
+    )
     t0 = time.time()
-    while p.poll() is None:
-        if time.time() - t0 > max_wall_secs:
-            p.kill()
-            break
-        time.sleep(1)
+    try:
+        while p.poll() is None:
+            if time.time() - t0 > max_wall_secs:
+                p.kill()
+                break
+            time.sleep(1)
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 @dsl.component(base_image=IMAGE_PRODUCER)
 def producer_op(
     kafka_topic: str = "latencyTopic",
     interval_ms: int = 100,
-    s1_n: int = 3000,
-    s2_n: int = 1000,
-    s3_n: int = 1000,
+    producer_stages: str = "",   # 可选：覆盖 config.PRODUCER_STAGES
 ):
-    """Phase-3 Kafka producer (send data in stages, then broadcast termination sentinels by partition)"""
-    import os, subprocess
+    """Phase-3 Kafka producer"""
+    import os, sys, subprocess
+    app_dir = os.environ.get("APP_DIR", "/app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+
     env = os.environ.copy()
     env["KAFKA_TOPIC"]         = kafka_topic
     env["PRODUCE_INTERVAL_MS"] = str(interval_ms)
-    env["STAGE1_N"]            = str(s1_n)
-    env["STAGE2_N"]            = str(s2_n)
-    env["STAGE3_N"]            = str(s3_n)
+    if producer_stages:
+        env["PRODUCER_STAGES"] = producer_stages
 
-    subprocess.run(["python", "drst_inference/online/producer.py"], check=True, env=env)
+    subprocess.run(
+        ["python", "-m", "drst_inference.online.producer"],
+        check=True,
+        cwd=app_dir,
+        env=env,
+    )
 
 
 @dsl.component(base_image=IMAGE_INFER)
@@ -86,38 +116,63 @@ def inference_op(
     max_wall_secs: int = 480,
 ):
     """Phase-4 Online inference consumer (dual-path baseline+adaptive with hot-reload)"""
-    import os, subprocess, shlex, time
-    env = os.environ.copy()
-    env["KAFKA_TOPIC"]       = kafka_topic
-    env["IDLE_TIMEOUT_S"]    = str(idle_timeout_s)
-    env["RELOAD_INTERVAL_S"] = str(reload_interval_s)
-    env["HOSTNAME"]          = f"infer-{instance_id}"
+    import os, sys, subprocess, time
+    app_dir = os.environ.get("APP_DIR", "/app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
 
-    cmd = "python drst_inference/online/inference_consumer.py"
-    p = subprocess.Popen(shlex.split(cmd), env=env)
+    env = os.environ.copy()
+    env["KAFKA_TOPIC"]        = kafka_topic
+    env["IDLE_TIMEOUT_S"]     = str(idle_timeout_s)
+    env["RELOAD_INTERVAL_S"]  = str(reload_interval_s)
+    env["HOSTNAME"]           = f"infer-{instance_id}"
+
+    p = subprocess.Popen(
+        ["python", "-m", "drst_inference.online.inference_consumer"],
+        cwd=app_dir,
+        env=env,
+    )
     t0 = time.time()
-    while p.poll() is None:
-        if time.time() - t0 > max_wall_secs:
-            p.kill()
-            break
-        time.sleep(1)
+    try:
+        while p.poll() is None:
+            if time.time() - t0 > max_wall_secs:
+                p.kill()
+                break
+            time.sleep(1)
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 @dsl.component(base_image=IMAGE_PLOT)
 def plot_op():
-    """Phase-5 Summary plotting and reporting (reads *_inference_trace.npz; generates PNG + report.md to MinIO)"""
-    import subprocess
-    subprocess.run(["python", "drst_inference/plotting/plot_final.py"],  check=True)
-    subprocess.run(["python", "drst_inference/plotting/plot_report.py"], check=True)
+    """Phase-5 Summary plotting and reporting"""
+    import os, sys, subprocess
+    app_dir = os.environ.get("APP_DIR", "/app")
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+
+    subprocess.run(
+        ["python", "-m", "drst_inference.plotting.plot_final"],
+        check=True,
+        cwd=app_dir,
+    )
+    subprocess.run(
+        ["python", "-m", "drst_inference.plotting.plot_report"],
+        check=True,
+        cwd=app_dir,
+    )
 
 # ======== Pipeline ========
 @dsl.pipeline(name="drift-stream-v2")
 def drift_stream(
-    image: str = IMAGE_OFFLINE,
+    image: str = IMAGE_OFFLINE,            # 未使用，仅保留兼容
     offline_key: str = "datasets/combined.csv",
     kafka_topic: str = "latencyTopic",
     interval_ms: int = 100,
-    s1_n: int = 3000, s2_n: int = 1000, s3_n: int = 1000,
+    producer_stages: str = "",
     idle_timeout_s: int = 60,
     max_wall_secs: int = 480,
 ):
@@ -136,7 +191,7 @@ def drift_stream(
     prod = producer_op(
         kafka_topic=kafka_topic,
         interval_ms=interval_ms,
-        s1_n=s1_n, s2_n=s2_n, s3_n=s3_n,
+        producer_stages=producer_stages,
     ).after(off).set_display_name("kafka-producer").set_caching_options(False)
 
     consumers = []
@@ -152,7 +207,7 @@ def drift_stream(
     final_plot = plot_op().set_display_name("plot-and-report").set_caching_options(False)
     final_plot.after(prod, mon, *consumers)
 
-    # ===== 让所有组件走 in-cluster MinIO，避免 ingress 依赖 =====
+    # 统一使用 in-cluster MinIO，避免 ingress 依赖
     for t in [off, mon, prod, *consumers, final_plot]:
         t.set_env_variable(name="MINIO_ACCESS_MODE", value="cluster")
         t.set_env_variable(name="MINIO_ENDPOINT",   value="minio-service.kubeflow.svc.cluster.local:9000")

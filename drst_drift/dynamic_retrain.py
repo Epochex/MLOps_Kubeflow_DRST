@@ -3,6 +3,7 @@
 # - Reads results/latest_batch.npy and retrain_grid.flag
 # - ABC grids retrieved from drst_common.config.abc_grids()
 # - Two-stage (warm scoring → full training), supports finetune/scratch (auto-detection)
+
 from __future__ import annotations
 import io, os, time
 from itertools import product
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
+from drst_common import config as _cfg  # for ACC_THR (optional)
 from drst_common.config import RESULT_DIR, TARGET_COL, abc_grids
 from drst_common.minio_helper import load_np, save_bytes, s3
 from drst_common.artefacts import (
@@ -32,7 +34,11 @@ RETRAIN_MODE   = os.getenv("RETRAIN_MODE", "auto").lower()  # auto|finetune|scra
 FREEZE_N       = int(os.getenv("FREEZE_N", "0"))            # freeze first N Linear layers when finetuning
 VAL_FRAC       = float(os.getenv("RETRAIN_VAL_FRAC", "0.2"))
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Accuracy threshold (relative error) — default 0.25; can be overridden via env ACC_THR
+ACC_THR        = float(getattr(_cfg, "ACC_THR", float(os.getenv("ACC_THR", "0.25"))))
+_thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
+
+device   = "cuda" if torch.cuda.is_available() else "cpu"
 pod_name = os.getenv("HOSTNAME", "retrain")
 
 # ---------- Helpers ----------
@@ -55,12 +61,14 @@ def _split_xy(arr: np.ndarray, cols: Optional[List[str]], feat_names: List[str])
         return arr[:, :d].astype(np.float32), arr[:, -1].astype(np.float32)
     return arr[:, :d].astype(np.float32), None
 
-def _eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
+def _eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float, float]:
+    """Return (mae, rmse, acc@thr, acc@0.15)."""
     err = np.abs(y_pred - y_true)
     mae = float(np.mean(err))
     rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
-    acc15 = calculate_accuracy_within_threshold(y_pred, y_true, thr=0.15)
-    return mae, rmse, acc15
+    acc_thr = calculate_accuracy_within_threshold(y_true, y_pred, ACC_THR)
+    acc15   = calculate_accuracy_within_threshold(y_true, y_pred, 0.15)
+    return mae, rmse, acc_thr, acc15
 
 def _loss_fn(name: str):
     name = name.lower()
@@ -124,7 +132,7 @@ def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: st
         model.eval()
         with torch.no_grad():
             pv = model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
-        _, rmse, _ = _eval_metrics(Yva, pv)
+        _, rmse, _, _ = _eval_metrics(Yva, pv)
         if rmse < best_rmse - 1e-6:
             best_rmse = rmse; bad = 0
             bio = io.BytesIO(); torch.save(model.to("cpu"), bio); best_state = bio.getvalue()
@@ -137,8 +145,8 @@ def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: st
         model = torch.load(io.BytesIO(best_state), map_location=device)
     with torch.no_grad():
         pv = model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
-    mae, rmse, acc15 = _eval_metrics(Yva, pv)
-    return model, {"mae": mae, "rmse": rmse, "acc@0.15": acc15}
+    mae, rmse, acc_thr, acc15 = _eval_metrics(Yva, pv)
+    return model, {"mae": mae, "rmse": rmse, f"acc@{_thr_str}": acc_thr, "acc@0.15": acc15}
 
 def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: str,
                 lr: float, batch: int, loss_name: str, weight_decay: float,
@@ -167,7 +175,7 @@ def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: s
     model.eval()
     with torch.no_grad():
         pv = model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
-    _, rmse, _ = _eval_metrics(Yva, pv)
+    _, rmse, _, _ = _eval_metrics(Yva, pv)
     return rmse
 
 def main():
@@ -213,7 +221,7 @@ def main():
     baseline_model.eval().to(device)
     with torch.no_grad():
         pb = baseline_model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
-    base_mae, base_rmse, base_acc15 = _eval_metrics(Yva, pb)
+    base_mae, base_rmse, base_acc_thr, base_acc15 = _eval_metrics(Yva, pb)
 
     # Current latest (for finetune check)
     latest = read_latest()
@@ -269,8 +277,12 @@ def main():
     model_bytes = buf.getvalue()
     model_mb = round(len(model_bytes) / (1024*1024), 4)
     ts = int(time.time())
+
+    # Compose metrics (both @ACC_THR and @0.15 for backward compatibility)
     metrics = {
+        f"acc@{_thr_str}": best_metrics[f"acc@{_thr_str}"],
         "acc@0.15": best_metrics["acc@0.15"],
+        f"baseline_acc@{_thr_str}": base_acc_thr,
         "baseline_acc@0.15": base_acc15,
         "mae": best_metrics["mae"], "rmse": best_metrics["rmse"],
         "baseline_mae": base_mae, "baseline_rmse": base_rmse,
@@ -279,19 +291,21 @@ def main():
         "grid": grid_letter,
         **best_cfg,
     }
+
     write_latest(model_bytes, metrics, model_key=f"model_{ts}.pt", metrics_key=f"metrics_{ts}.json")
     save_bytes(f"{RESULT_DIR}/retrain_done.flag", f"ts={ts}\n".encode(), "text/plain")
 
     log_metric(component="retrain", event="summary",
                train_rows=int(len(tr_idx)), mae=metrics["mae"], rmse=metrics["rmse"],
-               accuracy=metrics["acc@0.15"], model_size_mb=model_mb, grid=grid_letter,
+               **{f"accuracy@{_thr_str}": metrics[f"acc@{_thr_str}"]},
+               model_size_mb=model_mb, grid=grid_letter,
                lr=best_cfg["lr"], batch_size=best_cfg["batch_size"],
                loss=best_cfg["loss"], activation=best_cfg["activation"])
 
     sync_all_metrics_to_minio(); write_kfp_metadata()
     print(f"[retrain] done. grid={grid_letter} mode={best_cfg['mode']} "
-          f"rmse={metrics['rmse']:.4f} acc@0.15={metrics['acc@0.15']:.4f} "
-          f"(baseline rmse={base_rmse:.4f} acc={base_acc15:.4f})")
+          f"rmse={metrics['rmse']:.4f} acc@{_thr_str}={metrics[f'acc@{_thr_str}']:.4f} "
+          f"(baseline rmse={base_rmse:.4f} acc@{_thr_str}={base_acc_thr:.4f})")
 
 if __name__ == "__main__":
     main()
