@@ -13,19 +13,18 @@ from drst_common.config import (
     MODEL_DIR, RESULT_DIR, BUCKET, INFER_STDOUT_EVERY, RELOAD_INTERVAL_S,
     GAIN_THR_PP, RETRAIN_TOPIC, TARGET_COL
 )
-from drst_common.kafka_io import create_consumer, create_producer, partitions_count, is_sentinel
+from drst_common.kafka_io import (
+    create_consumer, create_producer, partitions_for_topic,
+    SENTINEL_HEADER_KEY, SENTINEL_HEADER_VAL, SENTINEL_FALLBACK_VALUE
+)
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.minio_helper import save_bytes, s3
 from drst_common.artefacts import load_selected_feats, load_scaler, read_latest, load_model_by_key
 from drst_common.resource_probe import start as start_probe
 
-def _make_run_tag() -> str:
-    for k in ("KFP_RUN_ID", "WORKFLOW_ID", "PIPELINE_RUN_ID", "POD_NAME", "HOSTNAME"):
-        v = os.getenv(k)
-        if v: return v
-    return str(int(time.time()))
-RUN_TAG   = _make_run_tag()
-GROUP_ID  = f"cg-infer-{RUN_TAG}"
+# ---------- group 固定，同一 run 的所有副本共享 ----------
+RUN_TAG  = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
+GROUP_ID = os.getenv("KAFKA_GROUP_ID", "cg-infer")
 
 POD_NAME = os.getenv("HOSTNAME", "infer")
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,26 +58,21 @@ def _pick_metric(metrics: Dict[str, float]) -> Tuple[float, float]:
     base_acc = next((float(metrics[k]) for k in base_candidates if k in metrics), 0.0)
     return new_acc, base_acc
 
-def _parse_row(v_bytes) -> Optional[dict]:
-    """兼容两种消息：
-       1) 扁平：{feat1:...,..., output_rate: y}
-       2) 嵌套：{"features": {...}, "label": y, "send_ts": "..."}
-    """
+def _is_sentinel_msg(msg) -> bool:
     try:
-        obj = json.loads(v_bytes)
+        # header 方式（推荐）
+        for k, v in (msg.headers or []):
+            if k == SENTINEL_HEADER_KEY and v == SENTINEL_HEADER_VAL:
+                return True
     except Exception:
-        return None
-    if isinstance(obj, dict):
-        if "features" in obj or "label" in obj:
-            feats = obj.get("features", {})
-            y = obj.get("label", obj.get(TARGET_COL))
-            return {"features": feats, "label": y, "send_ts": obj.get("send_ts")}
-        else:
-            # 扁平
-            y = obj.get(TARGET_COL)
-            feats = {k: v for k, v in obj.items() if k != TARGET_COL}
-            return {"features": feats, "label": y, "send_ts": obj.get("send_ts")}
-    return None
+        pass
+    try:
+        # 旧的 fallback：纯字节 value
+        if msg.value == SENTINEL_FALLBACK_VALUE:
+            return True
+    except Exception:
+        pass
+    return False
 
 print(f"[infer:{POD_NAME}] loading artefacts…")
 SELECTED_FEATS = load_selected_feats()
@@ -141,7 +135,7 @@ threading.Thread(target=_reload_daemon, daemon=True).start()
 print(f"[infer:{POD_NAME}] connecting Kafka…")
 consumer = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
 time.sleep(1.0)
-num_parts = partitions_count(consumer, KAFKA_TOPIC)
+num_parts = len(partitions_for_topic(KAFKA_TOPIC))
 print(f"[infer:{POD_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
 
 save_bytes(f"{RESULT_DIR}/consumer_ready_{POD_NAME}.flag", b"", "text/plain")
@@ -160,8 +154,9 @@ _batch_idx  = 0
 
 def _process_batch(rows: List[dict]):
     global cum_correct, cum_total, _batch_idx
-    X_raw = np.array([[r.get("features", {}).get(c, 0.0) for c in SELECTED_FEATS] for r in rows], dtype=np.float32)
-    labels = np.array([float(r.get("label", 0.0) or 0.0) for r in rows], dtype=np.float32)
+    # 注意：producer 发送的是“扁平字典”，特征在顶层；标签字段名为 TARGET_COL
+    X_raw = np.array([[r.get(c, 0.0) for c in SELECTED_FEATS] for r in rows], dtype=np.float32)
+    labels = np.array([r.get(TARGET_COL, 0.0) for r in rows], dtype=np.float32)
     send_ts = [r.get("send_ts") for r in rows]
     X_sc = SCALER.transform(X_raw)
 
@@ -232,16 +227,24 @@ try:
         got_data = False
         for _, records in polled.items():
             for msg in records:
-                if is_sentinel(msg):
+                if _is_sentinel_msg(msg):
                     sentinel_seen += 1
                     print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                     continue
-                row = _parse_row(msg.value)
-                if not isinstance(row, dict):
-                    continue
+                # 解码 JSON 值
+                try:
+                    v = json.loads(msg.value)
+                    if isinstance(v, dict) and v.get("producer_done"):
+                        # 兼容极旧格式
+                        sentinel_seen += 1
+                        print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
+                        continue
+                except Exception:
+                    continue  # 畸形消息，跳过
+
                 got_data = True
                 last_data_ts = time.time()
-                batch_buf.append(row)
+                batch_buf.append(v)
                 if len(batch_buf) >= BATCH:
                     _process_batch(batch_buf); batch_buf.clear()
 

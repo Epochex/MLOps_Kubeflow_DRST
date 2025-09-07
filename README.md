@@ -155,6 +155,8 @@ The retrainer consumes the frozen window and tier flag, reuses the offline scale
 
 ### 2.6 `experiments/`
 Reproducible experiments and Kubeflow Pipelines assembly. `kubeflow/pipeline.py` defines the full KFP DAG — offline → (monitor | producer | infer) → plot — with an 8-minute wall-clock cap per streaming stage and consumer auto-shutdown on idle. `submit_pipeline.py` compiles `drift_demo_v2.yaml` and submits it to KFP (KFP host/namespace/experiment are provided via environment variables). `yamls/` contains example manifests for observability (e.g., Prometheus and Kafka Exporter). The folder enables a one-command workflow to compile and submit an end-to-end run: offline training, streaming drift detection and adaptive updates, and final charts/report generation.
+![Pipeline Overview](<docs/pipeline_runtime.png>)
+
 
 ### 2.7 `deploy/`
 #### 2.7.1 `Auto_deployment_k8s_kubeflow.sh`
@@ -181,6 +183,7 @@ This resolves the **“runs stay Pending in UI”** problem by allowing the pers
 > ```
 > ⚠️ Auth-bypass is for **development/testing only**. For production, remove the EnvoyFilters, re-enable WebApp auth, and integrate with your real IdP/RBAC.
 
+![Infra Overview](<docs/KubeflowWebUI.png>)
 
 #### 2.7.2 `Auto_disable_auth.sh`
 Strips the authN/authZ chain for a dev/test environment. At the Istio gateway and selected in-namespace entry points, EnvoyFilters inject a fixed user identity (`kubeflow-userid` and `x-goog-authenticated-user-email` with the `accounts.google.com:` prefix). Authorization headers are removed only at the gateway to bypass residual OIDC/JWT checks. In the Kubeflow namespace, an allow-all AuthorizationPolicy is applied; WebApps are set with `APP_DISABLE_AUTH=True` and configured to read the injected headers; the KFP backend is set with `KUBEFLOW_USERID_HEADER=kubeflow-userid` and an empty prefix. Sidecar injection is enforced so filters take effect; Lua `headers():replace` is used for compatibility with your Envoy version. A matching Profile is created for the impersonated user. Net result: any request that reaches the NodePort is treated as the fixed user—suitable only for fast local testing and CI/CD bring-up.
@@ -188,7 +191,7 @@ Strips the authN/authZ chain for a dev/test environment. At the Istio gateway an
 #### 2.7.3 `Auto_deploy_kafka.sh`
 Installs Kafka bootstrap via Bitnami Helm. Ensures Helm and target namespace, adds and updates repo, renders a minimal `values.yaml`: single-broker (tunable), PLAINTEXT listeners (no SASL/TLS), KRaft (chart default), ClusterIP Service, configurable JVM heap. Installs and upgrades the release, waits for rollout, prints the in-cluster bootstrap address, and smoke-creates `latencyTopic` (3 partitions).
 
-![Infra Overview](<docs/KubeflowWebUI.png>)
+
 
 ### 2.8 `docker/`
 Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the in-cluster bootstrap address, and runs an idempotent smoke test, aligning with the repo’s default `KAFKA_SERVERS`. Includes helpers like `Auto_clear_pods.yaml` for basic cleanup/ops.

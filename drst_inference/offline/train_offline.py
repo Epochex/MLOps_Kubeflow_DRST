@@ -33,7 +33,7 @@ BRIDGE_N     = int(os.getenv("BRIDGE_N", "500"))
 RAND_N       = int(os.getenv("RAND_N", "500"))
 TOPK         = int(os.getenv("OFFLINE_TOPK", "10"))
 
-TRAIN_TRIGGER= int(os.getenv("TRAIN_TRIGGER", "1"))  # 默认0不训练，但若 baseline 不在，会自动训练
+TRAIN_TRIGGER= int(os.getenv("TRAIN_TRIGGER", "0"))  # 默认0不训练，但若 baseline 不在，会自动训练
 LR           = float(os.getenv("OFFLINE_LR", "1e-2"))
 BATCH_SIZE   = int(os.getenv("OFFLINE_BS", "16"))
 MAX_EPOCH    = int(os.getenv("OFFLINE_MAX_EPOCH", "100"))
