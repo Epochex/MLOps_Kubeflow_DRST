@@ -6,15 +6,14 @@ from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
-from kafka.errors import NoBrokersAvailable
 
 from drst_common import config as _cfg
 from drst_common.config import (
     KAFKA_TOPIC, BATCH_SIZE, CONSUME_IDLE_S as _CFG_IDLE_S,
     MODEL_DIR, RESULT_DIR, BUCKET, INFER_STDOUT_EVERY, RELOAD_INTERVAL_S,
-    GAIN_THR_PP, RETRAIN_TOPIC
+    GAIN_THR_PP, RETRAIN_TOPIC, TARGET_COL
 )
-from drst_common.kafka_io import create_consumer, create_producer, partitions_count
+from drst_common.kafka_io import create_consumer, create_producer, partitions_count, is_sentinel
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.minio_helper import save_bytes, s3
 from drst_common.artefacts import load_selected_feats, load_scaler, read_latest, load_model_by_key
@@ -59,6 +58,27 @@ def _pick_metric(metrics: Dict[str, float]) -> Tuple[float, float]:
     new_acc = next((float(metrics[k]) for k in candidates if k in metrics), 0.0)
     base_acc = next((float(metrics[k]) for k in base_candidates if k in metrics), 0.0)
     return new_acc, base_acc
+
+def _parse_row(v_bytes) -> Optional[dict]:
+    """兼容两种消息：
+       1) 扁平：{feat1:...,..., output_rate: y}
+       2) 嵌套：{"features": {...}, "label": y, "send_ts": "..."}
+    """
+    try:
+        obj = json.loads(v_bytes)
+    except Exception:
+        return None
+    if isinstance(obj, dict):
+        if "features" in obj or "label" in obj:
+            feats = obj.get("features", {})
+            y = obj.get("label", obj.get(TARGET_COL))
+            return {"features": feats, "label": y, "send_ts": obj.get("send_ts")}
+        else:
+            # 扁平
+            y = obj.get(TARGET_COL)
+            feats = {k: v for k, v in obj.items() if k != TARGET_COL}
+            return {"features": feats, "label": y, "send_ts": obj.get("send_ts")}
+    return None
 
 print(f"[infer:{POD_NAME}] loading artefacts…")
 SELECTED_FEATS = load_selected_feats()
@@ -141,7 +161,7 @@ _batch_idx  = 0
 def _process_batch(rows: List[dict]):
     global cum_correct, cum_total, _batch_idx
     X_raw = np.array([[r.get("features", {}).get(c, 0.0) for c in SELECTED_FEATS] for r in rows], dtype=np.float32)
-    labels = np.array([r.get("label", 0.0) for r in rows], dtype=np.float32)
+    labels = np.array([float(r.get("label", 0.0) or 0.0) for r in rows], dtype=np.float32)
     send_ts = [r.get("send_ts") for r in rows]
     X_sc = SCALER.transform(X_raw)
 
@@ -212,14 +232,16 @@ try:
         got_data = False
         for _, records in polled.items():
             for msg in records:
-                v = msg.value
-                if isinstance(v, dict) and v.get("producer_done"):
+                if is_sentinel(msg):
                     sentinel_seen += 1
                     print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                     continue
+                row = _parse_row(msg.value)
+                if not isinstance(row, dict):
+                    continue
                 got_data = True
                 last_data_ts = time.time()
-                batch_buf.append(v)
+                batch_buf.append(row)
                 if len(batch_buf) >= BATCH:
                     _process_batch(batch_buf); batch_buf.clear()
 

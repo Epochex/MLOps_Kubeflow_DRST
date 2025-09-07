@@ -9,7 +9,7 @@ import numpy as np
 from drst_common.config import (
     KAFKA_TOPIC, RESULT_DIR, TARGET_COL, DRIFT_WINDOW, EVAL_STRIDE, BUCKET, MODEL_DIR
 )
-from drst_common.kafka_io import create_consumer, partitions_count
+from drst_common.kafka_io import create_consumer, partitions_count, is_sentinel
 from drst_common.runtime import touch_ready, write_kfp_metadata
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.minio_helper import save_np, save_bytes, s3
@@ -68,15 +68,25 @@ retrain_in_progress = False
 lock_started_ts = 0.0
 
 def _features_from_msg(msg) -> Tuple[np.ndarray, Optional[float]]:
+    try:
+        obj = json.loads(msg.value)
+    except Exception:
+        obj = None
+    fdict, y = {}, None
+    if isinstance(obj, dict):
+        if "features" in obj or "label" in obj:
+            fdict = obj.get("features", {}) or {}
+            y = obj.get("label", obj.get(TARGET_COL))
+        else:
+            y = obj.get(TARGET_COL)
+            fdict = {k: v for k, v in obj.items() if k != TARGET_COL}
     feats = []
-    fdict = msg.get("features", {}) or {}
     for c in FEATURE_COLS:
         try:
-            v = float(fdict.get(c, 0.0))
+            v = float((fdict or {}).get(c, 0.0))
         except Exception:
             v = 0.0
         feats.append(v)
-    y = msg.get("label", None)
     try: y = float(y) if y is not None else None
     except Exception: y = None
     return np.asarray(feats, dtype=np.float32), y
@@ -146,7 +156,7 @@ def _retrain_done_after(ts0: float) -> bool:
         return meta["LastModified"].timestamp() >= ts0
     except Exception:
         return False
-
+    
 def _data_listener():
     global data_partitions, data_sentinel_seen
     cons = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
@@ -155,13 +165,12 @@ def _data_listener():
     print(f"[monitor:{pod_name}] topic «{KAFKA_TOPIC}» partitions = {data_partitions}")
     touch_ready("monitor", pod_name)
     for msg in cons:
-        v = msg.value
-        if isinstance(v, dict) and v.get("producer_done"):
+        if is_sentinel(msg):
             with sentinel_lock:
                 data_sentinel_seen += 1
                 print(f"[monitor:{pod_name}] got sentinel {data_sentinel_seen}/{data_partitions}")
             continue
-        q_data.put(v)
+        q_data.put(msg)
 
 threading.Thread(target=_data_listener, daemon=True).start()
 

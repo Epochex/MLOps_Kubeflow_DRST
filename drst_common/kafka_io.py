@@ -2,15 +2,21 @@
 # drst_common/kafka_io.py
 from __future__ import annotations
 import os, json, atexit, time
-from typing import List, Optional, Dict
+from typing import List, Optional, Tuple, Dict
 
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from kafka import KafkaProducer, KafkaConsumer, TopicPartition
+from kafka.errors import KafkaError, NoBrokersAvailable
+
+# 读取 config 里的 FQDN 作为默认值
+try:
+    from drst_common.config import KAFKA_SERVERS as _CFG_BOOTSTRAP
+except Exception:
+    _CFG_BOOTSTRAP = "kafka.default.svc.cluster.local:9092"
 
 # ---------------------------
 # Defaults (可被 env 覆盖)
 # ---------------------------
-BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", _CFG_BOOTSTRAP)
 SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")  # or SASL_PLAINTEXT / SASL_SSL
 SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
@@ -25,7 +31,7 @@ CLIENT_ID_PREFIX  = os.getenv("KAFKA_CLIENT_ID_PREFIX", "drst")
 SENTINEL_HEADER_KEY = "drst-sentinel"
 RUN_ID_HEADER_KEY   = "drst-run-id"
 SENTINEL_HEADER_VAL = b"1"
-SENTINEL_FALLBACK_VALUE = b"__DRST_EOF__"   # 兼容旧值
+SENTINEL_FALLBACK_VALUE = b"__DRST_EOF__"
 
 def _security_kwargs() -> Dict:
     kw = {"bootstrap_servers": BOOTSTRAP}
@@ -40,17 +46,33 @@ def _security_kwargs() -> Dict:
             kw["ssl_cafile"] = SSL_CAFILE
     return kw
 
+def _with_retry(make_fn, *, tries: int = 20, delay: float = 1.5):
+    last = None
+    for _ in range(max(1, tries)):
+        try:
+            return make_fn()
+        except NoBrokersAvailable as e:
+            last = e
+            time.sleep(delay)
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    if last:
+        raise last
+
 def create_producer(client_id: Optional[str] = None) -> KafkaProducer:
-    kw = _security_kwargs()
-    kw.update({
-        "client_id": client_id or f"{CLIENT_ID_PREFIX}-producer",
-        "acks": "all",
-        "linger_ms": int(os.getenv("KAFKA_LINGER_MS", "10")),
-        "retries": int(os.getenv("KAFKA_RETRIES", "3")),
-        "max_in_flight_requests_per_connection": 1,
-        "value_serializer": lambda d: json.dumps(d).encode("utf-8") if not isinstance(d, (bytes, bytearray)) else d,
-    })
-    producer = KafkaProducer(**kw)
+    def _mk():
+        kw = _security_kwargs()
+        kw.update({
+            "client_id": client_id or f"{CLIENT_ID_PREFIX}-producer",
+            "acks": "all",
+            "linger_ms": int(os.getenv("KAFKA_LINGER_MS", "10")),
+            "retries": int(os.getenv("KAFKA_RETRIES", "3")),
+            "max_in_flight_requests_per_connection": 1,
+            "value_serializer": lambda d: json.dumps(d).encode("utf-8") if not isinstance(d, (bytes, bytearray)) else d,
+        })
+        return KafkaProducer(**kw)
+    producer = _with_retry(_mk)
 
     def _close():
         try:
@@ -68,52 +90,53 @@ def create_consumer(
     start_from_end: bool = True,
     enable_auto_commit: bool = True,
 ) -> KafkaConsumer:
-    kw = _security_kwargs()
-    kw.update({
-        "group_id": group_id or GROUP_ID_DEFAULT,
-        "client_id": client_id or f"{CLIENT_ID_PREFIX}-consumer",
-        "auto_offset_reset": AUTO_OFFSET_RESET,
-        "enable_auto_commit": enable_auto_commit,
-        "value_deserializer": lambda b: json.loads(b) if (b and b != SENTINEL_FALLBACK_VALUE) else {},
-        "consumer_timeout_ms": 1000,
-        "max_poll_records": int(os.getenv("KAFKA_MAX_POLL_RECORDS", "500")),
-    })
-    consumer = KafkaConsumer(**kw)
-    consumer.subscribe([topic])
+    def _mk():
+        kw = _security_kwargs()
+        kw.update({
+            "group_id": group_id or GROUP_ID_DEFAULT,
+            "client_id": client_id or f"{CLIENT_ID_PREFIX}-consumer",
+            "auto_offset_reset": AUTO_OFFSET_RESET,
+            "enable_auto_commit": enable_auto_commit,
+            "value_deserializer": lambda b: b,  # 业务层自行 json.loads
+            "consumer_timeout_ms": 1000,
+            "max_poll_records": int(os.getenv("KAFKA_MAX_POLL_RECORDS", "500")),
+        })
+        c = KafkaConsumer(**kw)
+        c.subscribe([topic])
+        return c
+    consumer = _with_retry(_mk)
 
     # 等待分区分配
     t0 = time.time()
     while not consumer.assignment():
         consumer.poll(200)
-        if time.time() - t0 > 10:
+        if time.time() - t0 > 15:
             break
 
-    # 从当前末尾开始，避免吃历史 backlog
+    # 从当前末尾开始读（忽略历史 backlog）
     if start_from_end and consumer.assignment():
         for tp in list(consumer.assignment()):
             consumer.seek_to_end(tp)
     return consumer
 
+def partitions_count(consumer, topic: str) -> int:
+    """Return number of partitions for a topic using an existing consumer."""
+    try:
+        parts = consumer.partitions_for_topic(topic)
+        return len(parts or [])
+    except Exception:
+        return 0
+
 def partitions_for_topic(topic: str) -> List[int]:
-    tmp = KafkaConsumer(**_security_kwargs())
+    def _mk():
+        return KafkaConsumer(**_security_kwargs())
+    tmp = _with_retry(_mk)
     try:
         parts = tmp.partitions_for_topic(topic) or set()
         return sorted(list(parts))
     finally:
-        try:
-            tmp.close()
-        except Exception:
-            pass
-
-# 兼容老代码：接受 consumer 或 topic 字符串
-def partitions_count(consumer_or_topic, topic: Optional[str] = None) -> int:
-    if isinstance(consumer_or_topic, KafkaConsumer):
-        t = topic or next(iter(consumer_or_topic.subscription() or []), None)
-        if not t:
-            return 0
-        ps = consumer_or_topic.partitions_for_topic(t) or set()
-        return len(ps)
-    return len(partitions_for_topic(str(consumer_or_topic)))
+        try: tmp.close()
+        except Exception: pass
 
 def is_sentinel(record, run_id: Optional[str] = None) -> bool:
     try:
@@ -130,7 +153,7 @@ def is_sentinel(record, run_id: Optional[str] = None) -> bool:
     except Exception:
         pass
     try:
-        obj = json.loads(record.value)  # 如果 value 是 JSON
+        obj = json.loads(record.value)
         if obj.get("_sentinel", False):
             return (run_id is None) or (obj.get("run_id") == run_id)
     except Exception:
