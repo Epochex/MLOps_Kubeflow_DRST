@@ -439,7 +439,15 @@ deploymentSpec:
           \ app_dir)\n\n    subprocess.run(\n        [\"python\", \"-m\", \"drst_inference.plotting.plot_final\"\
           ],\n        check=True,\n        cwd=app_dir,\n    )\n    subprocess.run(\n\
           \        [\"python\", \"-m\", \"drst_inference.plotting.plot_report\"],\n\
-          \        check=True,\n        cwd=app_dir,\n    )\n\n"
+          \        check=True,\n        cwd=app_dir,\n    )\n\n    # \uFF08\u53EF\u9009\
+          \uFF09\u82E5\u955C\u50CF\u91CC\u5E26\u6709 experiments/summarize_resources.py\uFF0C\
+          \u5219\u987A\u624B\u4EA7\u51FA\u8D44\u6E90\u6C47\u603B\uFF1B\n    # \u82E5\
+          \u6587\u4EF6\u4E0D\u5B58\u5728\u6216\u5931\u8D25\uFF0C\u4E0D\u5F71\u54CD\
+          \u6D41\u6C34\u7EBF\u6210\u529F\u3002\n    try:\n        subprocess.run(\n\
+          \            [\"python\", \"experiments/summarize_resources.py\"],\n   \
+          \         check=True,\n            cwd=app_dir,\n        )\n    except Exception\
+          \ as e:\n        print(\"[plot_op] summarize_resources.py skipped:\", e)\n\
+          \n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster
@@ -483,10 +491,12 @@ deploymentSpec:
           , \"/app\")\n    if app_dir not in sys.path:\n        sys.path.insert(0,\
           \ app_dir)\n\n    env = os.environ.copy()\n    env[\"KAFKA_TOPIC\"]    \
           \     = kafka_topic\n    env[\"PRODUCE_INTERVAL_MS\"] = str(interval_ms)\n\
-          \    if producer_stages:\n        env[\"PRODUCER_STAGES\"] = producer_stages\n\
-          \n    subprocess.run(\n        [\"python\", \"-m\", \"drst_inference.online.producer\"\
-          ],\n        check=True,\n        cwd=app_dir,\n        env=env,\n    )\n\
-          \n"
+          \    # \u4E25\u683C\u8F6E\u8BE2\u5404\u5206\u533A\uFF08\u6700\u5C0F\u589E\
+          \u6539\uFF0C\u4EC5\u6B64\u4E00\u884C\uFF09\n    env[\"PRODUCER_PARTITION_MODE\"\
+          ] = \"rr\"\n    if producer_stages:\n        env[\"PRODUCER_STAGES\"] =\
+          \ producer_stages\n\n    subprocess.run(\n        [\"python\", \"-m\", \"\
+          drst_inference.online.producer\"],\n        check=True,\n        cwd=app_dir,\n\
+          \        env=env,\n    )\n\n"
         env:
         - name: MINIO_ACCESS_MODE
           value: cluster

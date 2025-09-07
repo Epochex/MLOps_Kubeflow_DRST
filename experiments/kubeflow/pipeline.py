@@ -96,6 +96,8 @@ def producer_op(
     env = os.environ.copy()
     env["KAFKA_TOPIC"]         = kafka_topic
     env["PRODUCE_INTERVAL_MS"] = str(interval_ms)
+    # 严格轮询各分区（最小增改，仅此一行）
+    env["PRODUCER_PARTITION_MODE"] = "rr"
     if producer_stages:
         env["PRODUCER_STAGES"] = producer_stages
 
@@ -164,6 +166,17 @@ def plot_op():
         check=True,
         cwd=app_dir,
     )
+
+    # （可选）若镜像里带有 experiments/summarize_resources.py，则顺手产出资源汇总；
+    # 若文件不存在或失败，不影响流水线成功。
+    try:
+        subprocess.run(
+            ["python", "experiments/summarize_resources.py"],
+            check=True,
+            cwd=app_dir,
+        )
+    except Exception as e:
+        print("[plot_op] summarize_resources.py skipped:", e)
 
 # ======== Pipeline ========
 @dsl.pipeline(name="drift-stream-v2")

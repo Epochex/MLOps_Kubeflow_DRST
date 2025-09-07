@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # drst_drift/dynamic_retrain.py
-# - Reads results/latest_batch.npy and retrain_grid.flag
-# - ABC grids retrieved from drst_common.config.abc_grids()
-# - Two-stage (warm scoring → full training), supports finetune/scratch (auto-detection)
-
+# 记录 retrain_wall_s + 进程资源曲线（results/retrain_resources.csv）
 from __future__ import annotations
 import io, os, time
 from itertools import product
@@ -13,35 +10,26 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
-from drst_common import config as _cfg  # for ACC_THR (optional)
-from drst_common.config import RESULT_DIR, TARGET_COL, abc_grids
-from drst_common.minio_helper import load_np, save_bytes, s3
-from drst_common.artefacts import (
-    load_scaler, load_selected_feats,
-    read_latest, load_model_by_key, write_latest,
+from drst_common import config as _cfg
+from drst_common.config import (
+    RESULT_DIR, TARGET_COL, abc_grids, BUCKET,
+    RETRAIN_WARM_EPOCHS, RETRAIN_EPOCHS_FULL, RETRAIN_EARLY_PATIENCE,
+    RETRAIN_MODE, RETRAIN_FREEZE_N, RETRAIN_VAL_FRAC,
 )
+from drst_common.minio_helper import load_np, save_bytes, s3
+from drst_common.artefacts import load_scaler, load_selected_feats, read_latest, load_model_by_key, write_latest
 from drst_common.utils import calculate_accuracy_within_threshold
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.runtime import touch_ready, write_kfp_metadata
-from drst_common.config import BUCKET
-from drst_inference.offline.model import MLPRegressor  # must support act parameter
+from drst_common.resource_probe import start as start_probe
+from drst_inference.offline.model import MLPRegressor
 
-# ================== Training controls ==================
-WARM_EPOCHS    = int(os.getenv("WARM_EPOCHS", "3"))
-EPOCHS_FULL    = int(os.getenv("EPOCHS_FULL", "8"))
-EARLY_PATIENCE = int(os.getenv("EARLY_PATIENCE", "2"))
-RETRAIN_MODE   = os.getenv("RETRAIN_MODE", "auto").lower()  # auto|finetune|scratch
-FREEZE_N       = int(os.getenv("FREEZE_N", "0"))            # freeze first N Linear layers when finetuning
-VAL_FRAC       = float(os.getenv("RETRAIN_VAL_FRAC", "0.2"))
-
-# Accuracy threshold (relative error) — default 0.25; can be overridden via env ACC_THR
-ACC_THR        = float(getattr(_cfg, "ACC_THR", float(os.getenv("ACC_THR", "0.25"))))
+ACC_THR  = float(getattr(_cfg, "ACC_THR", 0.25))
 _thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
 
 device   = "cuda" if torch.cuda.is_available() else "cpu"
-pod_name = os.getenv("HOSTNAME", "retrain")
+pod_name = os.getenv("HOSTNAME", "retrain")  # 仅用于可读日志，无超参含义
 
-# ---------- Helpers ----------
 def _read_grid_flag() -> str:
     try:
         raw = s3.get_object(Bucket=BUCKET, Key=f"{RESULT_DIR}/retrain_grid.flag")["Body"].read()
@@ -62,7 +50,6 @@ def _split_xy(arr: np.ndarray, cols: Optional[List[str]], feat_names: List[str])
     return arr[:, :d].astype(np.float32), None
 
 def _eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float, float]:
-    """Return (mae, rmse, acc@thr, acc@0.15)."""
     err = np.abs(y_pred - y_true)
     mae = float(np.mean(err))
     rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
@@ -102,7 +89,13 @@ def _can_finetune(current_model, hidden: Tuple[int, ...], act: str) -> bool:
         pass
     return list(hidden) == _hidden_of(current_model)
 
-# ---------- Training & scoring ----------
+def _align_to_dim(X: np.ndarray, in_dim: int) -> np.ndarray:
+    d = X.shape[1]
+    if d == in_dim: return X
+    if d > in_dim:  return X[:, :in_dim]
+    pad = np.zeros((X.shape[0], in_dim - d), dtype=np.float32)
+    return np.concatenate([X, pad], axis=1)
+
 def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: str,
                lr: float, batch: int, loss_name: str, weight_decay: float,
                mode: str, maybe_base_model) -> Tuple[torch.nn.Module, Dict[str, float]]:
@@ -110,25 +103,24 @@ def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: st
         model = maybe_base_model
     else:
         model = MLPRegressor(in_dim, hidden=hidden, act=act, dropout=0.0)
-    if mode == "finetune" and FREEZE_N > 0:
-        _freeze_n_linear(model, FREEZE_N)
+    if mode == "finetune" and RETRAIN_FREEZE_N > 0:
+        _freeze_n_linear(model, RETRAIN_FREEZE_N)
 
     ds = TensorDataset(torch.from_numpy(Xtr).float(), torch.from_numpy(Ytr).float().view(-1,1))
-    dl = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=False)
-    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=weight_decay)
+    dl = DataLoader(ds, batch_size=int(batch), shuffle=True, drop_last=False)
+    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=float(lr), weight_decay=float(weight_decay))
     loss_fn = _loss_fn(loss_name)
     model = model.to(device)
 
     best_rmse = float("inf"); best_state: Optional[bytes] = None
     bad = 0
-    for ep in range(max(1, EPOCHS_FULL)):
+    for _ in range(max(1, RETRAIN_EPOCHS_FULL)):
         model.train()
         for xb, yb in dl:
             xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad(set_to_none=True)
             loss = loss_fn(model(xb), yb)
             loss.backward(); opt.step()
-        # validation
         model.eval()
         with torch.no_grad():
             pv = model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
@@ -139,7 +131,7 @@ def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: st
             model.to(device)
         else:
             bad += 1
-            if bad > EARLY_PATIENCE: break
+            if bad > RETRAIN_EARLY_PATIENCE: break
 
     if best_state is not None:
         model = torch.load(io.BytesIO(best_state), map_location=device)
@@ -155,16 +147,16 @@ def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: s
         model = maybe_base_model
     else:
         model = MLPRegressor(in_dim, hidden=hidden, act=act, dropout=0.0)
-    if mode == "finetune" and FREEZE_N > 0:
-        _freeze_n_linear(model, FREEZE_N)
+    if mode == "finetune" and RETRAIN_FREEZE_N > 0:
+        _freeze_n_linear(model, RETRAIN_FREEZE_N)
 
     ds = TensorDataset(torch.from_numpy(Xtr).float(), torch.from_numpy(Ytr).float().view(-1,1))
-    dl = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=False)
-    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=weight_decay)
+    dl = DataLoader(ds, batch_size=int(batch), shuffle=True, drop_last=False)
+    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=float(lr), weight_decay=float(weight_decay))
     loss_fn = _loss_fn(loss_name)
     model = model.to(device)
 
-    for _ in range(max(1, WARM_EPOCHS)):
+    for _ in range(max(1, RETRAIN_WARM_EPOCHS)):
         model.train()
         for xb, yb in dl:
             xb, yb = xb.to(device), yb.to(device)
@@ -180,132 +172,132 @@ def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: s
 
 def main():
     touch_ready("retrain", pod_name)
+    stop_probe = start_probe("retrain")
+    t0_wall = time.time()
 
-    # 1) Latest window
     try:
-        arr = load_np(f"{RESULT_DIR}/latest_batch.npy")
-    except Exception as e:
-        print(f"[retrain] latest_batch.npy not found: {e}")
-        return
-
-    # 2) Grid source: flag written by monitor
-    grid_letter = _read_grid_flag()
-
-    feat_names = load_selected_feats()
-    scaler = load_scaler()
-    # Read column names
-    try:
-        raw = s3.get_object(Bucket=BUCKET, Key=f"{RESULT_DIR}/latest_batch.columns.json")["Body"].read()
-        cols = (raw and __import__("json").loads(raw.decode())) or None
-    except Exception:
-        cols = None
-
-    X, y = _split_xy(arr, cols, feat_names)
-    if y is None:
-        save_bytes(f"{RESULT_DIR}/retrain_skipped_no_labels.flag", b"", "text/plain")
-        log_metric(component="retrain", event="skipped", train_rows=int(X.shape[0]))
-        sync_all_metrics_to_minio(); write_kfp_metadata()
-        return
-
-    Xs = scaler.transform(X.astype(np.float32))
-    n = len(Xs)
-    idx = np.random.permutation(n)
-    val_n = max(1, int(n * VAL_FRAC))
-    va_idx, tr_idx = idx[:val_n], idx[val_n:]
-    Xtr, Ytr = Xs[tr_idx], y[tr_idx]
-    Xva, Yva = Xs[va_idx], y[va_idx]
-    in_dim = Xs.shape[1]
-
-    # Baseline metrics
-    baseline_model, _ = load_model_by_key("baseline_model.pt")
-    baseline_model.eval().to(device)
-    with torch.no_grad():
-        pb = baseline_model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
-    base_mae, base_rmse, base_acc_thr, base_acc15 = _eval_metrics(Yva, pb)
-
-    # Current latest (for finetune check)
-    latest = read_latest()
-    current_model_for_ft = None
-    current_hidden = None
-    if latest:
-        model_key, _, _ = latest
         try:
-            m, _ = load_model_by_key(model_key)
-            current_model_for_ft = m
-            current_hidden = _hidden_of(m)
+            arr = load_np(f"{RESULT_DIR}/latest_batch.npy")
+        except Exception as e:
+            print(f"[retrain] latest_batch.npy not found: {e}")
+            return
+
+        grid_letter = _read_grid_flag()
+        feat_names = load_selected_feats()
+        scaler = load_scaler()
+        try:
+            raw = s3.get_object(Bucket=BUCKET, Key=f"{RESULT_DIR}/latest_batch.columns.json")["Body"].read()
+            cols = (raw and __import__("json").loads(raw.decode())) or None
         except Exception:
-            pass
+            cols = None
 
-    grids = abc_grids(current_hidden)
-    G = grids.get(grid_letter, grids["B"])
+        X, y = _split_xy(arr, cols, feat_names)
+        if y is None:
+            save_bytes(f"{RESULT_DIR}/retrain_skipped_no_labels.flag", b"", "text/plain")
+            log_metric(component="retrain", event="skipped", train_rows=int(X.shape[0]))
+            sync_all_metrics_to_minio(); write_kfp_metadata()
+            return
 
-    combos = list(product(G["learning_rate"], G["batch_size"], G["hidden_layers"],
-                          G["activation"], G["loss"], G["wd"]))
-    print(f"[retrain] grid={grid_letter} candidates={len(combos)}")
+        Xs = scaler.transform(X.astype(np.float32))
+        n = len(Xs)
+        idx = np.random.permutation(n)
+        val_n = max(1, int(n * float(RETRAIN_VAL_FRAC)))
+        va_idx, tr_idx = idx[:val_n], idx[val_n:]
+        Xtr, Ytr = Xs[tr_idx], y[tr_idx]
+        Xva, Yva = Xs[va_idx], y[va_idx]
+        in_dim = Xs.shape[1]
 
-    # Warm scoring
-    scores = []
-    for lr, bs, hid, act, loss_name, wd in combos:
-        hid_t = tuple(hid)
-        if RETRAIN_MODE == "scratch":
-            mode = "scratch"; base_for_ft = None
-        elif RETRAIN_MODE == "finetune":
-            mode = "finetune" if (current_model_for_ft and _can_finetune(current_model_for_ft, hid_t, act)) else "scratch"
-            base_for_ft = current_model_for_ft if mode == "finetune" else None
-        else:
-            mode = "finetune" if (current_model_for_ft and _can_finetune(current_model_for_ft, hid_t, act)) else "scratch"
-            base_for_ft = current_model_for_ft if mode == "finetune" else None
-        rmse = _warm_score(Xtr, Ytr, Xva, Yva, in_dim, hid_t, act, float(lr), int(bs), str(loss_name), float(wd), mode, base_for_ft)
-        scores.append(((lr, bs, hid_t, act, loss_name, wd, mode), rmse))
+        # baseline 评估（做维度对齐）
+        baseline_model, _ = load_model_by_key("baseline_model.pt")
+        baseline_model.eval().to(device)
+        baseline_in_dim = baseline_model.net[0].in_features
+        Xva_b = _align_to_dim(Xva, baseline_in_dim)
+        with torch.no_grad():
+            pb = baseline_model(torch.from_numpy(Xva_b).float().to(device)).cpu().numpy().ravel()
+        base_mae, base_rmse, base_acc_thr, base_acc15 = _eval_metrics(Yva, pb)
 
-    scores.sort(key=lambda x: x[1])
-    topk = int(G.get("topk", 2))
-    finalists = scores[:topk]
+        # current 作为 finetune 起点（若结构匹配）
+        latest = read_latest()
+        current_model_for_ft = None
+        current_hidden = None
+        if latest:
+            model_key, _, _ = latest
+            try:
+                m, _ = load_model_by_key(model_key)
+                current_model_for_ft = m
+                current_hidden = _hidden_of(m)
+            except Exception:
+                pass
 
-    best_model = None; best_metrics = None; best_cfg = None
-    for (lr, bs, hid, act, loss_name, wd, mode), _ in finalists:
-        base_for_ft = current_model_for_ft if (mode == "finetune") else None
-        mdl, mets = _train_one(Xtr, Ytr, Xva, Yva, in_dim, hid, act, float(lr), int(bs), str(loss_name), float(wd), mode, base_for_ft)
-        if (best_metrics is None) or (mets["rmse"] < best_metrics["rmse"] - 1e-9):
-            best_model, best_metrics, best_cfg = mdl, mets, {
-                "lr": lr, "batch_size": bs, "hidden_layers": list(hid),
-                "activation": act, "loss": loss_name, "wd": wd, "mode": mode,
-            }
+        grids = abc_grids(current_hidden)
+        G = grids.get(grid_letter, grids["B"])
 
-    # Save latest & retrain_done.flag
-    buf = io.BytesIO(); torch.save(best_model.to("cpu"), buf)
-    model_bytes = buf.getvalue()
-    model_mb = round(len(model_bytes) / (1024*1024), 4)
-    ts = int(time.time())
+        combos = list(product(G["learning_rate"], G["batch_size"], G["hidden_layers"],
+                              G["activation"], G["loss"], G["wd"]))
+        print(f"[retrain] grid={grid_letter} candidates={len(combos)}")
 
-    # Compose metrics (both @ACC_THR and @0.15 for backward compatibility)
-    metrics = {
-        f"acc@{_thr_str}": best_metrics[f"acc@{_thr_str}"],
-        "acc@0.15": best_metrics["acc@0.15"],
-        f"baseline_acc@{_thr_str}": base_acc_thr,
-        "baseline_acc@0.15": base_acc15,
-        "mae": best_metrics["mae"], "rmse": best_metrics["rmse"],
-        "baseline_mae": base_mae, "baseline_rmse": base_rmse,
-        "train_rows": int(len(tr_idx)), "val_rows": int(len(va_idx)),
-        "model_size_mb": model_mb,
-        "grid": grid_letter,
-        **best_cfg,
-    }
+        scores = []
+        for lr, bs, hid, act, loss_name, wd in combos:
+            hid_t = tuple(hid)
+            if RETRAIN_MODE == "scratch":
+                mode = "scratch"; base_for_ft = None
+            elif RETRAIN_MODE == "finetune":
+                mode = "finetune" if (current_model_for_ft and _can_finetune(current_model_for_ft, hid_t, act)) else "scratch"
+                base_for_ft = current_model_for_ft if mode == "finetune" else None
+            else:
+                mode = "finetune" if (current_model_for_ft and _can_finetune(current_model_for_ft, hid_t, act)) else "scratch"
+                base_for_ft = current_model_for_ft if mode == "finetune" else None
+            rmse = _warm_score(Xtr, Ytr, Xva, Yva, in_dim, hid_t, act, float(lr), int(bs), str(loss_name), float(wd), mode, base_for_ft)
+            scores.append(((lr, bs, hid_t, act, loss_name, wd, mode), rmse))
 
-    write_latest(model_bytes, metrics, model_key=f"model_{ts}.pt", metrics_key=f"metrics_{ts}.json")
-    save_bytes(f"{RESULT_DIR}/retrain_done.flag", f"ts={ts}\n".encode(), "text/plain")
+        scores.sort(key=lambda x: x[1])
+        topk = int(G.get("topk", 2))
+        finalists = scores[:topk]
 
-    log_metric(component="retrain", event="summary",
-               train_rows=int(len(tr_idx)), mae=metrics["mae"], rmse=metrics["rmse"],
-               **{f"accuracy@{_thr_str}": metrics[f"acc@{_thr_str}"]},
-               model_size_mb=model_mb, grid=grid_letter,
-               lr=best_cfg["lr"], batch_size=best_cfg["batch_size"],
-               loss=best_cfg["loss"], activation=best_cfg["activation"])
+        best_model = None; best_metrics = None; best_cfg = None
+        for (lr, bs, hid, act, loss_name, wd, mode), _ in finalists:
+            base_for_ft = current_model_for_ft if (mode == "finetune") else None
+            mdl, mets = _train_one(Xtr, Ytr, Xva, Yva, in_dim, tuple(hid), act, float(lr), int(bs), str(loss_name), float(wd), mode, base_for_ft)
+            if (best_metrics is None) or (mets["rmse"] < best_metrics["rmse"] - 1e-9):
+                best_model, best_metrics, best_cfg = mdl, mets, {
+                    "lr": lr, "batch_size": bs, "hidden_layers": list(hid),
+                    "activation": act, "loss": loss_name, "wd": wd, "mode": mode,
+                }
 
-    sync_all_metrics_to_minio(); write_kfp_metadata()
-    print(f"[retrain] done. grid={grid_letter} mode={best_cfg['mode']} "
-          f"rmse={metrics['rmse']:.4f} acc@{_thr_str}={metrics[f'acc@{_thr_str}']:.4f} "
-          f"(baseline rmse={base_rmse:.4f} acc@{_thr_str}={base_acc_thr:.4f})")
+        buf = io.BytesIO(); torch.save(best_model.to("cpu"), buf)
+        model_bytes = buf.getvalue()
+        model_mb = round(len(model_bytes) / (1024*1024), 4)
+        ts = int(time.time())
 
-if __name__ == "__main__":
-    main()
+        train_secs = round(time.time() - t0_wall, 3)
+
+        metrics = {
+            f"acc@{_thr_str}": best_metrics[f"acc@{_thr_str}"],
+            "acc@0.15": best_metrics["acc@0.15"],
+            f"baseline_acc@{_thr_str}": base_acc_thr,
+            "baseline_acc@0.15": base_acc15,
+            "mae": best_metrics["mae"], "rmse": best_metrics["rmse"],
+            "baseline_mae": base_mae, "baseline_rmse": base_rmse,
+            "train_rows": int(len(tr_idx)), "val_rows": int(len(va_idx)),
+            "model_size_mb": model_mb,
+            "grid": grid_letter, "retrain_wall_s": train_secs,
+            **best_cfg,
+        }
+
+        write_latest(model_bytes, metrics, model_key=f"model_{ts}.pt", metrics_key=f"metrics_{ts}.json")
+        save_bytes(f"{RESULT_DIR}/retrain_done.flag", f"ts={ts}\n".encode(), "text/plain")
+
+        log_metric(component="retrain", event="summary",
+                   train_rows=int(len(tr_idx)), mae=metrics["mae"], rmse=metrics["rmse"],
+                   **{f"accuracy@{_thr_str}": metrics[f"acc@{_thr_str}"]},
+                   model_size_mb=model_mb, grid=grid_letter, retrain_wall_s=train_secs,
+                   lr=best_cfg["lr"], batch_size=best_cfg["batch_size"],
+                   loss=best_cfg["loss"], activation=best_cfg["activation"])
+
+        sync_all_metrics_to_minio(); write_kfp_metadata()
+        print(f"[retrain] done. grid={grid_letter} mode={best_cfg['mode']} "
+              f"rmse={metrics['rmse']:.4f} acc@{_thr_str}={metrics[f'acc@{_thr_str}']:.4f} "
+              f"(baseline rmse={base_rmse:.4f} acc@{_thr_str}={base_acc_thr:.4f}) "
+              f"wall={train_secs:.3f}s")
+    finally:
+        stop_probe()

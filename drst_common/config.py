@@ -1,135 +1,120 @@
-import os
-from typing import Optional, List, Dict, Tuple
+#!/usr/bin/env python3
+# drst_common/config.py
+from __future__ import annotations
+from typing import Dict, List
 
-def _to_bool(s: str | None, default: bool = True) -> bool:
-    if s is None:
-        return default
-    return str(s).strip().lower() in ("1", "true", "yes", "on")
+# ===== MinIO / S3 =====
+MINIO_ACCESS_MODE = "cluster"
+MINIO_SCHEME      = "http"
+MINIO_ENDPOINT    = "minio-service.kubeflow.svc.cluster.local:9000"
+BUCKET            = "onvm-demo2"
 
-# MinIO
-MINIO_ACCESS_MODE = os.getenv("MINIO_ACCESS_MODE", "ingress").lower()
-_INGRESS_DEFAULT = "minio.45.149.207.13.nip.io:30080"
-_CLUSTER_DEFAULT = "minio-service.kubeflow.svc.cluster.local:9000"
+# 目录前缀
+MODEL_DIR  = "models"
+RESULT_DIR = "results"
+DATA_DIR   = "datasets"
 
-ENDPOINT = os.getenv("MINIO_API_ENDPOINT") or os.getenv(
-    "MINIO_ENDPOINT",
-    _INGRESS_DEFAULT if MINIO_ACCESS_MODE == "ingress" else _CLUSTER_DEFAULT
-)
-MINIO_SCHEME = os.getenv("MINIO_SCHEME", "http").lower()
-MINIO_VERIFY_SSL = _to_bool(os.getenv("MINIO_VERIFY_SSL", "true"), default=True)
+# ===== Kafka =====
+KAFKA_SERVERS = "kafka.default.svc.cluster.local:9092"
+KAFKA_TOPIC   = "latencyTopic"
 
-ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
-SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
-BUCKET     = os.getenv("MINIO_BUCKET",     "onvm-demo2")
-MINIO_CONSOLE_URL = os.getenv("MINIO_CONSOLE_URL", "http://minio.45.149.207.13.nip.io:30080/")
+# ===== 特征/训练（离线）=====
+FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"   # 用于派生完整 60 维 FEATURE_COLS 的“真理源”
+EXCLUDE_COLS    = ["Unnamed: 0", "input_rate", "latency"]
+TARGET_COL      = "output_rate"
+OFFLINE_TOPK    = 10
+ACC_THR         = 0.25
 
-# Kafka
-KAFKA_TOPIC        = os.getenv("KAFKA_TOPIC", "latencyTopic")
-KAFKA_SERVERS      = os.getenv("KAFKA_SERVERS", "kafka.default.svc.cluster.local:9092").split(",")
-AUTO_OFFSET_RESET  = os.getenv("AUTO_OFFSET_RESET", "latest")
-ENABLE_AUTO_COMMIT = _to_bool(os.getenv("ENABLE_AUTO_COMMIT", "true"), default=True)
-BATCH_SIZE         = int(os.getenv("BATCH_SIZE", "5"))
-CONSUME_IDLE_S     = int(os.getenv("CONSUME_IDLE_S", "5"))
+# ===== 批大小（逐条推理）=====
+BATCH_SIZE = 1  # producer / consumer 同步读取
 
-# Project paths
-DATA_DIR   = os.getenv("DATA_DIR",   "datasets")
-MODEL_DIR  = os.getenv("MODEL_DIR",  "models")
-RESULT_DIR = os.getenv("RESULT_DIR", "results")
+# ===== Consumer 行为（在线推理）=====
+CONSUME_IDLE_S     = 300     # 无数据超时退出
+RELOAD_INTERVAL_S  = 30      # 热更新探测周期（秒）
+INFER_STDOUT_EVERY = 1       # 每处理几批打印一行
+GAIN_THR_PP        = 0.01    # 新模型相对 baseline 的提升阈值（百分点）
+RETRAIN_TOPIC      = KAFKA_TOPIC + "_infer_count"
 
-# Feature schema
-FEATURE_SRC_KEY = os.getenv("FEATURE_SRC_KEY", f"{DATA_DIR}/combined.csv")
-
-# Metrics threshold
-ACC_THR = float(os.getenv("ACC_THR", "0.25"))
-
-# Columns
-TARGET_COL   = os.getenv("TARGET_COL", "output_rate")
-EXCLUDE_COLS = ["Unnamed: 0", "input_rate", "latency"]
-
-# Drift
-DRIFT_WINDOW = int(os.getenv("DRIFT_WINDOW", "300"))
-EVAL_STRIDE  = int(os.getenv("EVAL_STRIDE",  "50"))
-
-# Producer timing
-PRODUCE_INTERVAL_MS = int(os.getenv("PRODUCE_INTERVAL_MS", "100"))
-
-# Offline train/eval policy
-OFFLINE_TRAIN_KEY = os.getenv("OFFLINE_TRAIN_KEY", f"{DATA_DIR}/combined.csv")
-OFFLINE_EVAL_SOURCE_KEY = os.getenv("OFFLINE_EVAL_SOURCE_KEY", OFFLINE_TRAIN_KEY)
-OFFLINE_EVAL_ROWS  = int(os.getenv("OFFLINE_EVAL_ROWS", "500"))
-OFFLINE_EVAL_TAKE  = os.getenv("OFFLINE_EVAL_TAKE", "random").lower()
-OFFLINE_EVAL_SEED  = int(os.getenv("OFFLINE_EVAL_SEED", "42"))
-
-# Producer stages (rich form): {"key":..., "rows":..., "take": head|tail|random, "seed": optional}
-def _parse_legacy_env_to_rich() -> List[Dict]:
-    raw = os.getenv("PRODUCER_STAGES", "").strip()
-    out: List[Dict] = []
-    if not raw:
-        return out
-    for chunk in [c.strip() for c in raw.split(",") if c.strip()]:
-        if ":" not in chunk:
-            continue
-        k, n = chunk.split(":", 1)
-        try:
-            out.append({"key": k.strip(), "rows": int(n.strip()), "take": "head"})
-        except ValueError:
-            pass
-    return out
-
-PRODUCER_STAGES: List[Dict] = [
-    {"key": f"{DATA_DIR}/combined.csv",                               "rows": 500,  "take": "tail"},
-    {"key": f"{DATA_DIR}/random_rates.csv",                           "rows": 1000, "take": "head"},
-    {"key": f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv","rows": 1000, "take": "head"},
+# ===== Producer 行为 =====
+PRODUCE_INTERVAL_MS     = 100
+PRODUCER_PARTITION_MODE = "rr"  # "auto" | "rr" | "hash"
+MANIFEST_KEY            = f"{DATA_DIR}/online/manifest.json"
+PRODUCER_STAGES: List[dict] = [
+    {"key": f"{DATA_DIR}/combined.csv",     "rows": 1000, "take": "head"},
+    {"key": f"{DATA_DIR}/random_rates.csv", "rows": 1000, "take": "head"},
 ]
 
-try:
-    import json as _json
-    _ps_json = os.getenv("PRODUCER_STAGES_JSON", "").strip()
-    if _ps_json:
-        maybe = _json.loads(_ps_json)
-        if isinstance(maybe, list) and maybe:
-            PRODUCER_STAGES = maybe
-    elif os.getenv("PRODUCER_STAGES"):
-        legacy = _parse_legacy_env_to_rich()
-        if legacy:
-            PRODUCER_STAGES = legacy
-except Exception:
-    pass
+# ===== 漂移监控窗口 =====
+DRIFT_WINDOW = 300
+EVAL_STRIDE  = 50
 
-# Retrain thresholds
-RETRAIN_JS_NO_RETRAIN = float(os.getenv("RETRAIN_JS_NO_RETRAIN", "0.40"))
-RETRAIN_JS_GRID_A     = float(os.getenv("RETRAIN_JS_GRID_A",     "0.60"))
-RETRAIN_JS_GRID_B     = float(os.getenv("RETRAIN_JS_GRID_B",     "0.75"))
+# ===== Offline 训练控制 =====
+TRAIN_TRIGGER     = 1
+OFFLINE_TRAIN_KEY = f"{DATA_DIR}/combined.csv"
 
-# ABC grids
-def abc_grids(current_hidden: Optional[List[int]] = None) -> Dict[str, Dict[str, list]]:
-    base_hidden = tuple(current_hidden or [128, 64, 32])
+FAST_MAX_EPOCH  = 10
+FAST_PATIENCE   = 4
+FAST_LR         = 1e-3
+FAST_BS         = 64
+
+FULL_MAX_EPOCH  = 100
+FULL_PATIENCE   = 10
+FULL_LR         = 1e-3
+FULL_BS         = 16
+
+# ===== Retrain（明文，不读环境变量）=====
+RETRAIN_WARM_EPOCHS    = 3
+RETRAIN_EPOCHS_FULL    = 8
+RETRAIN_EARLY_PATIENCE = 2
+RETRAIN_MODE           = "auto"   # "scratch" | "finetune" | "auto"
+RETRAIN_FREEZE_N       = 0        # finetune 时可冻结前 N 个 Linear
+RETRAIN_VAL_FRAC       = 0.2
+
+# ===== 动态重训网格（保持原样）=====
+def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
+    def uniq_layers(cands: List[List[int]]) -> List[List[int]]:
+        seen = set(); out = []
+        for h in cands:
+            k = tuple(h)
+            if k in seen: continue
+            seen.add(k); out.append(h)
+        return out
+
+    base_small  = [[32, 16], [64, 32]]
+    base_medium = [[64, 32], [96, 48], [128, 64]]
+    base_large  = [[128, 64], [160, 80], [192, 96]]
+
+    if current_hidden and isinstance(current_hidden, list) and len(current_hidden) > 0:
+        base_small  = uniq_layers([current_hidden] + base_small)
+        base_medium = uniq_layers([current_hidden] + base_medium)
+        base_large  = uniq_layers([current_hidden] + base_large)
+
     return {
         "A": {
-            "learning_rate": [1e-3, 5e-4, 1e-4],
-            "batch_size": [16, 32],
-            "hidden_layers": [base_hidden],
-            "activation": ["relu"],
-            "loss": ["mse"],
-            "wd": [0.0],
-            "topk": 1,
+            "learning_rate": [5e-4, 1e-3],
+            "batch_size":    [32, 64],
+            "hidden_layers": base_small,
+            "activation":    ["relu"],
+            "loss":          ["smoothl1"],
+            "wd":            [0.0],
+            "topk":          1,
         },
         "B": {
-            "learning_rate": [1e-3, 5e-4],
-            "batch_size": [16, 32],
-            "hidden_layers": [(64, 32), (128, 64, 32)],
-            "activation": ["relu", "tanh"],
-            "loss": ["mse"],
-            "wd": [0.0],
-            "topk": 2,
+            "learning_rate": [5e-4, 1e-3],
+            "batch_size":    [32, 64, 128],
+            "hidden_layers": base_medium,
+            "activation":    ["relu", "gelu"],
+            "loss":          ["smoothl1", "mse"],
+            "wd":            [0.0, 1e-5],
+            "topk":          2,
         },
         "C": {
-            "learning_rate": [1e-2, 1e-3],
-            "batch_size": [16, 32, 64],
-            "hidden_layers": [(256, 128, 64), (128, 128, 64, 32)],
-            "activation": ["relu", "gelu"],
-            "loss": ["huber", "mse"],
-            "wd": [0.0, 1e-3],
-            "topk": 3,
+            "learning_rate": [3e-4, 5e-4, 1e-3],
+            "batch_size":    [64, 128],
+            "hidden_layers": base_large,
+            "activation":    ["relu", "gelu"],
+            "loss":          ["smoothl1", "mse"],
+            "wd":            [0.0, 1e-5],
+            "topk":          2,
         },
     }

@@ -31,15 +31,12 @@ WORKDIR /app
 # 共享代码（尽量稳定，减少重建）
 COPY drst_common ./drst_common
 COPY requirements.txt ./requirements.txt
-# 如需把本地包安装成可编辑包，可在这里 pip install -e .
-# 但通常我们直接靠 PYTHONPATH=/app + 包内 __init__.py 即可。
 
 ######## 2) 各组件镜像（只拷贝自身代码） ########
 
 # 2.1 offline
 FROM base AS offline
 COPY drst_inference/offline ./drst_inference/offline
-# 若离线训练需要本地样例数据，可一并拷贝（可选）
 COPY datasets ./datasets
 CMD ["bash","-lc","python -V && echo offline image ready"]
 
@@ -62,4 +59,6 @@ CMD ["bash","-lc","python -V && echo infer image ready"]
 # 2.5 plot
 FROM base AS plot
 COPY drst_inference/plotting ./drst_inference/plotting
+# 新增：把资源汇总脚本也打进镜像（放在 /app/experiments 下）
+COPY experiments/kubeflow/summarize_resources.py ./experiments/summarize_resources.py
 CMD ["bash","-lc","python -V && echo plot image ready"]
