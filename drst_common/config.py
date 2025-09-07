@@ -1,48 +1,39 @@
 #!/usr/bin/env python3
-# drst_common/config.py
 from __future__ import annotations
 from typing import Dict, List
 
-# ===== MinIO / S3 =====
 MINIO_ACCESS_MODE = "cluster"
 MINIO_SCHEME      = "http"
 MINIO_ENDPOINT    = "minio-service.kubeflow.svc.cluster.local:9000"
 BUCKET            = "onvm-demo2"
 
-# 目录前缀
 MODEL_DIR  = "models"
 RESULT_DIR = "results"
 DATA_DIR   = "datasets"
 
-# ===== Kafka =====
 KAFKA_SERVERS = "kafka.default.svc.cluster.local:9092"
 KAFKA_TOPIC   = "latencyTopic"
 
-# ===== 特征/训练（离线）=====
-FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"   # 自举特征全集
+FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"
 EXCLUDE_COLS    = ["Unnamed: 0", "input_rate", "latency"]
 TARGET_COL      = "output_rate"
 OFFLINE_TOPK    = 10
 ACC_THR         = 0.25
 
-# ===== 批大小（逐条推理）=====
 BATCH_SIZE = 1
 
-# ===== Consumer 行为（在线推理）=====
 CONSUME_IDLE_S     = 300
 RELOAD_INTERVAL_S  = 30
 INFER_STDOUT_EVERY = 1
 GAIN_THR_PP        = 0.01
 RETRAIN_TOPIC      = KAFKA_TOPIC + "_infer_count"
 
-# ===== Producer 行为（全部放这里）=====
 PRODUCE_INTERVAL_MS     = 100
-PRODUCER_PARTITION_MODE = "rr"  # "auto" | "rr" | "hash"
+PRODUCER_PARTITION_MODE = "rr"
 
-# 每个阶段的行数统一由配置给出；也可用同名 env 或 PRODUCER_STAGES(JSON) 覆盖
-PRODUCER_BRIDGE_N = 500   # Stage1: combined 尾部
-PRODUCER_RAND_N   = 1000  # Stage2: random_rates 头部
-PRODUCER_STIM_N   = 1000  # Stage3: resource_stimulus… 头部
+PRODUCER_BRIDGE_N = 500
+PRODUCER_RAND_N   = 1000
+PRODUCER_STIM_N   = 1000
 
 PRODUCER_STAGES: List[dict] = [
     {"key": f"{DATA_DIR}/combined.csv",     "take": "tail", "rows": PRODUCER_BRIDGE_N},
@@ -50,11 +41,9 @@ PRODUCER_STAGES: List[dict] = [
     {"key": f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv", "take": "head", "rows": PRODUCER_STIM_N},
 ]
 
-# ===== 漂移监控窗口 =====
 DRIFT_WINDOW = 300
 EVAL_STRIDE  = 50
 
-# ===== Offline 训练控制 =====
 TRAIN_TRIGGER     = 1
 OFFLINE_TRAIN_KEY = f"{DATA_DIR}/combined.csv"
 
@@ -68,15 +57,27 @@ FULL_PATIENCE   = 10
 FULL_LR         = 1e-3
 FULL_BS         = 16
 
-# ===== Retrain（明文，不读环境变量）=====
 RETRAIN_WARM_EPOCHS    = 3
 RETRAIN_EPOCHS_FULL    = 8
 RETRAIN_EARLY_PATIENCE = 2
-RETRAIN_MODE           = "auto"   # "scratch" | "finetune" | "auto"
+RETRAIN_MODE           = "auto"
 RETRAIN_FREEZE_N       = 0
 RETRAIN_VAL_FRAC       = 0.2
 
-# ===== 动态重训网格（保留原样）=====
+PRODUCER_TPS = 5
+PRODUCER_JITTER_MS = 0
+
+MONITOR_WAIT_RETRAIN = False # True
+MONITOR_IDLE_TIMEOUT_S = 60
+MAX_WALL_SECS = 480
+
+HIST_BINS = 64
+JS_THR_A = 0.40
+JS_THR_B = 0.60
+JS_THR_C = 0.75
+
+WAIT_FEATURES_SECS = 120
+
 def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
     def uniq_layers(cands: List[List[int]]) -> List[List[int]]:
         seen = set(); out = []

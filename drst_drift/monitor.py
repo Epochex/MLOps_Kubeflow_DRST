@@ -1,257 +1,265 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, json, time, queue, threading
-from collections import deque
-from typing import List, Tuple, Optional, Dict
-
+import os, sys, time, io, json, random, collections
+from typing import Deque, Optional, List, Tuple
 import numpy as np
 
-from drst_common.config import (
-    KAFKA_TOPIC, RESULT_DIR, TARGET_COL, BUCKET, MODEL_DIR
-)
-from drst_common.kafka_io import create_consumer, SENTINEL_HEADER_KEY, SENTINEL_HEADER_VAL, SENTINEL_FALLBACK_VALUE
-from drst_common.runtime import touch_ready, write_kfp_metadata
+from drst_common.kafka_io import create_consumer, is_sentinel, partitions_for_topic
+from drst_common.minio_helper import s3, save_bytes
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
-from drst_common.minio_helper import save_np, save_bytes, s3
 from drst_common.resource_probe import start as start_probe
-from drst_common.utils import jensen_shannon_divergence, make_prob_hist
+from drst_common.config import (
+    BUCKET, MODEL_DIR, RESULT_DIR, KAFKA_TOPIC, TARGET_COL,
+    DRIFT_WINDOW, EVAL_STRIDE, HIST_BINS,
+    JS_THR_A, JS_THR_B, JS_THR_C,
+    MONITOR_WAIT_RETRAIN, MONITOR_IDLE_TIMEOUT_S, MAX_WALL_SECS,
+    WAIT_FEATURES_SECS
+)
 
-# ===== 你的设计：固定窗口/步长/阈值（无需额外 export）=====
-DRIFT_WINDOW   = 300          # 窗口大小
-EVAL_STRIDE    = 50           # 每进来 50 条评一次
-JS_THR_A       = 0.40         # <0.40 不重训；[0.40,0.60) 用 A
-JS_THR_B       = 0.60         # [0.60,0.75) 用 B
-JS_THR_C       = 0.75         # ≥0.75    用 C
-HIST_BINS      = 64
-IDLE_TIMEOUT_S = 60
-BASELINE_REFRESH_MODE = "on_retrain"  # 重训后用当前窗口刷新基线，便于后续收敛
+RUN_TAG = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
+TOPIC   = os.getenv("KAFKA_TOPIC", KAFKA_TOPIC)
 
-pod_name = os.getenv("HOSTNAME", "monitor")
+LOCK_KEY  = f"{RESULT_DIR}/retrain_lock.flag"
+GRID_KEY  = f"{RESULT_DIR}/retrain_grid.flag"
+BATCH_KEY = f"{RESULT_DIR}/latest_batch.npy"
+COLS_KEY  = f"{RESULT_DIR}/latest_batch.columns.json"
+DONE_KEY  = f"{RESULT_DIR}/retrain_done.flag"
 
-def _make_run_tag() -> str:
-    for k in ("KFP_RUN_ID", "WORKFLOW_ID", "PIPELINE_RUN_ID", "POD_NAME", "HOSTNAME"):
-        v = os.getenv(k)
-        if v: return v
-    return str(int(time.time()))
-RUN_TAG   = _make_run_tag()
-GROUP_ID  = f"cg-monitor-{RUN_TAG}"
-
-q_data = queue.Queue()
-data_partitions = 0
-data_sentinel_seen = 0
-sentinel_lock = threading.Lock()
-
-def _load_feature_cols() -> List[str]:
-    obj = s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/feature_cols.json")
-    cols = json.loads(obj["Body"].read().decode())
-    if not isinstance(cols, list) or not cols:
-        raise RuntimeError("feature_cols.json invalid")
-    return [str(c) for c in cols]
-
-FEATURE_COLS = _load_feature_cols()
-
-baseline_buf: deque[np.ndarray] = deque(maxlen=DRIFT_WINDOW)
-baseline_ready = False
-window_buf:   deque[np.ndarray] = deque(maxlen=DRIFT_WINDOW)
-label_buf:    deque[float]      = deque(maxlen=DRIFT_WINDOW)
-_hist_range_per_feat: Optional[List[Tuple[float,float]]] = None
-
-retrain_in_progress = False
-lock_started_ts = 0.0
-
-def _features_from_msg(msg) -> Tuple[np.ndarray, Optional[float]]:
-    feats = []
-    fdict = msg.get("features", None)
-    # 兼容扁平字典（producer 当前就是扁平）
-    if not isinstance(fdict, dict):
-        fdict = msg
-    for c in FEATURE_COLS:
-        try:
-            v = float(fdict.get(c, 0.0))
-        except Exception:
-            v = 0.0
-        feats.append(v)
-    y = msg.get(TARGET_COL, None)
-    try: y = float(y) if y is not None else None
-    except Exception: y = None
-    return np.asarray(feats, dtype=np.float32), y
-
-def _init_hist_ranges(baseline_arr: np.ndarray) -> None:
-    global _hist_range_per_feat
-    d = baseline_arr.shape[1]
-    _hist_range_per_feat = []
-    for j in range(d):
-        mn = float(np.min(baseline_arr[:, j])); mx = float(np.max(baseline_arr[:, j]))
-        if mn == mx:
-            eps = (abs(mn) * 1e-6) or 1e-6
-            mn, mx = mn - eps, mx + eps
-        _hist_range_per_feat.append((mn, mx))
-
-def _compute_js(baseline_arr: np.ndarray, window_arr: np.ndarray) -> float:
-    assert _hist_range_per_feat is not None
-    vals = []
-    for j, rng in enumerate(_hist_range_per_feat):
-        p = make_prob_hist(baseline_arr[:, j], bins=HIST_BINS, range=rng)
-        q = make_prob_hist(window_arr[:, j],   bins=HIST_BINS, range=rng)
-        vals.append(jensen_shannon_divergence(p, q))
-    return float(np.mean(vals))
-
-def _save_latest_batch(X: np.ndarray, y: Optional[np.ndarray]):
-    cols = list(FEATURE_COLS)
-    if y is not None:
-        arr = np.concatenate([X, y.reshape(-1,1)], axis=1)
-        cols.append(TARGET_COL)
-    else:
-        arr = X
-    save_np(f"{RESULT_DIR}/latest_batch.npy", arr)
-    save_bytes(f"{RESULT_DIR}/latest_batch.columns.json", json.dumps(cols, ensure_ascii=False, indent=2).encode(), "application/json")
-
-def _grid_letter(js_val: float) -> str | None:
-    # 固定阈值：<A 不重训；落入 [A,B)→A；[B,C)→B；≥C→C
-    if js_val < JS_THR_A: return None
-    if js_val < JS_THR_B: return "A"
-    if js_val < JS_THR_C: return "B"
-    return "C"
-
-def _retrain_done_after(ts0: float) -> bool:
-    key = f"{RESULT_DIR}/retrain_done.flag"
+def _exists(key:str)->bool:
     try:
-        meta = s3.head_object(Bucket=BUCKET, Key=key)
-        return meta["LastModified"].timestamp() >= ts0
+        s3.head_object(Bucket=BUCKET, Key=key)
+        return True
     except Exception:
         return False
 
-def _is_sentinel_msg(msg) -> bool:
+def _last_modified_ts(key:str) -> Optional[float]:
     try:
-        for k, v in (msg.headers or []):
-            if k == SENTINEL_HEADER_KEY and v == SENTINEL_HEADER_VAL:
-                return True
+        meta = s3.head_object(Bucket=BUCKET, Key=key)
+        return meta["LastModified"].timestamp()
     except Exception:
-        pass
-    try:
-        if msg.value == SENTINEL_FALLBACK_VALUE:
-            return True
-    except Exception:
-        pass
-    try:
-        obj = json.loads(msg.value)
-        if isinstance(obj, dict) and obj.get("producer_done"):
-            return True
-    except Exception:
-        pass
-    return False
+        return None
 
-def _data_listener():
-    global data_partitions, data_sentinel_seen
-    cons = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
-    time.sleep(1.0)
-    # 直接用 assignment 的分区数
-    t0 = time.time()
-    while not cons.assignment() and time.time() - t0 < 10:
-        cons.poll(100)
-    data_partitions = max(1, len(cons.assignment()))
-    print(f"[monitor:{pod_name}] topic «{KAFKA_TOPIC}» partitions = {data_partitions}")
-    touch_ready("monitor", pod_name)
-    while True:
-        polled = cons.poll(timeout_ms=1000)
-        if not polled: continue
-        for _, recs in polled.items():
-            for msg in recs:
-                if _is_sentinel_msg(msg):
-                    with sentinel_lock:
-                        data_sentinel_seen += 1
-                        print(f"[monitor:{pod_name}] got sentinel {data_sentinel_seen}/{data_partitions}")
-                    continue
-                try:
-                    v = json.loads(msg.value)
-                    if not isinstance(v, dict): continue
-                    q_data.put(v)
-                except Exception:
-                    continue
+def _save_latest_batch(arr: np.ndarray, cols: List[str]):
+    with io.BytesIO() as f:
+        np.save(f, arr.astype(np.float32), allow_pickle=False)
+        save_bytes(BATCH_KEY, f.getvalue(), "application/octet-stream")
+    save_bytes(COLS_KEY, json.dumps(cols, ensure_ascii=False).encode("utf-8"), "application/json")
 
-threading.Thread(target=_data_listener, daemon=True).start()
+def _signal_retrain(grid: str):
+    save_bytes(LOCK_KEY, b"1\n", "text/plain")
+    save_bytes(GRID_KEY, grid.encode(), "text/plain")
 
-print(f"[monitor:{pod_name}] started…")
-last_data_time = time.time()
-stop_probe = start_probe("monitor")  # 资源采样
+def _retrain_done_after(ts0: float) -> bool:
+    ts = _last_modified_ts(DONE_KEY)
+    return (ts is not None) and (ts >= ts0)
 
-try:
-    while True:
-        # 解锁：等待 retrain 完成
-        if retrain_in_progress and _retrain_done_after(lock_started_ts):
-            retrain_in_progress = False
-            print(f"[monitor:{pod_name}] retrain done detected → unlock")
-            if BASELINE_REFRESH_MODE == "on_retrain":
-                try:
-                    X_win = np.vstack(window_buf) if len(window_buf) == DRIFT_WINDOW else None
-                    if X_win is not None and X_win.size > 0:
-                        baseline_buf.clear()
-                        for row in X_win: baseline_buf.append(row.copy())
-                        # 重置直方图范围
-                        _init_hist_ranges(np.vstack(baseline_buf))
-                        log_metric(component="monitor", event="baseline_refreshed")
-                        print(f"[monitor:{pod_name}] baseline refreshed")
-                except Exception as e:
-                    print(f"[monitor:{pod_name}] baseline refresh failed: {e}")
-
+def _load_feature_cols(wait_secs:int) -> List[str]:
+    key = f"{MODEL_DIR}/feature_cols.json"
+    deadline = time.time() + wait_secs
+    last_err = None
+    while time.time() < deadline:
         try:
-            rec = q_data.get(timeout=1.0)
-        except queue.Empty:
-            with sentinel_lock:
-                all_done = (data_sentinel_seen >= data_partitions) if data_partitions else False
-            if all_done and q_data.empty():
-                print(f"[monitor:{pod_name}] all sentinels seen; exit."); break
-            if (time.time() - last_data_time) > IDLE_TIMEOUT_S and baseline_ready:
-                print(f"[monitor:{pod_name}] idle >{IDLE_TIMEOUT_S}s; exit."); break
+            raw = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+            cols = json.loads(raw.decode("utf-8"))
+            if isinstance(cols, list) and cols:
+                return [str(c) for c in cols]
+        except Exception as e:
+            last_err = e
+        time.sleep(2)
+    raise RuntimeError(f"wait feature_cols.json timeout: {last_err}")
+
+def _parse_record(value_bytes: bytes, feat_cols: List[str]) -> Tuple[np.ndarray, Optional[float]]:
+    obj = json.loads(value_bytes.decode("utf-8"))
+    if isinstance(obj, dict) and isinstance(obj.get("features"), dict):
+        feats = obj["features"]
+        label_val = obj.get("label", obj.get(TARGET_COL))
+    else:
+        feats = obj if isinstance(obj, dict) else {}
+        label_val = (obj.get(TARGET_COL) if isinstance(obj, dict) else None)
+    vec = np.asarray([float(feats.get(c, 0.0)) for c in feat_cols], dtype=np.float32)
+    try:
+        y = float(label_val) if label_val is not None else None
+    except Exception:
+        y = None
+    return vec, y
+
+def _compute_js(baseline: np.ndarray, window: np.ndarray, bins:int) -> float:
+    eps = 1e-12
+    vals = []
+    for j in range(baseline.shape[1]):
+        a = baseline[:, j]; b = window[:, j]
+        lo = float(min(a.min(), b.min()))
+        hi = float(max(a.max(), b.max()))
+        if hi <= lo:
+            continue
+        P, _ = np.histogram(a, bins=bins, range=(lo, hi), density=True)
+        Q, _ = np.histogram(b, bins=bins, range=(lo, hi), density=True)
+        P = P.astype(np.float64) + eps
+        Q = Q.astype(np.float64) + eps
+        P /= P.sum(); Q /= Q.sum()
+        M = 0.5 * (P + Q)
+        kl_pm = float(np.sum(P * np.log(P / M)))
+        kl_qm = float(np.sum(Q * np.log(Q / M)))
+        js = 0.5 * (kl_pm + kl_qm)
+        vals.append(js)
+    return float(np.mean(vals)) if vals else 0.0
+
+def _poll_one(consumer, timeout_ms: int = 1000):
+    """统一的 poll 解包：返回按时间顺序的 ConsumerRecord 列表"""
+    polled = consumer.poll(timeout_ms=timeout_ms)
+    if not polled:
+        return []
+    out = []
+    for _tp, recs in polled.items():
+        if recs:
+            out.extend(recs)
+    return out
+
+def main():
+    pod = os.getenv("HOSTNAME", "monitor")
+    feat_cols = _load_feature_cols(WAIT_FEATURES_SECS)
+
+    consumer = create_consumer(TOPIC, group_id=f"cg-monitor-{RUN_TAG}")
+    parts = partitions_for_topic(TOPIC) or set()
+
+    print(f"[monitor:{pod}] started…", flush=True)
+    print(f"[monitor:{pod}] topic «{TOPIC}» partitions = {len(parts)}", flush=True)
+
+    stop_probe = start_probe("monitor")
+
+    baseline_feats: Optional[np.ndarray] = None
+    window_feats: Deque[np.ndarray] = collections.deque(maxlen=DRIFT_WINDOW)
+    window_labels: Deque[Optional[float]] = collections.deque(maxlen=DRIFT_WINDOW)
+
+    t_start = time.time()
+    last_rx = time.time()
+    all_sentinels = 0
+    retrain_in_progress = False
+    lock_started_ts: Optional[float] = None
+
+    # ---- 1) 基线预热（用 poll，避免 StopIteration）----
+    while True:
+        msgs = _poll_one(consumer, timeout_ms=1000)
+        if not msgs:
+            # 超时检查
+            if time.time() - t_start > MAX_WALL_SECS:
+                print(f"[monitor:{pod}] max wall exceeded while warming baseline; exit.", flush=True)
+                sync_all_metrics_to_minio(); stop_probe(); return
             continue
 
-        last_data_time = time.time()
-        feats_vec, y = _features_from_msg(rec)
+        for msg in msgs:
+            last_rx = time.time()
+            if is_sentinel(msg):
+                all_sentinels += 1
+                continue
+            try:
+                x, y = _parse_record(msg.value, feat_cols)
+            except Exception:
+                continue
+            window_feats.append(x)
+            window_labels.append(y)
+            if len(window_feats) >= DRIFT_WINDOW:
+                baseline_feats = np.stack(list(window_feats), axis=0)
+                print(f"[monitor:{pod}] baseline ready with {baseline_feats.shape[0]} rows", flush=True)
+                # 清空窗口（后续重新累计当前窗口）
+                window_feats.clear(); window_labels.clear()
+                break
+        if baseline_feats is not None:
+            break
 
-        if not baseline_ready:
-            baseline_buf.append(feats_vec)
-            if len(baseline_buf) >= DRIFT_WINDOW:
-                baseline_ready = True
-                base_arr = np.vstack(baseline_buf)
-                _init_hist_ranges(base_arr)
-                log_metric(component="monitor", event="baseline_ready", train_rows=DRIFT_WINDOW)
-                print(f"[monitor:{pod_name}] baseline ready with {DRIFT_WINDOW} rows")
+    # ---- 2) 监控主循环 ----
+    stride_since_eval = 0
+    while True:
+        # 主动超时/墙钟
+        if (time.time() - last_rx) > MONITOR_IDLE_TIMEOUT_S:
+            if MONITOR_WAIT_RETRAIN and retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+                time.sleep(1.0); continue
+            print(f"[monitor:{pod}] idle > {MONITOR_IDLE_TIMEOUT_S}s; exit.", flush=True)
+            break
+        if time.time() - t_start > MAX_WALL_SECS:
+            if MONITOR_WAIT_RETRAIN and retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+                time.sleep(1.0); continue
+            print(f"[monitor:{pod}] max wall exceeded; exit.", flush=True)
+            break
+
+        msgs = _poll_one(consumer, timeout_ms=500)
+        if not msgs:
+            time.sleep(0.05)
             continue
 
-        window_buf.append(feats_vec)
-        if y is not None: label_buf.append(float(y))
-        if len(window_buf) < DRIFT_WINDOW: continue
-        if retrain_in_progress: continue
+        for msg in msgs:
+            if is_sentinel(msg):
+                all_sentinels += 1
+                # 所有分区都收尾
+                if all_sentinels >= max(1, len(parts)):
+                    if MONITOR_WAIT_RETRAIN and retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+                        # 等重训完成
+                        time.sleep(1.0); continue
+                    print(f"[monitor:{pod}] all sentinels seen; exit.", flush=True)
+                    sync_all_metrics_to_minio(); stop_probe()
+                    print(f"[monitor:{pod}] metrics synced; bye.", flush=True)
+                    return
+                continue
 
-        # 每进来 STRIDE 条评一次
-        if (len(window_buf) % EVAL_STRIDE) != 0: 
-            continue
+            last_rx = time.time()
+            try:
+                x, y = _parse_record(msg.value, feat_cols)
+            except Exception:
+                continue
+            window_feats.append(x)
+            window_labels.append(y)
+            stride_since_eval += 1
 
-        X_base = np.vstack(baseline_buf)
-        X_win  = np.vstack(window_buf)
-        js_val = _compute_js(X_base, X_win)
+            if retrain_in_progress and MONITOR_WAIT_RETRAIN:
+                continue
 
-        log_metric(component="monitor", event="js_tick",
-                   js_val=round(js_val, 6),
-                   thr_A=JS_THR_A, thr_B=JS_THR_B, thr_C=JS_THR_C,
-                   window=DRIFT_WINDOW, eval_stride=EVAL_STRIDE)
+            if len(window_feats) >= DRIFT_WINDOW and stride_since_eval >= EVAL_STRIDE:
+                stride_since_eval = 0
+                cur_feats = np.stack(list(window_feats)[-DRIFT_WINDOW:], axis=0)
+                js = _compute_js(baseline_feats, cur_feats, HIST_BINS)
 
-        letter = _grid_letter(js_val)
-        if letter is None: 
-            continue
+                grid = None
+                if js >= JS_THR_C:   grid = "C"
+                elif js >= JS_THR_B: grid = "B"
+                elif js >= JS_THR_A: grid = "A"
 
-        y_latest = np.array(label_buf, dtype=np.float32) if len(label_buf) == len(window_buf) else None
-        _save_latest_batch(X_win, y_latest)
-        save_bytes(f"{RESULT_DIR}/retrain_grid.flag", letter.encode(), "text/plain")
-        save_bytes(f"{RESULT_DIR}/last_js.txt", f"{js_val:.6f}\n".encode(), "text/plain")
-        save_bytes(f"{RESULT_DIR}/retrain_lock.flag", b"", "text/plain")
-        retrain_in_progress = True
-        lock_started_ts = time.time()
+                if grid:
+                    print(f"[monitor:{pod}] drift triggered: js={js:.3f} → grid {grid}", flush=True)
+                    log_metric(component="monitor", event="drift", js=round(js, 6), grid=grid)
 
-        log_metric(component="monitor", event="drift_triggered", js_val=round(js_val, 6), grid=letter)
-        print(f"[monitor:{pod_name}] drift triggered: js={js_val:.3f} → grid {letter}")
-finally:
+                    # 只收集“有标签”的行作为重训样本
+                    lbls = list(window_labels)[-DRIFT_WINDOW:]
+                    mask = np.array([ (l is not None) and np.isfinite(l) for l in lbls ], dtype=bool)
+                    if mask.any():
+                        feats_labeled = cur_feats[mask]
+                        y_arr = np.array([float(lbls[i]) for i in range(len(lbls)) if mask[i]], dtype=np.float32)
+                        batch = np.column_stack([feats_labeled, y_arr])
+                        _save_latest_batch(batch, cols=[*feat_cols, TARGET_COL])
+                    else:
+                        # 没有标签也要触发锁，重训侧会优雅跳过
+                        _save_latest_batch(cur_feats, cols=feat_cols)
+
+                    _signal_retrain(grid)
+                    retrain_in_progress = True
+                    lock_started_ts = time.time()
+                    continue
+
+                log_metric(component="monitor", event="js_tick", js=round(js, 6))
+
+            if retrain_in_progress and _retrain_done_after(lock_started_ts or 0.0):
+                print(f"[monitor:{pod}] retrain done detected → unlock + baseline refresh", flush=True)
+                retrain_in_progress = False
+                # 刷新基线（按策略；这里采用在重训后刷新）
+                if len(window_feats) >= DRIFT_WINDOW:
+                    baseline_feats = np.stack(list(window_feats)[-DRIFT_WINDOW:], axis=0)
+                log_metric(component="monitor", event="retrain_done_seen", ts=time.time())
+
     sync_all_metrics_to_minio()
-    write_kfp_metadata()
     stop_probe()
-    print(f"[monitor:{pod_name}] metrics synced; bye.")
+    print(f"[monitor:{pod}] metrics synced; bye.", flush=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

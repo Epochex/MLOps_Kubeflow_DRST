@@ -22,7 +22,6 @@ from drst_common.minio_helper import save_bytes, s3
 from drst_common.artefacts import load_selected_feats, load_scaler, read_latest, load_model_by_key
 from drst_common.resource_probe import start as start_probe
 
-# ---------- group 固定，同一 run 的所有副本共享 ----------
 RUN_TAG  = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "cg-infer")
 
@@ -60,14 +59,12 @@ def _pick_metric(metrics: Dict[str, float]) -> Tuple[float, float]:
 
 def _is_sentinel_msg(msg) -> bool:
     try:
-        # header 方式（推荐）
         for k, v in (msg.headers or []):
             if k == SENTINEL_HEADER_KEY and v == SENTINEL_HEADER_VAL:
                 return True
     except Exception:
         pass
     try:
-        # 旧的 fallback：纯字节 value
         if msg.value == SENTINEL_FALLBACK_VALUE:
             return True
     except Exception:
@@ -152,12 +149,36 @@ cum_correct = 0
 cum_total   = 0
 _batch_idx  = 0
 
+def _extract_vec_label_ts(row: dict) -> Tuple[List[float], Optional[float], Optional[str]]:
+    if isinstance(row, dict) and isinstance(row.get("features"), dict):
+        fdict = row["features"]
+        label_val = row.get("label", row.get(TARGET_COL))
+        ts = row.get("send_ts")
+    else:
+        fdict = row if isinstance(row, dict) else {}
+        label_val = (row.get(TARGET_COL) if isinstance(row, dict) else None)
+        ts = (row.get("send_ts") if isinstance(row, dict) else None)
+    vec = [float(fdict.get(c, 0.0)) for c in SELECTED_FEATS]
+    label: Optional[float]
+    try:
+        label = float(label_val) if label_val is not None else None
+    except Exception:
+        label = None
+    return vec, label, ts
+
 def _process_batch(rows: List[dict]):
     global cum_correct, cum_total, _batch_idx
-    # 注意：producer 发送的是“扁平字典”，特征在顶层；标签字段名为 TARGET_COL
-    X_raw = np.array([[r.get(c, 0.0) for c in SELECTED_FEATS] for r in rows], dtype=np.float32)
-    labels = np.array([r.get(TARGET_COL, 0.0) for r in rows], dtype=np.float32)
-    send_ts = [r.get("send_ts") for r in rows]
+    X_list: List[List[float]] = []
+    labels_list: List[Optional[float]] = []
+    send_ts_list: List[Optional[str]] = []
+    for r in rows:
+        vec, lab, ts = _extract_vec_label_ts(r)
+        X_list.append(vec); labels_list.append(lab); send_ts_list.append(ts)
+
+    X_raw = np.asarray(X_list, dtype=np.float32)
+    labels = np.array([np.nan if (v is None) else float(v) for v in labels_list], dtype=np.float32)
+    mask = np.isfinite(labels)
+
     X_sc = SCALER.transform(X_raw)
 
     with _model_lock:
@@ -173,47 +194,59 @@ def _process_batch(rows: List[dict]):
         pc = mdl            (torch.from_numpy(X_c).to(DEVICE)).cpu().numpy().ravel()
     wall_ms = (time.perf_counter() - t0) * 1000.0
 
-    denom = np.maximum(np.abs(labels), 1e-8)
-    err_c = np.abs(pc - labels) / denom
-    batch_correct = int((err_c <= ACC_THR).sum())
-    batch_total   = len(rows)
-    cum_correct  += batch_correct
-    cum_total    += batch_total
-    cum_acc = (cum_correct / max(1, cum_total))
+    if mask.any():
+        y = labels[mask]
+        pb_m = pb[mask]
+        pc_m = pc[mask]
+        denom = np.maximum(np.abs(y), 1e-8)
+        err_c = np.abs(pc_m - y) / denom
+        err_b = np.abs(pb_m - y) / denom
 
-    err_b = np.abs(pb - labels) / denom
-    pct   = [50, 80, 90, 95, 99]
-    q_b   = np.percentile(err_b, pct).round(3)
-    q_c   = np.percentile(err_c, pct).round(3)
+        batch_correct = int((err_c <= ACC_THR).sum())
+        batch_total   = int(mask.sum())
+        cum_correct  += batch_correct
+        cum_total    += batch_total
+        cum_acc = (cum_correct / max(1, cum_total))
 
-    log_metric(
-        component="infer", event="batch_metrics",
-        batch_size=batch_total, latency_ms=round(wall_ms, 3),
-        **{f"cumulative_accuracy@{_thr_str}": round(cum_acc, 3)},
-        base_p50=float(q_b[0]), base_p80=float(q_b[1]), base_p90=float(q_b[2]),
-        base_p95=float(q_b[3]), base_p99=float(q_b[4]),
-        adpt_p50=float(q_c[0]), adpt_p80=float(q_c[1]), adpt_p90=float(q_c[2]),
-        adpt_p95=float(q_c[3]), adpt_p99=float(q_c[4]),
-        model_loading_ms=_model_loading_ms
-    )
+        pct   = [50, 80, 90, 95, 99]
+        q_b   = np.percentile(err_b, pct).round(3)
+        q_c   = np.percentile(err_c, pct).round(3)
 
-    _batch_idx += 1
-    if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
-        print(
-            f"[infer:{POD_NAME}] batch#{_batch_idx} n={batch_total} t={wall_ms:.2f}ms "
-            f"cum@{_thr_str}={cum_acc:.3f} "
-            f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
-            f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
-            flush=True
+        log_metric(
+            component="infer", event="batch_metrics",
+            batch_size=len(rows), labeled=batch_total, latency_ms=round(wall_ms, 3),
+            **{f"cumulative_accuracy@{_thr_str}": round(cum_acc, 3)},
+            base_p50=float(q_b[0]), base_p80=float(q_b[1]), base_p90=float(q_b[2]),
+            base_p95=float(q_b[3]), base_p99=float(q_b[4]),
+            adpt_p50=float(q_c[0]), adpt_p80=float(q_c[1]), adpt_p90=float(q_c[2]),
+            adpt_p95=float(q_c[3]), adpt_p99=float(q_c[4]),
+            model_loading_ms=_model_loading_ms
         )
 
-    pred_b_hist.extend(pb.tolist()); pred_c_hist.extend(pc.tolist()); true_hist.extend(labels.tolist())
-    for ts in send_ts:
-        try: t = datetime.fromisoformat(str(ts).rstrip("Z")).timestamp()
-        except Exception: t = time.time()
-        ts_hist.append(float(t))
+        _batch_idx += 1
+        if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
+            print(
+                f"[infer:{POD_NAME}] batch#{_batch_idx} n={len(rows)} t={wall_ms:.2f}ms "
+                f"cum@{_thr_str}={cum_acc:.3f} "
+                f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
+                f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
+                flush=True
+            )
+
+        pred_b_hist.extend(pb_m.tolist()); pred_c_hist.extend(pc_m.tolist()); true_hist.extend(y.tolist())
+        for ts in np.array(send_ts_list, dtype=object)[mask]:
+            try: t = datetime.fromisoformat(str(ts).rstrip("Z")).timestamp()
+            except Exception: t = time.time()
+            ts_hist.append(float(t))
+    else:
+        log_metric(
+            component="infer", event="batch_metrics",
+            batch_size=len(rows), labeled=0, latency_ms=round(wall_ms, 3),
+            model_loading_ms=_model_loading_ms
+        )
+
     try:
-        producer.send(RETRAIN_TOPIC, {"processed": batch_total})
+        producer.send(RETRAIN_TOPIC, {"processed": len(rows)})
     except Exception:
         pass
 
@@ -231,16 +264,14 @@ try:
                     sentinel_seen += 1
                     print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                     continue
-                # 解码 JSON 值
                 try:
                     v = json.loads(msg.value)
                     if isinstance(v, dict) and v.get("producer_done"):
-                        # 兼容极旧格式
                         sentinel_seen += 1
                         print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                         continue
                 except Exception:
-                    continue  # 畸形消息，跳过
+                    continue
 
                 got_data = True
                 last_data_ts = time.time()

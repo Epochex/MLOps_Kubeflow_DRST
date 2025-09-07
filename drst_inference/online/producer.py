@@ -1,33 +1,61 @@
 #!/usr/bin/env python3
-# drst_inference/online/producer.py
 from __future__ import annotations
-import os, json, time
+import os, json, time, random
 from datetime import datetime, timezone
 from typing import List
 
 import numpy as np
 import pandas as pd
 
-from drst_common.config import BUCKET, MODEL_DIR, TARGET_COL
+from drst_common.config import (
+    BUCKET, MODEL_DIR, TARGET_COL, DATA_DIR,
+    PRODUCER_BRIDGE_N, PRODUCER_RAND_N, PRODUCER_STIM_N,
+    PRODUCER_TPS, PRODUCER_JITTER_MS, PRODUCE_INTERVAL_MS
+)
 from drst_common.minio_helper import load_csv, s3
 from drst_common.kafka_io import create_producer, broadcast_sentinel, partitions_for_topic
 
-TOPIC        = os.getenv("KAFKA_TOPIC", "latencyTopic")
-INTERVAL_MS  = int(os.getenv("INTERVAL_MS", "100"))
-RUN_ID       = os.getenv("RUN_ID") or time.strftime("%Y%m%d%H%M%S", time.gmtime())
+TOPIC = os.getenv("KAFKA_TOPIC", "latencyTopic")
+RUN_ID = os.getenv("RUN_ID") or time.strftime("%Y%m%d%H%M%S", time.gmtime())
 
-BRIDGE_N     = int(os.getenv("BRIDGE_N", "500"))
-RAND_N       = int(os.getenv("RAND_N", "1000"))
-STIM_N       = int(os.getenv("STIM_N", "1000"))
+BRIDGE_N = int(os.getenv("BRIDGE_N", str(PRODUCER_BRIDGE_N)))
+RAND_N   = int(os.getenv("RAND_N",   str(PRODUCER_RAND_N)))
+STIM_N   = int(os.getenv("STIM_N",   str(PRODUCER_STIM_N)))
 
-KEY_COMBINED = os.getenv("STAGE1_KEY", "datasets/combined.csv")
-KEY_RANDOM   = os.getenv("STAGE2_KEY", "datasets/random_rates.csv")
-KEY_STIM     = os.getenv("STAGE3_KEY", "datasets/resource_stimulus_global_A-B-C_modified.csv")
+KEY_COMBINED = os.getenv("STAGE1_KEY", f"{DATA_DIR}/combined.csv")
+KEY_RANDOM   = os.getenv("STAGE2_KEY", f"{DATA_DIR}/random_rates.csv")
+KEY_STIM     = os.getenv("STAGE3_KEY", f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv")
 
 WAIT_FEATURES_SECS = int(os.getenv("WAIT_FEATURES_SECS", "120"))
 
-def _sleep_ms(ms: int): 
-    if ms > 0: time.sleep(ms / 1000.0)
+def _per_msg_sleep_s() -> float:
+    tps_env = os.getenv("PRODUCER_TPS")
+    if tps_env is not None and tps_env.strip():
+        try:
+            tps = float(tps_env)
+            if tps > 0:
+                return 1.0 / tps
+        except Exception:
+            pass
+    if PRODUCER_TPS and PRODUCER_TPS > 0:
+        return 1.0 / float(PRODUCER_TPS)
+    interval_ms_env = os.getenv("INTERVAL_MS")
+    if interval_ms_env is not None and interval_ms_env.strip():
+        try:
+            ms = float(interval_ms_env)
+            if ms >= 0:
+                return ms / 1000.0
+        except Exception:
+            pass
+    return float(PRODUCE_INTERVAL_MS) / 1000.0
+
+def _sleep_for_rate(base_s: float):
+    j_ms_env = os.getenv("PRODUCER_JITTER_MS")
+    jitter_ms = int(j_ms_env) if j_ms_env else int(PRODUCER_JITTER_MS)
+    if jitter_ms > 0:
+        time.sleep(base_s + random.randint(0, jitter_ms) / 1000.0)
+    else:
+        time.sleep(base_s)
 
 def _load_feature_cols() -> List[str]:
     key = f"{MODEL_DIR}/feature_cols.json"
@@ -83,6 +111,11 @@ def main():
         (_align(df3, feat_cols) if not df3.empty else pd.DataFrame(columns=feat_cols+[TARGET_COL]))
     ]
 
+    per_msg = _per_msg_sleep_s()
+    if per_msg > 0:
+        tps = 1.0 / per_msg if per_msg > 0 else 0.0
+        print(f"[producer:producer] throttling enabled: {tps:.2f} msgs/sec (~{per_msg*1000:.0f} ms/record)", flush=True)
+
     producer = create_producer(client_id=f"producer-{RUN_ID}")
     sent = 0
     for df in df_list:
@@ -95,7 +128,7 @@ def main():
             }
             producer.send(TOPIC, value=payload, headers=[("run_id", RUN_ID.encode("utf-8"))])
             sent += 1
-            _sleep_ms(INTERVAL_MS)
+            _sleep_for_rate(per_msg)
 
     n_sentinels = broadcast_sentinel(producer, TOPIC, run_id=RUN_ID, partitions=parts)
     try:
