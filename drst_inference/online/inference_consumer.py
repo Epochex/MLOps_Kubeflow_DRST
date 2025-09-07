@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""
-- Kafka 在线推理（baseline + current 双路）
-- 热更新 current 模型
-- 每批打印一行流日志（人类可读）
-- 指标通过 log_metric() → 分片 CSV → 合并到 results/metrics_summary.csv
-- 进程资源采样：results/infer_<pod>_resources.csv
-"""
 from __future__ import annotations
-import os, io, json, time, hashlib
+import os, io, json, time, hashlib, threading
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
+from kafka.errors import NoBrokersAvailable
 
 from drst_common import config as _cfg
 from drst_common.config import (
-    KAFKA_TOPIC, BATCH_SIZE, CONSUME_IDLE_S, MODEL_DIR, RESULT_DIR, BUCKET,
-    INFER_STDOUT_EVERY, RELOAD_INTERVAL_S, GAIN_THR_PP, RETRAIN_TOPIC
+    KAFKA_TOPIC, BATCH_SIZE, CONSUME_IDLE_S as _CFG_IDLE_S,
+    MODEL_DIR, RESULT_DIR, BUCKET, INFER_STDOUT_EVERY, RELOAD_INTERVAL_S,
+    GAIN_THR_PP, RETRAIN_TOPIC
 )
 from drst_common.kafka_io import create_consumer, create_producer, partitions_count
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
@@ -25,8 +20,21 @@ from drst_common.minio_helper import save_bytes, s3
 from drst_common.artefacts import load_selected_feats, load_scaler, read_latest, load_model_by_key
 from drst_common.resource_probe import start as start_probe
 
+def _make_run_tag() -> str:
+    for k in ("KFP_RUN_ID", "WORKFLOW_ID", "PIPELINE_RUN_ID", "POD_NAME", "HOSTNAME"):
+        v = os.getenv(k)
+        if v: return v
+    return str(int(time.time()))
+RUN_TAG   = _make_run_tag()
+GROUP_ID  = f"cg-infer-{RUN_TAG}"
+
 POD_NAME = os.getenv("HOSTNAME", "infer")
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+
+try:
+    IDLE_S = int(os.getenv("IDLE_TIMEOUT_S", "")) if os.getenv("IDLE_TIMEOUT_S") else int(_CFG_IDLE_S)
+except Exception:
+    IDLE_S = 60
 
 ACC_THR  = float(getattr(_cfg, "ACC_THR", 0.25))
 _thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
@@ -56,7 +64,7 @@ print(f"[infer:{POD_NAME}] loading artefacts…")
 SELECTED_FEATS = load_selected_feats()
 SCALER = load_scaler()
 
-stop_probe = start_probe(f"infer_{POD_NAME}")  # 资源采样启动
+stop_probe = start_probe(f"infer_{POD_NAME}")
 
 baseline_model, baseline_raw = load_model_by_key("baseline_model.pt")
 baseline_model = baseline_model.to(DEVICE).eval()
@@ -108,13 +116,10 @@ def _reload_daemon():
     while True:
         time.sleep(RELOAD_INTERVAL_S)
         _maybe_reload_model()
-
-import threading
 threading.Thread(target=_reload_daemon, daemon=True).start()
 
-from kafka.errors import NoBrokersAvailable
 print(f"[infer:{POD_NAME}] connecting Kafka…")
-consumer = create_consumer(KAFKA_TOPIC, group_id="cg-infer")
+consumer = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
 time.sleep(1.0)
 num_parts = partitions_count(consumer, KAFKA_TOPIC)
 print(f"[infer:{POD_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
@@ -135,7 +140,6 @@ _batch_idx  = 0
 
 def _process_batch(rows: List[dict]):
     global cum_correct, cum_total, _batch_idx
-    # 1) 取 selected feats（线上用 Top-K 一致）
     X_raw = np.array([[r.get("features", {}).get(c, 0.0) for c in SELECTED_FEATS] for r in rows], dtype=np.float32)
     labels = np.array([r.get("label", 0.0) for r in rows], dtype=np.float32)
     send_ts = [r.get("send_ts") for r in rows]
@@ -145,18 +149,15 @@ def _process_batch(rows: List[dict]):
         mdl = current_model
         in_dim_cur = mdl.net[0].in_features
 
-    # 2) 维度对齐
     X_b = _align_to_dim(X_sc, baseline_in_dim)
     X_c = _align_to_dim(X_sc, in_dim_cur)
 
-    # 3) 推理
     t0 = time.perf_counter()
     with torch.no_grad():
         pb = baseline_model(torch.from_numpy(X_b).to(DEVICE)).cpu().numpy().ravel()
         pc = mdl            (torch.from_numpy(X_c).to(DEVICE)).cpu().numpy().ravel()
     wall_ms = (time.perf_counter() - t0) * 1000.0
 
-    # 4) 统计
     denom = np.maximum(np.abs(labels), 1e-8)
     err_c = np.abs(pc - labels) / denom
     batch_correct = int((err_c <= ACC_THR).sum())
@@ -227,10 +228,9 @@ try:
                 _process_batch(batch_buf); batch_buf.clear()
             if num_parts and sentinel_seen >= num_parts:
                 print(f"[infer:{POD_NAME}] all sentinels received; exiting loop"); break
-            if (time.time() - last_data_ts) > CONSUME_IDLE_S:
-                print(f"[infer:{POD_NAME}] idle > {CONSUME_IDLE_S}s; exiting loop"); break
+            if (time.time() - last_data_ts) > IDLE_S:
+                print(f"[infer:{POD_NAME}] idle > {IDLE_S}s; exiting loop"); break
 finally:
-    # 保存轨迹
     arr_adj  = np.asarray(pred_c_hist,  np.float32)
     arr_orig = np.asarray(pred_b_hist,  np.float32)
     arr_true = np.asarray(true_hist,    np.float32)
@@ -242,5 +242,5 @@ finally:
     print(f"[infer:{POD_NAME}] trace saved: {len(arr_true)} samples")
 
     sync_all_metrics_to_minio()
-    stop_probe()   # 停止资源采样并上传 CSV
+    stop_probe()
     print(f"[infer:{POD_NAME}] done.")

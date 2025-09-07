@@ -19,29 +19,35 @@ KAFKA_SERVERS = "kafka.default.svc.cluster.local:9092"
 KAFKA_TOPIC   = "latencyTopic"
 
 # ===== 特征/训练（离线）=====
-FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"   # 用于派生完整 60 维 FEATURE_COLS 的“真理源”
+FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"   # 自举特征全集
 EXCLUDE_COLS    = ["Unnamed: 0", "input_rate", "latency"]
 TARGET_COL      = "output_rate"
 OFFLINE_TOPK    = 10
 ACC_THR         = 0.25
 
 # ===== 批大小（逐条推理）=====
-BATCH_SIZE = 1  # producer / consumer 同步读取
+BATCH_SIZE = 1
 
 # ===== Consumer 行为（在线推理）=====
-CONSUME_IDLE_S     = 300     # 无数据超时退出
-RELOAD_INTERVAL_S  = 30      # 热更新探测周期（秒）
-INFER_STDOUT_EVERY = 1       # 每处理几批打印一行
-GAIN_THR_PP        = 0.01    # 新模型相对 baseline 的提升阈值（百分点）
+CONSUME_IDLE_S     = 300
+RELOAD_INTERVAL_S  = 30
+INFER_STDOUT_EVERY = 1
+GAIN_THR_PP        = 0.01
 RETRAIN_TOPIC      = KAFKA_TOPIC + "_infer_count"
 
-# ===== Producer 行为 =====
+# ===== Producer 行为（全部放这里）=====
 PRODUCE_INTERVAL_MS     = 100
 PRODUCER_PARTITION_MODE = "rr"  # "auto" | "rr" | "hash"
-MANIFEST_KEY            = f"{DATA_DIR}/online/manifest.json"
+
+# 每个阶段的行数统一由配置给出；也可用同名 env 或 PRODUCER_STAGES(JSON) 覆盖
+PRODUCER_BRIDGE_N = 500   # Stage1: combined 尾部
+PRODUCER_RAND_N   = 1000  # Stage2: random_rates 头部
+PRODUCER_STIM_N   = 1000  # Stage3: resource_stimulus… 头部
+
 PRODUCER_STAGES: List[dict] = [
-    {"key": f"{DATA_DIR}/combined.csv",     "rows": 1000, "take": "head"},
-    {"key": f"{DATA_DIR}/random_rates.csv", "rows": 1000, "take": "head"},
+    {"key": f"{DATA_DIR}/combined.csv",     "take": "tail", "rows": PRODUCER_BRIDGE_N},
+    {"key": f"{DATA_DIR}/random_rates.csv", "take": "head", "rows": PRODUCER_RAND_N},
+    {"key": f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv", "take": "head", "rows": PRODUCER_STIM_N},
 ]
 
 # ===== 漂移监控窗口 =====
@@ -67,10 +73,10 @@ RETRAIN_WARM_EPOCHS    = 3
 RETRAIN_EPOCHS_FULL    = 8
 RETRAIN_EARLY_PATIENCE = 2
 RETRAIN_MODE           = "auto"   # "scratch" | "finetune" | "auto"
-RETRAIN_FREEZE_N       = 0        # finetune 时可冻结前 N 个 Linear
+RETRAIN_FREEZE_N       = 0
 RETRAIN_VAL_FRAC       = 0.2
 
-# ===== 动态重训网格（保持原样）=====
+# ===== 动态重训网格（保留原样）=====
 def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
     def uniq_layers(cands: List[List[int]]) -> List[List[int]]:
         seen = set(); out = []
@@ -91,30 +97,30 @@ def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
 
     return {
         "A": {
-            "learning_rate": [5e-4, 1e-3],
-            "batch_size":    [32, 64],
+            "learning_rate": [5e-3, 1e-2],
+            "batch_size":    [16, 32],
             "hidden_layers": base_small,
-            "activation":    ["relu"],
+            "activation":    ["relu", "gelu"],
             "loss":          ["smoothl1"],
-            "wd":            [0.0],
-            "topk":          1,
+            "wd":            [0.0, 1e-4],
+            "topk":          2,
         },
         "B": {
-            "learning_rate": [5e-4, 1e-3],
-            "batch_size":    [32, 64, 128],
+            "learning_rate": [3e-3, 1e-2],
+            "batch_size":    [16, 32],
             "hidden_layers": base_medium,
             "activation":    ["relu", "gelu"],
             "loss":          ["smoothl1", "mse"],
-            "wd":            [0.0, 1e-5],
-            "topk":          2,
+            "wd":            [0.0, 1e-4],
+            "topk":          3,
         },
         "C": {
-            "learning_rate": [3e-4, 5e-4, 1e-3],
-            "batch_size":    [64, 128],
+            "learning_rate": [1e-3, 3e-3, 1e-2],
+            "batch_size":    [16, 32],
             "hidden_layers": base_large,
             "activation":    ["relu", "gelu"],
             "loss":          ["smoothl1", "mse"],
-            "wd":            [0.0, 1e-5],
-            "topk":          2,
+            "wd":            [0.0, 1e-4],
+            "topk":          3,
         },
     }

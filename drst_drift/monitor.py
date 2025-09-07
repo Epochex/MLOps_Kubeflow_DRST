@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# drst_drift/monitor.py
 from __future__ import annotations
 import os, json, time, queue, threading
 from collections import deque
@@ -14,7 +13,7 @@ from drst_common.kafka_io import create_consumer, partitions_count
 from drst_common.runtime import touch_ready, write_kfp_metadata
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
 from drst_common.minio_helper import save_np, save_bytes, s3
-from drst_common.resource_probe import start as start_probe  # 新增
+from drst_common.resource_probe import start as start_probe
 from drst_common.utils import jensen_shannon_divergence, make_prob_hist
 
 IDLE_TIMEOUT_S       = int(os.getenv("IDLE_TIMEOUT_S", "60"))
@@ -23,6 +22,14 @@ JS_CALIB_SAMPLES     = int(os.getenv("JS_CALIB_SAMPLES", "400"))
 JS_QUANTILES_RAW     = os.getenv("JS_QUANTILES", "0.90,0.97,0.995")
 BASELINE_REFRESH_MODE= os.getenv("BASELINE_REFRESH_MODE", "on_retrain").lower()
 pod_name = os.getenv("HOSTNAME", "monitor")
+
+def _make_run_tag() -> str:
+    for k in ("KFP_RUN_ID", "WORKFLOW_ID", "PIPELINE_RUN_ID", "POD_NAME", "HOSTNAME"):
+        v = os.getenv(k)
+        if v: return v
+    return str(int(time.time()))
+RUN_TAG   = _make_run_tag()
+GROUP_ID  = f"cg-monitor-{RUN_TAG}"
 
 def _parse_quantiles(s: str) -> Tuple[float, float, float]:
     try:
@@ -40,7 +47,6 @@ data_partitions = 0
 data_sentinel_seen = 0
 sentinel_lock = threading.Lock()
 
-# —— 关键：加载 FEATURE_COLS（60 维） —— #
 def _load_feature_cols() -> List[str]:
     obj = s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/feature_cols.json")
     cols = json.loads(obj["Body"].read().decode())
@@ -62,7 +68,6 @@ retrain_in_progress = False
 lock_started_ts = 0.0
 
 def _features_from_msg(msg) -> Tuple[np.ndarray, Optional[float]]:
-    # 直接取 60 维原始特征；若缺列补 0
     feats = []
     fdict = msg.get("features", {}) or {}
     for c in FEATURE_COLS:
@@ -144,7 +149,7 @@ def _retrain_done_after(ts0: float) -> bool:
 
 def _data_listener():
     global data_partitions, data_sentinel_seen
-    cons = create_consumer(KAFKA_TOPIC, group_id="cg-monitor-data")
+    cons = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
     time.sleep(1.0)
     data_partitions = partitions_count(cons, KAFKA_TOPIC)
     print(f"[monitor:{pod_name}] topic «{KAFKA_TOPIC}» partitions = {data_partitions}")
@@ -159,6 +164,7 @@ def _data_listener():
         q_data.put(v)
 
 threading.Thread(target=_data_listener, daemon=True).start()
+
 
 print(f"[monitor:{pod_name}] started…")
 last_data_time = time.time()
