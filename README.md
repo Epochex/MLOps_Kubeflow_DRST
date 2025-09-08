@@ -155,7 +155,8 @@ The retrainer consumes the frozen window and tier flag, reuses the offline scale
 
 ### 2.6 `experiments/`
 Reproducible experiments and Kubeflow Pipelines assembly. `kubeflow/pipeline.py` defines the full KFP DAG — offline → (monitor | producer | infer) → plot — with an 8-minute wall-clock cap per streaming stage and consumer auto-shutdown on idle. `submit_pipeline.py` compiles `drift_demo_v2.yaml` and submits it to KFP (KFP host/namespace/experiment are provided via environment variables). `yamls/` contains example manifests for observability (e.g., Prometheus and Kafka Exporter). The folder enables a one-command workflow to compile and submit an end-to-end run: offline training, streaming drift detection and adaptive updates, and final charts/report generation.
-![Pipeline Overview](<docs/pipeline_runtime.png>)  
+![Pipeline Overview](<docs/pipeline_runtime.png>)
+
 
 ### 2.7 `deploy/`
 #### 2.7.1 `Auto_deployment_k8s_kubeflow.sh`
@@ -192,9 +193,11 @@ Installs Kafka bootstrap via Bitnami Helm. Ensures Helm and target namespace, ad
 
 
 
-### 2.8 `docker/`
+#### 2.8 `docker/`
 Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the in-cluster bootstrap address, and runs an idempotent smoke test, aligning with the repo’s default `KAFKA_SERVERS`. Includes helpers like `Auto_clear_pods.yaml` for basic cleanup/ops.
+
 ![Pipeline Overview](<docs/pipeline_runtime3.png>)
+
 ---
 
 ## 📊 Current limitations
