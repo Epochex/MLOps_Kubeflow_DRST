@@ -1,6 +1,5 @@
+# ===== 文件: drst_drift/dynamic_retrain.py =====
 #!/usr/bin/env python3
-# drst_drift/dynamic_retrain.py
-# 记录 retrain_wall_s + 进程资源曲线（results/retrain_resources.csv）
 from __future__ import annotations
 import io, os, time, json
 from itertools import product
@@ -15,7 +14,6 @@ from drst_common.config import (
     RESULT_DIR, TARGET_COL, abc_grids, BUCKET,
     RETRAIN_WARM_EPOCHS, RETRAIN_EPOCHS_FULL, RETRAIN_EARLY_PATIENCE,
     RETRAIN_MODE, RETRAIN_FREEZE_N, RETRAIN_VAL_FRAC,
-    RETRAIN_WATCH_MAX_SECS,   # ← 统一读取
 )
 from drst_common.minio_helper import load_np, save_bytes, s3
 from drst_common.artefacts import load_scaler, load_selected_feats, read_latest, load_model_by_key, write_latest
@@ -29,9 +27,8 @@ ACC_THR  = float(getattr(_cfg, "ACC_THR", 0.25))
 _thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
 
 device   = "cuda" if torch.cuda.is_available() else "cpu"
-pod_name = os.getenv("HOSTNAME", "retrain")  # 仅用于可读日志，无超参含义
+pod_name = os.getenv("HOSTNAME", "retrain")
 
-# --- 监听相关配置与对象键 ---
 LOCK_KEY = f"{RESULT_DIR}/retrain_lock.flag"
 DONE_KEY = f"{RESULT_DIR}/retrain_done.flag"
 WATCH    = os.getenv("RETRAIN_WATCH", "0") in ("1", "true", "True")
@@ -190,10 +187,6 @@ def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: s
     return rmse
 
 def _run_once() -> bool:
-    """
-    原有单次重训流程；成功训练并写出 DONE 返回 True；
-    若缺 batch / 无标签而跳过，返回 False。
-    """
     t0_wall = time.time()
     try:
         try:
@@ -227,7 +220,6 @@ def _run_once() -> bool:
         Xva, Yva = Xs[va_idx], y[va_idx]
         in_dim = Xs.shape[1]
 
-        # baseline 评估（做维度对齐）
         baseline_model, _ = load_model_by_key("baseline_model.pt")
         baseline_model.eval().to(device)
         baseline_in_dim = baseline_model.net[0].in_features
@@ -236,7 +228,6 @@ def _run_once() -> bool:
             pb = baseline_model(torch.from_numpy(Xva_b).float().to(device)).cpu().numpy().ravel()
         base_mae, base_rmse, base_acc_thr, base_acc15 = _eval_metrics(Yva, pb)
 
-        # current 作为 finetune 起点（若结构匹配）
         latest = read_latest()
         current_model_for_ft = None
         current_hidden = None
@@ -325,7 +316,6 @@ def _run_once() -> bool:
         sync_all_metrics_to_minio(); write_kfp_metadata()
         print(f"[retrain] done. grid={grid_letter} mode={best_cfg['mode']} "
               f"rmse={metrics['rmse']:.4f} acc@{_thr_str}={metrics[f'acc@{_thr_str}']:.4f} "
-              f"(baseline rmse={base_rmse:.4f} acc@{_thr_str}={base_acc_thr:.4f}) "
               f"wall={train_secs:.3f}s")
         return True
     except Exception as ex:
@@ -340,15 +330,13 @@ def main():
             _ = _run_once()
             return
 
-        # 统一的 watcher 超时：来自 config.RETRAIN_WATCH_MAX_SECS
-        max_secs = int(RETRAIN_WATCH_MAX_SECS)
-        print(f"[retrain] watcher started: poll={POLL_S}s, max_watch={max_secs}s (<=0 means infinite)", flush=True)
+        max_secs = int(_cfg.get_max_wall_secs())
+        print(f"[retrain] watcher started: poll={POLL_S}s, max_watch={max_secs} (<=0 means infinite)", flush=True)
 
         start_ts = time.time()
         last_done_ts = _obj_mtime(DONE_KEY) or 0.0
         last_lock_attempt_ts: float | None = None
 
-        # 0/负数 → 无限等待；>0 → 限时
         def _still_in_window() -> bool:
             return (max_secs <= 0) or ((time.time() - start_ts) < max_secs)
 

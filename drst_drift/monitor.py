@@ -1,9 +1,12 @@
+# ===== 文件: drst_drift/monitor.py =====
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys, time, io, json, random, collections
+import os, sys, time, io, json, collections
 from typing import Deque, Optional, List, Tuple
+from datetime import datetime, timezone
 import numpy as np
 
+from drst_common import config as _cfg
 from drst_common.kafka_io import create_consumer, is_sentinel, partitions_for_topic
 from drst_common.minio_helper import s3, save_bytes
 from drst_common.metric_logger import log_metric, sync_all_metrics_to_minio
@@ -12,8 +15,8 @@ from drst_common.config import (
     BUCKET, MODEL_DIR, RESULT_DIR, KAFKA_TOPIC, TARGET_COL,
     DRIFT_WINDOW, EVAL_STRIDE, HIST_BINS,
     JS_THR_A, JS_THR_B, JS_THR_C,
-    MONITOR_SIGNAL_INFER_PAUSE, MONITOR_IDLE_TIMEOUT_S, MAX_WALL_SECS,
-    WAIT_FEATURES_SECS, PAUSE_INFER_KEY
+    MONITOR_SIGNAL_INFER_PAUSE, MONITOR_IDLE_TIMEOUT_S,
+    WAIT_FEATURES_SECS, PAUSE_INFER_KEY, JS_CURRENT_KEY
 )
 
 RUN_TAG = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
@@ -25,7 +28,6 @@ BATCH_KEY = f"{RESULT_DIR}/latest_batch.npy"
 BATCH_COL = f"{RESULT_DIR}/latest_batch.columns.json"
 DONE_KEY  = f"{RESULT_DIR}/retrain_done.flag"
 
-# 冷却期（秒），默认 10，可用环境变量 RETRAIN_COOLDOWN_S 覆盖
 RETRAIN_COOLDOWN_S = int(os.getenv("RETRAIN_COOLDOWN_S", "10") or 10)
 
 def _exists(key:str)->bool:
@@ -49,14 +51,6 @@ def _save_latest_batch_xy(x: np.ndarray, y: np.ndarray, cols: List[str]):
         np.save(f, arr, allow_pickle=False)
         save_bytes(BATCH_KEY, f.getvalue(), "application/octet-stream")
     save_bytes(BATCH_COL, json.dumps(cols + [TARGET_COL]).encode("utf-8"), "application/json")
-
-def _signal_retrain(grid: str):
-    save_bytes(LOCK_KEY, b"1\n", "text/plain")
-    save_bytes(GRID_KEY, grid.encode(), "text/plain")
-
-def _retrain_done_after(ts0: float) -> bool:
-    ts = _last_modified_ts(DONE_KEY)
-    return (ts is not None) and (ts >= ts0)
 
 def _load_feature_cols(wait_secs:int) -> List[str]:
     key = f"{MODEL_DIR}/feature_cols.json"
@@ -102,6 +96,13 @@ def _compute_js(baseline_x: np.ndarray, window_x: np.ndarray, bins:int) -> float
         vals.append(js)
     return float(np.mean(vals)) if vals else 0.0
 
+def _broadcast_js(js: float) -> None:
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "js": float(js),
+    }
+    save_bytes(JS_CURRENT_KEY, json.dumps(payload).encode("utf-8"), "application/json")
+
 def main():
     pod = os.getenv("HOSTNAME", "monitor")
     feat_cols = _load_feature_cols(WAIT_FEATURES_SECS)
@@ -111,10 +112,12 @@ def main():
     print(f"[monitor:{pod}] topic «{TOPIC}» partitions = {len(parts)}", flush=True)
     print(f"[monitor:{pod}] retrain cooldown = {RETRAIN_COOLDOWN_S}s", flush=True)
 
-    # 启动资源采样（组件名固定为 'monitor'，并会写 host_resources.csv）
+    wall_secs = int(_cfg.get_max_wall_secs())
+    idle_secs = int(MONITOR_IDLE_TIMEOUT_S)
+    print(f"[monitor:{pod}] wall_secs={wall_secs} (<=0 means infinite), idle_secs={idle_secs} (<=0 means infinite)", flush=True)
+
     stop_probe = start_probe("monitor")
 
-    # 窗口里**同时保存** (x, y)，重训时才能写出 (X,y)
     window: Deque[Tuple[np.ndarray, Optional[float]]] = collections.deque(maxlen=DRIFT_WINDOW)
     baseline_x = None
 
@@ -130,7 +133,7 @@ def main():
     while True:
         polled = consumer.poll(timeout_ms=1000)
         if not polled:
-            if time.time() - t_start > MAX_WALL_SECS:
+            if wall_secs > 0 and (time.time() - t_start > wall_secs):
                 print(f"[monitor:{pod}] max wall exceeded while warming baseline; exit.", flush=True)
                 sync_all_metrics_to_minio(); stop_probe(); return
             continue
@@ -152,13 +155,13 @@ def main():
     stride_since_eval = 0
 
     while True:
-        if (time.time() - last_rx) > MONITOR_IDLE_TIMEOUT_S:
-            if retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+        if (idle_secs > 0) and ((time.time() - last_rx) > idle_secs):
+            if retrain_in_progress and not _last_modified_ts(DONE_KEY) or (retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0)))):
                 time.sleep(1.0); continue
-            print(f"[monitor:{pod}] idle > {MONITOR_IDLE_TIMEOUT_S}s; exit.", flush=True)
+            print(f"[monitor:{pod}] idle > {idle_secs}s; exit.", flush=True)
             break
-        if time.time() - t_start > MAX_WALL_SECS:
-            if retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+        if (wall_secs > 0) and (time.time() - t_start > wall_secs):
+            if retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                 time.sleep(1.0); continue
             print(f"[monitor:{pod}] max wall exceeded; exit.", flush=True)
             break
@@ -166,8 +169,7 @@ def main():
         polled = consumer.poll(timeout_ms=500)
         if not polled:
             time.sleep(0.05)
-            # 重训完成检查
-            if retrain_in_progress and _retrain_done_after(lock_started_ts or 0.0):
+            if retrain_in_progress and (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                 dt = time.time() - (lock_started_ts or time.time())
                 try: s3.delete_object(Bucket=BUCKET, Key=LOCK_KEY)
                 except Exception: pass
@@ -177,7 +179,6 @@ def main():
                 retrain_in_progress = False
                 cooldown_until = time.time() + max(0, RETRAIN_COOLDOWN_S)
 
-                # 日志输出
                 try:
                     raw = s3.get_object(Bucket=BUCKET, Key=DONE_KEY)["Body"].read()
                     info = json.loads(raw.decode("utf-8"))
@@ -186,7 +187,6 @@ def main():
                     extra = f"grid={chosen_grid}"
                 print(f"[monitor:{pod}] retrain done ({extra}) after {dt:.3f}s — baseline refreshed; cooldown {RETRAIN_COOLDOWN_S}s.", flush=True)
                 log_metric(component="monitor", event="retrain_done_seen", grid=chosen_grid, wall_s=round(dt,3))
-
                 if len(window) >= DRIFT_WINDOW:
                     baseline_x = np.stack([t[0] for t in list(window)[-DRIFT_WINDOW:]], axis=0)
                 continue
@@ -198,18 +198,23 @@ def main():
                 if is_sentinel(rec):
                     all_sentinels += 1
                     if all_sentinels >= max(1, len(parts)):
-                        if retrain_in_progress and not _retrain_done_after(lock_started_ts or 0.0):
+                        if retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                             time.sleep(1.0); continue
                         print(f"[monitor:{pod}] all sentinels seen; exit.", flush=True)
                         sync_all_metrics_to_minio(); stop_probe(); return
                     continue
 
-                x, y = _xy_from_record(rec.value, feat_cols)
+                obj = json.loads(rec.value.decode("utf-8"))
+                feats = obj.get("features", {})
+                x = np.asarray([float(feats.get(c, 0.0)) for c in feat_cols], dtype=np.float32)
+                y = obj.get("label", None)
+                y = float(y) if y is not None else None
+
                 window.append((x, y))
                 stride_since_eval += 1
 
                 if retrain_in_progress:
-                    if _retrain_done_after(lock_started_ts or 0.0):
+                    if _last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0)):
                         dt = time.time() - (lock_started_ts or time.time())
                         try: s3.delete_object(Bucket=BUCKET, Key=LOCK_KEY)
                         except Exception: pass
@@ -231,7 +236,6 @@ def main():
                             baseline_x = np.stack([t[0] for t in list(window)[-DRIFT_WINDOW:]], axis=0)
                     continue
 
-                # 冷却中：跳过评估
                 if cooldown_until is not None and time.time() < cooldown_until:
                     continue
 
@@ -240,8 +244,8 @@ def main():
                     cur_x = np.stack([t[0] for t in list(window)[-DRIFT_WINDOW:]], axis=0)
                     js = _compute_js(baseline_x, cur_x, HIST_BINS)
 
-                    # —— 把 JS 写入资源采样的 js 字段 —— #
                     update_extra(js=js)
+                    _broadcast_js(js)
 
                     grid = None
                     if js >= JS_THR_C:   grid = "C"
@@ -257,11 +261,16 @@ def main():
                         ys = np.array([t[1] for t in list(window)[-DRIFT_WINDOW:]], dtype=np.float32)
                         mask = ~np.isnan(ys)
                         if mask.any():
-                            _save_latest_batch_xy(xs[mask], ys[mask], feat_cols)
+                            arr = np.concatenate([xs[mask].astype(np.float32), ys[mask].reshape(-1,1)], axis=1)
+                            with io.BytesIO() as f:
+                                np.save(f, arr, allow_pickle=False)
+                                save_bytes(BATCH_KEY, f.getvalue(), "application/octet-stream")
+                            save_bytes(BATCH_COL, json.dumps(feat_cols + [TARGET_COL]).encode("utf-8"), "application/json")
                         else:
                             save_bytes(BATCH_KEY, b"", "application/octet-stream")
 
-                        _signal_retrain(grid)
+                        save_bytes(LOCK_KEY, b"1\n", "text/plain")
+                        save_bytes(GRID_KEY, grid.encode(), "text/plain")
                         if MONITOR_SIGNAL_INFER_PAUSE:
                             save_bytes(PAUSE_INFER_KEY, b"1\n", "text/plain")
                         retrain_in_progress = True

@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os, io, json, time, hashlib, threading
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 
 import numpy as np
 import torch
@@ -13,7 +13,9 @@ from drst_common.config import (
     KAFKA_TOPIC, BATCH_SIZE, CONSUME_IDLE_S as _CFG_IDLE_S,
     MODEL_DIR, RESULT_DIR, BUCKET, INFER_STDOUT_EVERY, RELOAD_INTERVAL_S,
     GAIN_THR_PP, RETRAIN_TOPIC, TARGET_COL,
-    INFER_RESPECT_PAUSE_FLAG, PAUSE_INFER_KEY
+    INFER_RESPECT_PAUSE_FLAG, PAUSE_INFER_KEY,
+    JS_CURRENT_KEY, INFER_HIT_THR,  # 新增
+    ACC_THR,                       # 用于累计命中
 )
 from drst_common.kafka_io import (
     create_consumer, create_producer, partitions_for_topic,
@@ -42,8 +44,7 @@ try:
 except Exception:
     IDLE_S = 60
 
-ACC_THR  = float(getattr(_cfg, "ACC_THR", 0.25))
-_thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
+_thr_str = ("%.2f" % float(ACC_THR)).rstrip("0").rstrip(".")
 
 def _align_to_dim(X: np.ndarray, in_dim: int) -> np.ndarray:
     d = X.shape[1]
@@ -150,6 +151,25 @@ def _reload_daemon():
         _maybe_reload_model()
 threading.Thread(target=_reload_daemon, daemon=True).start()
 
+# —— 读取 monitor 广播的“当前 JS”（做 1s 缓存，避免高频拉 S3） —— #
+_last_js_val: Optional[float] = None
+_last_js_fetch_ts: float = 0.0
+def _read_js_current(max_age_s: float = 1.0) -> Optional[float]:
+    global _last_js_val, _last_js_fetch_ts
+    now = time.time()
+    if (_last_js_val is not None) and (now - _last_js_fetch_ts < max_age_s):
+        return _last_js_val
+    try:
+        raw = s3.get_object(Bucket=BUCKET, Key=JS_CURRENT_KEY)["Body"].read()
+        info = json.loads(raw.decode("utf-8"))
+        val = float(info.get("js"))
+        _last_js_val = val
+        _last_js_fetch_ts = now
+        return val
+    except Exception:
+        _last_js_fetch_ts = now
+        return None
+
 print(f"[{COMPONENT_NAME}] connecting Kafka…")
 consumer = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
 time.sleep(1.0)
@@ -158,9 +178,17 @@ print(f"[{COMPONENT_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
 
 save_bytes(f"{RESULT_DIR}/consumer_ready_{COMPONENT_NAME}.flag", b"", "text/plain")
 producer = create_producer()
-sentinel_seen = 0
-last_data_ts = time.time()
 
+# --- 新：记录“已收到 sentinel 的分区集合”（按本消费者 assignment 判定是否齐备） ---
+seen_parts: Set[int] = set()
+
+def _assigned_parts_now() -> Set[int]:
+    try:
+        return {tp.partition for tp in (consumer.assignment() or set())}
+    except Exception:
+        return set()
+
+last_data_ts = time.time()
 ts_hist:   List[float] = []
 true_hist: List[float] = []
 pred_b_hist: List[float] = []
@@ -192,35 +220,34 @@ def _process_batch(rows: List[dict]):
 
     denom = np.maximum(np.abs(labels), 1e-8)
     err_c = np.abs(pc - labels) / denom
-    batch_correct = int((err_c <= ACC_THR).sum())
+    batch_correct = int((err_c <= float(ACC_THR)).sum())  # 累计阈值
     batch_total   = len(rows)
     cum_correct  += batch_correct
     cum_total    += batch_total
     cum_acc = (cum_correct / max(1, cum_total))
 
-    err_b = np.abs(pb - labels) / denom
-    pct   = [50, 80, 90, 95, 99]
-    q_b   = np.percentile(err_b, pct).round(3)
-    q_c   = np.percentile(err_c, pct).round(3)
+    # 批内命中（按 INFER_HIT_THR）
+    hit_thr = float(INFER_HIT_THR)
+    hits = int((err_c <= hit_thr).sum())
+    hit_rate = (hits / max(1, batch_total))
 
+    # 写指标（最简）
     log_metric(
         component="infer", event="batch_metrics",
         batch_size=batch_total, latency_ms=round(wall_ms, 3),
+        hit_thr=hit_thr, hit_n=hits, hit_rate=round(hit_rate, 4),
         **{f"cumulative_accuracy@{_thr_str}": round(cum_acc, 3)},
-        base_p50=float(q_b[0]), base_p80=float(q_b[1]), base_p90=float(q_b[2]),
-        base_p95=float(q_b[3]), base_p99=float(q_b[4]),
-        adpt_p50=float(q_c[0]), adpt_p80=float(q_c[1]), adpt_p90=float(q_c[2]),
-        adpt_p95=float(q_c[3]), adpt_p99=float(q_c[4]),
         model_loading_ms=_model_loading_ms
     )
 
     _batch_idx += 1
     if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
+        js_val = _read_js_current()
+        js_str = ("%.3f" % js_val) if (js_val is not None) else "-"
         print(
-            f"[{COMPONENT_NAME}] batch#{_batch_idx} n={batch_total} t={wall_ms:.2f}ms "
-            f"cum@{_thr_str}={cum_acc:.3f} "
-            f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
-            f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
+            f"[{COMPONENT_NAME}] b#{_batch_idx} n={batch_total} {wall_ms:.2f}ms "
+            f"js={js_str} hit@{hit_thr:.2f}={hits}/{batch_total} ({hit_rate:.0%}) "
+            f"cum@{_thr_str}={cum_acc:.3f}",
             flush=True
         )
 
@@ -247,6 +274,7 @@ def _pause_flag_exists() -> bool:
 
 try:
     while True:
+        # —— 可选暂停（重训时）——
         if INFER_RESPECT_PAUSE_FLAG and _pause_flag_exists():
             if not paused:
                 if not consumer.assignment():
@@ -268,34 +296,56 @@ try:
 
         polled = consumer.poll(timeout_ms=1000)
         got_data = False
+
         for _, records in polled.items():
             for msg in records:
+                # 记录“本分区”已收到 sentinel
                 if _is_sentinel_msg(msg):
-                    sentinel_seen += 1
-                    print(f"[{COMPONENT_NAME}] got sentinel {sentinel_seen}/{num_parts}")
+                    seen_parts.add(getattr(msg, "partition", -1))
+                    ap = _assigned_parts_now()
+                    print(f"[{COMPONENT_NAME}] got sentinel from p{getattr(msg,'partition',-1)} "
+                          f"{len(seen_parts & ap)}/{len(ap)} (assigned)", flush=True)
                     continue
                 try:
                     v = json.loads(msg.value)
                     if isinstance(v, dict) and v.get("producer_done"):
-                        sentinel_seen += 1
-                        print(f"[{COMPONENT_NAME}] got sentinel {sentinel_seen}/{num_parts}")
+                        seen_parts.add(getattr(msg, "partition", -1))
+                        ap = _assigned_parts_now()
+                        print(f"[{COMPONENT_NAME}] got sentinel(dict) from p{getattr(msg,'partition',-1)} "
+                              f"{len(seen_parts & ap)}/{len(ap)} (assigned)", flush=True)
                         continue
                 except Exception:
-                    continue
+                    # 如果不是 JSON，按普通数据处理（兼容）
+                    pass
 
                 got_data = True
                 last_data_ts = time.time()
+                # 业务数据
+                try:
+                    v = json.loads(msg.value)
+                except Exception:
+                    continue
                 batch_buf.append(v)
                 if len(batch_buf) >= BATCH:
                     _process_batch(batch_buf); batch_buf.clear()
 
+        # —— 若没新数据，先 flush 缓冲 —— 
+        if not got_data and batch_buf:
+            _process_batch(batch_buf); batch_buf.clear()
+
+        # —— 新：按“本消费者 assignment”判定 sentinel 是否齐备 —— 
+        ap = _assigned_parts_now()
+        if ap and ap.issubset(seen_parts):
+            # 安全退出前 flush（上面已 flush，无数据亦可）
+            print(f"[{COMPONENT_NAME}] all assigned-partition sentinels received; exiting loop", flush=True)
+            break
+
+        # —— 闲置超时（兜底）——
         if not got_data:
-            if batch_buf:
-                _process_batch(batch_buf); batch_buf.clear()
-            if num_parts and sentinel_seen >= num_parts:
-                print(f"[{COMPONENT_NAME}] all sentinels received; exiting loop"); break
             if (time.time() - last_data_ts) > IDLE_S:
-                print(f"[{COMPONENT_NAME}] idle > {IDLE_S}s; exiting loop"); break
+                print(f"[{COMPONENT_NAME}] idle > {IDLE_S}s; exiting loop", flush=True)
+                break
+
 finally:
     arr_adj  = np.asarray(pred_c_hist,  np.float32)
     arr_orig = np.asarray(pred_b_hist,  np.float32)
