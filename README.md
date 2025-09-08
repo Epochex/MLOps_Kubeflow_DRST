@@ -155,8 +155,8 @@ The retrainer consumes the frozen window and tier flag, reuses the offline scale
 
 ### 2.6 `experiments/`
 Reproducible experiments and Kubeflow Pipelines assembly. `kubeflow/pipeline.py` defines the full KFP DAG — offline → (monitor | producer | infer) → plot — with an 8-minute wall-clock cap per streaming stage and consumer auto-shutdown on idle. `submit_pipeline.py` compiles `drift_demo_v2.yaml` and submits it to KFP (KFP host/namespace/experiment are provided via environment variables). `yamls/` contains example manifests for observability (e.g., Prometheus and Kafka Exporter). The folder enables a one-command workflow to compile and submit an end-to-end run: offline training, streaming drift detection and adaptive updates, and final charts/report generation.
-![Pipeline Overview](<docs/pipeline_runtime.png>)
-
+![Pipeline Overview](<docs/pipeline_runtime.png>)  
+![Pipeline Overview](<docs/pipeline_runtime3.png>)
 
 ### 2.7 `deploy/`
 #### 2.7.1 `Auto_deployment_k8s_kubeflow.sh`
