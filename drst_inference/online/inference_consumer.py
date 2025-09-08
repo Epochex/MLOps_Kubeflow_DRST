@@ -27,7 +27,14 @@ from drst_common.resource_probe import start as start_probe
 RUN_TAG  = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "cg-infer")
 
-POD_NAME = os.getenv("HOSTNAME", "infer")
+# —— 固定友好组件名：infer1 / infer2 / infer3 —— #
+_replica_env = os.getenv("INFER_REPLICA_ID", None)
+try:
+    _rep_id = int(_replica_env) if _replica_env is not None else 0
+except Exception:
+    _rep_id = 0
+COMPONENT_NAME = f"infer{_rep_id + 1}"
+
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
@@ -85,25 +92,25 @@ def _rows_to_matrix(rows: List[dict], feat_cols: List[str]) -> Tuple[np.ndarray,
         ts_list.append(r.get("send_ts"))
     return X, y, ts_list
 
-print(f"[infer:{POD_NAME}] loading artefacts…")
+print(f"[{COMPONENT_NAME}] loading artefacts…")
 SELECTED_FEATS = load_selected_feats()
 SCALER = load_scaler()
 
-stop_probe = start_probe(f"infer_{POD_NAME}")
+stop_probe = start_probe(COMPONENT_NAME)
 
 baseline_model, baseline_raw = load_model_by_key("baseline_model.pt")
 baseline_model = baseline_model.to(DEVICE).eval()
 baseline_in_dim = baseline_model.net[0].in_features
-print(f"[infer:{POD_NAME}] baseline in_dim = {baseline_in_dim}")
+print(f"[{COMPONENT_NAME}] baseline in_dim = {baseline_in_dim}")
 
 _latest = read_latest()
 _cur_key = (_latest[0] if _latest else "model.pt")
 try:
     current_model, curr_raw = load_model_by_key(_cur_key)
     current_model = current_model.to(DEVICE).eval()
-    print(f"[infer:{POD_NAME}] current model = {_cur_key}")
+    print(f"[{COMPONENT_NAME}] current model = {_cur_key}")
 except Exception as e:
-    print(f"[infer:{POD_NAME}] WARN load {_cur_key} failed: {e}; fallback -> baseline")
+    print(f"[{COMPONENT_NAME}] WARN load {_cur_key} failed: {e}; fallback -> baseline")
     current_model, curr_raw = baseline_model, baseline_raw
 cur_sig = hashlib.md5(curr_raw).hexdigest()
 
@@ -123,7 +130,7 @@ def _maybe_reload_model():
         new_acc, base_acc = _pick_metric(metrics)
         gain_pp  = new_acc - base_acc
         if ("acc@0.15" in metrics or f"acc@{_thr_str}" in metrics) and (gain_pp < GAIN_THR_PP):
-            print(f"[infer:{POD_NAME}] skip reload: Δ{gain_pp:+.3f}pp < {GAIN_THR_PP}")
+            print(f"[{COMPONENT_NAME}] skip reload: Δ{gain_pp:+.3f}pp < {GAIN_THR_PP}")
             return
         t0 = time.perf_counter()
         mdl = m.to(DEVICE).eval()
@@ -133,9 +140,9 @@ def _maybe_reload_model():
         log_metric(component="infer", event="hot_reload",
                    model_key=model_key, metrics_key=metrics_key,
                    gain_pp=round(gain_pp, 4), load_ms=_model_loading_ms)
-        print(f"[infer:{POD_NAME}] hot reloaded -> {model_key} (Δacc@{_thr_str}={gain_pp:+.3f}pp, load={_model_loading_ms}ms)")
+        print(f"[{COMPONENT_NAME}] hot reloaded -> {model_key} (Δacc@{_thr_str}={gain_pp:+.3f}pp, load={_model_loading_ms}ms)")
     except Exception as e:
-        print(f"[infer:{POD_NAME}] reload error: {e}")
+        print(f"[{COMPONENT_NAME}] reload error: {e}")
 
 def _reload_daemon():
     while True:
@@ -143,13 +150,13 @@ def _reload_daemon():
         _maybe_reload_model()
 threading.Thread(target=_reload_daemon, daemon=True).start()
 
-print(f"[infer:{POD_NAME}] connecting Kafka…")
+print(f"[{COMPONENT_NAME}] connecting Kafka…")
 consumer = create_consumer(KAFKA_TOPIC, group_id=GROUP_ID)
 time.sleep(1.0)
 num_parts = len(partitions_for_topic(KAFKA_TOPIC))
-print(f"[infer:{POD_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
+print(f"[{COMPONENT_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
 
-save_bytes(f"{RESULT_DIR}/consumer_ready_{POD_NAME}.flag", b"", "text/plain")
+save_bytes(f"{RESULT_DIR}/consumer_ready_{COMPONENT_NAME}.flag", b"", "text/plain")
 producer = create_producer()
 sentinel_seen = 0
 last_data_ts = time.time()
@@ -210,7 +217,7 @@ def _process_batch(rows: List[dict]):
     _batch_idx += 1
     if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
         print(
-            f"[infer:{POD_NAME}] batch#{_batch_idx} n={batch_total} t={wall_ms:.2f}ms "
+            f"[{COMPONENT_NAME}] batch#{_batch_idx} n={batch_total} t={wall_ms:.2f}ms "
             f"cum@{_thr_str}={cum_acc:.3f} "
             f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
             f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
@@ -227,7 +234,7 @@ def _process_batch(rows: List[dict]):
     except Exception:
         pass
 
-print(f"[infer:{POD_NAME}] ready; consuming…")
+print(f"[{COMPONENT_NAME}] ready; consuming…")
 batch_buf: List[dict] = []
 BATCH = max(1, BATCH_SIZE)
 
@@ -240,18 +247,16 @@ def _pause_flag_exists() -> bool:
 
 try:
     while True:
-        # —— 可选暂停 —— #
         if INFER_RESPECT_PAUSE_FLAG and _pause_flag_exists():
             if not paused:
-                # 确保拿到 assignment
                 if not consumer.assignment():
                     consumer.poll(timeout_ms=100)
                 parts = list(consumer.assignment())
                 if parts:
                     consumer.pause(*parts)
                 paused = True
-                print(f"[infer:{POD_NAME}] paused by flag; waiting retrain to finish…", flush=True)
-            last_data_ts = time.time()  # 避免因 idle 退出
+                print(f"[{COMPONENT_NAME}] paused by flag; waiting retrain to finish…", flush=True)
+            last_data_ts = time.time()
             time.sleep(0.5)
             continue
         elif paused:
@@ -259,7 +264,7 @@ try:
             if parts:
                 consumer.resume(*parts)
             paused = False
-            print(f"[infer:{POD_NAME}] resumed; continue consuming.", flush=True)
+            print(f"[{COMPONENT_NAME}] resumed; continue consuming.", flush=True)
 
         polled = consumer.poll(timeout_ms=1000)
         got_data = False
@@ -267,13 +272,13 @@ try:
             for msg in records:
                 if _is_sentinel_msg(msg):
                     sentinel_seen += 1
-                    print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
+                    print(f"[{COMPONENT_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                     continue
                 try:
                     v = json.loads(msg.value)
                     if isinstance(v, dict) and v.get("producer_done"):
                         sentinel_seen += 1
-                        print(f"[infer:{POD_NAME}] got sentinel {sentinel_seen}/{num_parts}")
+                        print(f"[{COMPONENT_NAME}] got sentinel {sentinel_seen}/{num_parts}")
                         continue
                 except Exception:
                     continue
@@ -288,20 +293,20 @@ try:
             if batch_buf:
                 _process_batch(batch_buf); batch_buf.clear()
             if num_parts and sentinel_seen >= num_parts:
-                print(f"[infer:{POD_NAME}] all sentinels received; exiting loop"); break
+                print(f"[{COMPONENT_NAME}] all sentinels received; exiting loop"); break
             if (time.time() - last_data_ts) > IDLE_S:
-                print(f"[infer:{POD_NAME}] idle > {IDLE_S}s; exiting loop"); break
+                print(f"[{COMPONENT_NAME}] idle > {IDLE_S}s; exiting loop"); break
 finally:
     arr_adj  = np.asarray(pred_c_hist,  np.float32)
     arr_orig = np.asarray(pred_b_hist,  np.float32)
     arr_true = np.asarray(true_hist,    np.float32)
     arr_ts   = np.asarray(ts_hist,      np.float64)
-    local_npz = f"/tmp/{POD_NAME}_inference_trace.npz"
+    local_npz = f"/tmp/{COMPONENT_NAME}_inference_trace.npz"
     np.savez(local_npz, ts=arr_ts, pred_adj=arr_adj, pred_orig=arr_orig, true=arr_true)
     with open(local_npz, "rb") as f:
-        save_bytes(f"{RESULT_DIR}/{POD_NAME}_inference_trace.npz", f.read(), "application/octet-stream")
-    print(f"[infer:{POD_NAME}] trace saved: {len(arr_true)} samples")
+        save_bytes(f"{RESULT_DIR}/{COMPONENT_NAME}_inference_trace.npz", f.read(), "application/octet-stream")
+    print(f"[{COMPONENT_NAME}] trace saved: {len(arr_true)} samples")
 
     sync_all_metrics_to_minio()
     stop_probe()
-    print(f"[infer:{POD_NAME}] done.")
+    print(f"[{COMPONENT_NAME}] done.")

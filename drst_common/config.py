@@ -95,7 +95,7 @@ RETRAIN_EARLY_PATIENCE = 2
 RETRAIN_MODE           = "auto"   # "scratch" | "finetune" | "auto"
 RETRAIN_FREEZE_N       = 0
 RETRAIN_VAL_FRAC       = 0.2
-RETRAIN_WATCH_MAX_SECS  = int(os.getenv("RETRAIN_WATCH_MAX_SECS", "3600") or 480)
+RETRAIN_WATCH_MAX_SECS  = int(os.getenv("RETRAIN_WATCH_MAX_SECS", "480") or 480)
 
 # ===== 动态重训网格 =====
 def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
