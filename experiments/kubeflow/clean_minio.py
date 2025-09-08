@@ -110,10 +110,10 @@ def main():
         return 0
 
     except EndpointConnectionError as e:
-        print(f"\n[连接失败] 无法访问 MinIO S3 端点： {MINIO_S3_ENDPOINT}\n{e}")
+        print(f"[连接失败] 无法访问 MinIO S3 端点：{MINIO_S3_ENDPOINT}\n{e}")
         return 2
     except Exception as e:
-        print(f"\n[ERR] 未处理异常：{e}")
+        print(f"[ERR] 未处理异常：{e}")
         return 1
 
 if __name__ == "__main__":

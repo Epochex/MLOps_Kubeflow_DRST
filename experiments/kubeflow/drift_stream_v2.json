@@ -1,0 +1,655 @@
+{
+  "components": {
+    "comp-infer-op": {
+      "executorLabel": "exec-infer-op",
+      "inputDefinitions": {
+        "parameters": {
+          "kafka_topic": {
+            "defaultValue": "latencyTopic",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "max_wall_secs": {
+            "defaultValue": 480.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "replica_id": {
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "wait_retrain": {
+            "defaultValue": false,
+            "isOptional": true,
+            "parameterType": "BOOLEAN"
+          }
+        }
+      }
+    },
+    "comp-infer-op-2": {
+      "executorLabel": "exec-infer-op-2",
+      "inputDefinitions": {
+        "parameters": {
+          "kafka_topic": {
+            "defaultValue": "latencyTopic",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "max_wall_secs": {
+            "defaultValue": 480.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "replica_id": {
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "wait_retrain": {
+            "defaultValue": false,
+            "isOptional": true,
+            "parameterType": "BOOLEAN"
+          }
+        }
+      }
+    },
+    "comp-infer-op-3": {
+      "executorLabel": "exec-infer-op-3",
+      "inputDefinitions": {
+        "parameters": {
+          "kafka_topic": {
+            "defaultValue": "latencyTopic",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "max_wall_secs": {
+            "defaultValue": 480.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "replica_id": {
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "wait_retrain": {
+            "defaultValue": false,
+            "isOptional": true,
+            "parameterType": "BOOLEAN"
+          }
+        }
+      }
+    },
+    "comp-monitor-op": {
+      "executorLabel": "exec-monitor-op",
+      "inputDefinitions": {
+        "parameters": {
+          "drift_window": {
+            "defaultValue": 300.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "eval_stride": {
+            "defaultValue": 50.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "hist_bins": {
+            "defaultValue": 64.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "idle_timeout_s": {
+            "defaultValue": 60.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "infer_pause_on_retrain": {
+            "defaultValue": false,
+            "isOptional": true,
+            "parameterType": "BOOLEAN"
+          },
+          "js_calib_samples": {
+            "defaultValue": 400.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "js_quantiles": {
+            "defaultValue": "0.90,0.97,0.995",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "kafka_topic": {
+            "defaultValue": "latencyTopic",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "max_wall_secs": {
+            "defaultValue": 480.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          }
+        }
+      }
+    },
+    "comp-offline-training-op": {
+      "executorLabel": "exec-offline-training-op"
+    },
+    "comp-plot-op": {
+      "executorLabel": "exec-plot-op"
+    },
+    "comp-producer-op": {
+      "executorLabel": "exec-producer-op",
+      "inputDefinitions": {
+        "parameters": {
+          "interval_ms": {
+            "defaultValue": 200.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "kafka_topic": {
+            "defaultValue": "latencyTopic",
+            "isOptional": true,
+            "parameterType": "STRING"
+          },
+          "producer_stages": {
+            "defaultValue": "",
+            "isOptional": true,
+            "parameterType": "STRING"
+          }
+        }
+      }
+    },
+    "comp-retrain-op": {
+      "executorLabel": "exec-retrain-op",
+      "inputDefinitions": {
+        "parameters": {
+          "max_wall_secs": {
+            "defaultValue": 480.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "poll_interval_s": {
+            "defaultValue": 2.0,
+            "isOptional": true,
+            "parameterType": "NUMBER_INTEGER"
+          },
+          "watch": {
+            "defaultValue": true,
+            "isOptional": true,
+            "parameterType": "BOOLEAN"
+          }
+        }
+      }
+    }
+  },
+  "deploymentSpec": {
+    "executors": {
+      "exec-infer-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "infer_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str       = DEFAULT_KAFKA_TOPIC,\n    wait_retrain: bool     = False,\n    max_wall_secs: int     = 480,\n):\n    \"\"\"\u5728\u7ebf\u63a8\u7406\u526f\u672c\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    # Kafka\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    # \u5176\u5b83\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\n    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/infer:latest"
+        }
+      },
+      "exec-infer-op-2": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "infer_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str       = DEFAULT_KAFKA_TOPIC,\n    wait_retrain: bool     = False,\n    max_wall_secs: int     = 480,\n):\n    \"\"\"\u5728\u7ebf\u63a8\u7406\u526f\u672c\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    # Kafka\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    # \u5176\u5b83\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\n    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/infer:latest"
+        }
+      },
+      "exec-infer-op-3": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "infer_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str       = DEFAULT_KAFKA_TOPIC,\n    wait_retrain: bool     = False,\n    max_wall_secs: int     = 480,\n):\n    \"\"\"\u5728\u7ebf\u63a8\u7406\u526f\u672c\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    # Kafka\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    # \u5176\u5b83\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\n    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/infer:latest"
+        }
+      },
+      "exec-monitor-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "monitor_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef monitor_op(\n    kafka_topic: str         = DEFAULT_KAFKA_TOPIC,\n    drift_window: int        = 300,\n    eval_stride: int         = 50,\n    hist_bins: int           = 64,\n    idle_timeout_s: int      = 60,\n    max_wall_secs: int       = 480,\n    js_quantiles: str        = \"0.90,0.97,0.995\",\n    js_calib_samples: int    = 400,\n    infer_pause_on_retrain: bool = False,\n):\n    \"\"\"JS \u6f02\u79fb\u76d1\u63a7\uff0c\u89e6\u53d1 retrain\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    # Kafka\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    # \u76d1\u63a7\u53c2\u6570\n    os.environ[\"DRIFT_WINDOW\"]  = str(drift_window)\n    os.environ[\"EVAL_STRIDE\"]   = str(eval_stride)\n    os.environ[\"HIST_BINS\"]     = str(hist_bins)\n    os.environ[\"MONITOR_IDLE_TIMEOUT_S\"] = str(idle_timeout_s)\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\n    os.environ[\"JS_QUANTILES\"]     = js_quantiles\n    os.environ[\"JS_CALIB_SAMPLES\"] = str(js_calib_samples)\n    os.environ[\"MONITOR_SIGNAL_INFER_PAUSE\"] = \"1\" if infer_pause_on_retrain else \"0\"\n    subprocess.run([\"python\", \"-m\", \"drst_drift.monitor\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/monitor:latest"
+        }
+      },
+      "exec-offline-training-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "offline_training_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef offline_training_op():\n    \"\"\"\u7ebf\u4e0b\u521d\u8bad\uff08\u5199 feature_cols.json / baseline_model.pt / latest \u6307\u9488\uff09\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # \u663e\u5f0f\u6ce8\u5165 S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    subprocess.run([\"python\", \"-m\", \"drst_inference.offline.train_offline\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/offline:latest"
+        }
+      },
+      "exec-plot-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "plot_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef plot_op():\n    \"\"\"\u6c47\u603b\u7ed8\u56fe\uff1b\u5931\u8d25\u4e0d\u5f71\u54cd\u4e3b\u6d41\u7a0b\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    try:\n        subprocess.run([\"python\", \"-m\", \"drst_inference.plotting.plot_final\"], check=True)\n    except Exception as e:\n        print(f\"[plot_final] skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\", \"experiments/kubeflow/summarize_resources.py\"], check=True)\n    except Exception as e:\n        print(f\"[plot_op] summarize_resources.py skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\", \"-m\", \"drst_inference.plotting.plot_report\"], check=True)\n    except Exception as e:\n        print(f\"[plot_report] skipped: {e}\", flush=True)\n\n"
+          ],
+          "image": "hirschazer/plot:latest"
+        }
+      },
+      "exec-producer-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "producer_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef producer_op(\n    kafka_topic: str = DEFAULT_KAFKA_TOPIC,\n    interval_ms: int = 200,\n    producer_stages: str = \"\",\n):\n    \"\"\"Kafka producer\uff08\u9650\u6d41\uff09\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # Kafka\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    # S3\uff08producer \u4e5f\u8981\u8bfb CSV\uff09\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n    # \u8282\u6d41\n    if producer_stages:\n        os.environ[\"PRODUCER_STAGES\"] = producer_stages\n    os.environ[\"INTERVAL_MS\"] = str(interval_ms)\n    subprocess.run([\"python\", \"-m\", \"drst_inference.online.producer\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/producer:latest"
+        }
+      },
+      "exec-retrain-op": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "retrain_op"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef retrain_op(\n    watch: bool          = True,\n    poll_interval_s: int = 2,\n    max_wall_secs: int   = 480,\n):\n    \"\"\"\u52a8\u6001\u91cd\u8bad watcher\uff1a\u53d1\u73b0 lock \u5c31\u6267\u884c\u4e00\u6b21 dynamic_retrain\uff1b\u6301\u7eed\u5230 max_wall_secs\"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    # S3 for dynamic_retrain\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\n    os.environ[\"RETRAIN_WATCH\"] = \"1\" if watch else \"0\"\n    os.environ[\"POLL_INTERVAL_S\"] = str(poll_interval_s)\n    os.environ[\"MAX_WALL_SECS\"]   = str(max_wall_secs)\n    subprocess.run([\"python\", \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
+          ],
+          "image": "hirschazer/retrain:latest"
+        }
+      }
+    }
+  },
+  "pipelineInfo": {
+    "description": "Drift monitoring + dynamic retraining + online inference (v2)",
+    "name": "drift-stream-v2"
+  },
+  "root": {
+    "dag": {
+      "tasks": {
+        "infer-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-infer-op"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "kafka_topic": {
+                "componentInputParameter": "kafka_topic"
+              },
+              "max_wall_secs": {
+                "componentInputParameter": "infer_max_wall_secs"
+              },
+              "replica_id": {
+                "runtimeValue": {
+                  "constant": 0.0
+                }
+              },
+              "wait_retrain": {
+                "componentInputParameter": "infer_wait_retrain"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "infer-op"
+          }
+        },
+        "infer-op-2": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-infer-op-2"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "kafka_topic": {
+                "componentInputParameter": "kafka_topic"
+              },
+              "max_wall_secs": {
+                "componentInputParameter": "infer_max_wall_secs"
+              },
+              "replica_id": {
+                "runtimeValue": {
+                  "constant": 1.0
+                }
+              },
+              "wait_retrain": {
+                "componentInputParameter": "infer_wait_retrain"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "infer-op-2"
+          }
+        },
+        "infer-op-3": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-infer-op-3"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "kafka_topic": {
+                "componentInputParameter": "kafka_topic"
+              },
+              "max_wall_secs": {
+                "componentInputParameter": "infer_max_wall_secs"
+              },
+              "replica_id": {
+                "runtimeValue": {
+                  "constant": 2.0
+                }
+              },
+              "wait_retrain": {
+                "componentInputParameter": "infer_wait_retrain"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "infer-op-3"
+          }
+        },
+        "monitor-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-monitor-op"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "drift_window": {
+                "componentInputParameter": "drift_window"
+              },
+              "eval_stride": {
+                "componentInputParameter": "eval_stride"
+              },
+              "hist_bins": {
+                "componentInputParameter": "hist_bins"
+              },
+              "idle_timeout_s": {
+                "componentInputParameter": "idle_timeout_s"
+              },
+              "infer_pause_on_retrain": {
+                "componentInputParameter": "infer_pause_on_retrain"
+              },
+              "js_calib_samples": {
+                "componentInputParameter": "js_calib_samples"
+              },
+              "js_quantiles": {
+                "componentInputParameter": "js_quantiles"
+              },
+              "kafka_topic": {
+                "componentInputParameter": "kafka_topic"
+              },
+              "max_wall_secs": {
+                "componentInputParameter": "max_wall_secs"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "monitor-op"
+          }
+        },
+        "offline-training-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-offline-training-op"
+          },
+          "taskInfo": {
+            "name": "offline-training-op"
+          }
+        },
+        "plot-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-plot-op"
+          },
+          "dependentTasks": [
+            "infer-op",
+            "infer-op-2",
+            "infer-op-3",
+            "monitor-op",
+            "producer-op",
+            "retrain-op"
+          ],
+          "taskInfo": {
+            "name": "plot-op"
+          }
+        },
+        "producer-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-producer-op"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "interval_ms": {
+                "componentInputParameter": "producer_interval_ms"
+              },
+              "kafka_topic": {
+                "componentInputParameter": "kafka_topic"
+              },
+              "producer_stages": {
+                "componentInputParameter": "producer_stages"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "producer-op"
+          }
+        },
+        "retrain-op": {
+          "cachingOptions": {},
+          "componentRef": {
+            "name": "comp-retrain-op"
+          },
+          "dependentTasks": [
+            "offline-training-op"
+          ],
+          "inputs": {
+            "parameters": {
+              "max_wall_secs": {
+                "componentInputParameter": "retrain_max_wall_secs"
+              },
+              "poll_interval_s": {
+                "componentInputParameter": "retrain_poll_interval_s"
+              },
+              "watch": {
+                "componentInputParameter": "retrain_watch"
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "retrain-op"
+          }
+        }
+      }
+    },
+    "inputDefinitions": {
+      "parameters": {
+        "drift_window": {
+          "defaultValue": 300.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "eval_stride": {
+          "defaultValue": 50.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "hist_bins": {
+          "defaultValue": 64.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "idle_timeout_s": {
+          "defaultValue": 60.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "image": {
+          "defaultValue": "unused",
+          "isOptional": true,
+          "parameterType": "STRING"
+        },
+        "infer_max_wall_secs": {
+          "defaultValue": 480.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "infer_pause_on_retrain": {
+          "defaultValue": false,
+          "isOptional": true,
+          "parameterType": "BOOLEAN"
+        },
+        "infer_wait_retrain": {
+          "defaultValue": false,
+          "isOptional": true,
+          "parameterType": "BOOLEAN"
+        },
+        "js_calib_samples": {
+          "defaultValue": 400.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "js_quantiles": {
+          "defaultValue": "0.90,0.97,0.995",
+          "isOptional": true,
+          "parameterType": "STRING"
+        },
+        "kafka_topic": {
+          "defaultValue": "latencyTopic",
+          "isOptional": true,
+          "parameterType": "STRING"
+        },
+        "max_wall_secs": {
+          "defaultValue": 480.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "producer_interval_ms": {
+          "defaultValue": 200.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "producer_stages": {
+          "defaultValue": "",
+          "isOptional": true,
+          "parameterType": "STRING"
+        },
+        "retrain_max_wall_secs": {
+          "defaultValue": 480.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "retrain_poll_interval_s": {
+          "defaultValue": 2.0,
+          "isOptional": true,
+          "parameterType": "NUMBER_INTEGER"
+        },
+        "retrain_watch": {
+          "defaultValue": true,
+          "isOptional": true,
+          "parameterType": "BOOLEAN"
+        }
+      }
+    }
+  },
+  "schemaVersion": "2.1.0",
+  "sdkVersion": "kfp-2.12.2"
+}

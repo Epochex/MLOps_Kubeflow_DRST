@@ -1,3 +1,4 @@
+# ===== 文件: drst_inference/online/inference_consumer.py =====
 #!/usr/bin/env python3
 from __future__ import annotations
 import os, io, json, time, hashlib, threading
@@ -11,7 +12,8 @@ from drst_common import config as _cfg
 from drst_common.config import (
     KAFKA_TOPIC, BATCH_SIZE, CONSUME_IDLE_S as _CFG_IDLE_S,
     MODEL_DIR, RESULT_DIR, BUCKET, INFER_STDOUT_EVERY, RELOAD_INTERVAL_S,
-    GAIN_THR_PP, RETRAIN_TOPIC, TARGET_COL
+    GAIN_THR_PP, RETRAIN_TOPIC, TARGET_COL,
+    INFER_RESPECT_PAUSE_FLAG, PAUSE_INFER_KEY
 )
 from drst_common.kafka_io import (
     create_consumer, create_producer, partitions_for_topic,
@@ -70,6 +72,18 @@ def _is_sentinel_msg(msg) -> bool:
     except Exception:
         pass
     return False
+
+def _rows_to_matrix(rows: List[dict], feat_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, List[Optional[str]]]:
+    X = np.zeros((len(rows), len(feat_cols)), dtype=np.float32)
+    y = np.zeros((len(rows),), dtype=np.float32)
+    ts_list: List[Optional[str]] = []
+    for i, r in enumerate(rows):
+        feats = r.get("features", {})
+        for j, c in enumerate(feat_cols):
+            X[i, j] = float(feats.get(c, 0.0))
+        y[i] = float(r.get("label", 0.0))
+        ts_list.append(r.get("send_ts"))
+    return X, y, ts_list
 
 print(f"[infer:{POD_NAME}] loading artefacts…")
 SELECTED_FEATS = load_selected_feats()
@@ -149,36 +163,11 @@ cum_correct = 0
 cum_total   = 0
 _batch_idx  = 0
 
-def _extract_vec_label_ts(row: dict) -> Tuple[List[float], Optional[float], Optional[str]]:
-    if isinstance(row, dict) and isinstance(row.get("features"), dict):
-        fdict = row["features"]
-        label_val = row.get("label", row.get(TARGET_COL))
-        ts = row.get("send_ts")
-    else:
-        fdict = row if isinstance(row, dict) else {}
-        label_val = (row.get(TARGET_COL) if isinstance(row, dict) else None)
-        ts = (row.get("send_ts") if isinstance(row, dict) else None)
-    vec = [float(fdict.get(c, 0.0)) for c in SELECTED_FEATS]
-    label: Optional[float]
-    try:
-        label = float(label_val) if label_val is not None else None
-    except Exception:
-        label = None
-    return vec, label, ts
+paused = False
 
 def _process_batch(rows: List[dict]):
     global cum_correct, cum_total, _batch_idx
-    X_list: List[List[float]] = []
-    labels_list: List[Optional[float]] = []
-    send_ts_list: List[Optional[str]] = []
-    for r in rows:
-        vec, lab, ts = _extract_vec_label_ts(r)
-        X_list.append(vec); labels_list.append(lab); send_ts_list.append(ts)
-
-    X_raw = np.asarray(X_list, dtype=np.float32)
-    labels = np.array([np.nan if (v is None) else float(v) for v in labels_list], dtype=np.float32)
-    mask = np.isfinite(labels)
-
+    X_raw, labels, send_ts = _rows_to_matrix(rows, SELECTED_FEATS)
     X_sc = SCALER.transform(X_raw)
 
     with _model_lock:
@@ -194,59 +183,47 @@ def _process_batch(rows: List[dict]):
         pc = mdl            (torch.from_numpy(X_c).to(DEVICE)).cpu().numpy().ravel()
     wall_ms = (time.perf_counter() - t0) * 1000.0
 
-    if mask.any():
-        y = labels[mask]
-        pb_m = pb[mask]
-        pc_m = pc[mask]
-        denom = np.maximum(np.abs(y), 1e-8)
-        err_c = np.abs(pc_m - y) / denom
-        err_b = np.abs(pb_m - y) / denom
+    denom = np.maximum(np.abs(labels), 1e-8)
+    err_c = np.abs(pc - labels) / denom
+    batch_correct = int((err_c <= ACC_THR).sum())
+    batch_total   = len(rows)
+    cum_correct  += batch_correct
+    cum_total    += batch_total
+    cum_acc = (cum_correct / max(1, cum_total))
 
-        batch_correct = int((err_c <= ACC_THR).sum())
-        batch_total   = int(mask.sum())
-        cum_correct  += batch_correct
-        cum_total    += batch_total
-        cum_acc = (cum_correct / max(1, cum_total))
+    err_b = np.abs(pb - labels) / denom
+    pct   = [50, 80, 90, 95, 99]
+    q_b   = np.percentile(err_b, pct).round(3)
+    q_c   = np.percentile(err_c, pct).round(3)
 
-        pct   = [50, 80, 90, 95, 99]
-        q_b   = np.percentile(err_b, pct).round(3)
-        q_c   = np.percentile(err_c, pct).round(3)
+    log_metric(
+        component="infer", event="batch_metrics",
+        batch_size=batch_total, latency_ms=round(wall_ms, 3),
+        **{f"cumulative_accuracy@{_thr_str}": round(cum_acc, 3)},
+        base_p50=float(q_b[0]), base_p80=float(q_b[1]), base_p90=float(q_b[2]),
+        base_p95=float(q_b[3]), base_p99=float(q_b[4]),
+        adpt_p50=float(q_c[0]), adpt_p80=float(q_c[1]), adpt_p90=float(q_c[2]),
+        adpt_p95=float(q_c[3]), adpt_p99=float(q_c[4]),
+        model_loading_ms=_model_loading_ms
+    )
 
-        log_metric(
-            component="infer", event="batch_metrics",
-            batch_size=len(rows), labeled=batch_total, latency_ms=round(wall_ms, 3),
-            **{f"cumulative_accuracy@{_thr_str}": round(cum_acc, 3)},
-            base_p50=float(q_b[0]), base_p80=float(q_b[1]), base_p90=float(q_b[2]),
-            base_p95=float(q_b[3]), base_p99=float(q_b[4]),
-            adpt_p50=float(q_c[0]), adpt_p80=float(q_c[1]), adpt_p90=float(q_c[2]),
-            adpt_p95=float(q_c[3]), adpt_p99=float(q_c[4]),
-            model_loading_ms=_model_loading_ms
+    _batch_idx += 1
+    if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
+        print(
+            f"[infer:{POD_NAME}] batch#{_batch_idx} n={batch_total} t={wall_ms:.2f}ms "
+            f"cum@{_thr_str}={cum_acc:.3f} "
+            f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
+            f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
+            flush=True
         )
 
-        _batch_idx += 1
-        if INFER_STDOUT_EVERY > 0 and (_batch_idx % INFER_STDOUT_EVERY == 0):
-            print(
-                f"[infer:{POD_NAME}] batch#{_batch_idx} n={len(rows)} t={wall_ms:.2f}ms "
-                f"cum@{_thr_str}={cum_acc:.3f} "
-                f"adpt[p50,p90,p95,p99]={q_c[0]:.3f},{q_c[2]:.3f},{q_c[3]:.3f},{q_c[4]:.3f} "
-                f"base[p50,p90,p95,p99]={q_b[0]:.3f},{q_b[2]:.3f},{q_b[3]:.3f},{q_b[4]:.3f}",
-                flush=True
-            )
-
-        pred_b_hist.extend(pb_m.tolist()); pred_c_hist.extend(pc_m.tolist()); true_hist.extend(y.tolist())
-        for ts in np.array(send_ts_list, dtype=object)[mask]:
-            try: t = datetime.fromisoformat(str(ts).rstrip("Z")).timestamp()
-            except Exception: t = time.time()
-            ts_hist.append(float(t))
-    else:
-        log_metric(
-            component="infer", event="batch_metrics",
-            batch_size=len(rows), labeled=0, latency_ms=round(wall_ms, 3),
-            model_loading_ms=_model_loading_ms
-        )
-
+    pred_b_hist.extend(pb.tolist()); pred_c_hist.extend(pc.tolist()); true_hist.extend(labels.tolist())
+    for ts in send_ts:
+        try: t = datetime.fromisoformat(str(ts).rstrip("Z")).timestamp()
+        except Exception: t = time.time()
+        ts_hist.append(float(t))
     try:
-        producer.send(RETRAIN_TOPIC, {"processed": len(rows)})
+        producer.send(RETRAIN_TOPIC, {"processed": batch_total})
     except Exception:
         pass
 
@@ -254,8 +231,36 @@ print(f"[infer:{POD_NAME}] ready; consuming…")
 batch_buf: List[dict] = []
 BATCH = max(1, BATCH_SIZE)
 
+def _pause_flag_exists() -> bool:
+    try:
+        s3.head_object(Bucket=BUCKET, Key=PAUSE_INFER_KEY)
+        return True
+    except Exception:
+        return False
+
 try:
     while True:
+        # —— 可选暂停 —— #
+        if INFER_RESPECT_PAUSE_FLAG and _pause_flag_exists():
+            if not paused:
+                # 确保拿到 assignment
+                if not consumer.assignment():
+                    consumer.poll(timeout_ms=100)
+                parts = list(consumer.assignment())
+                if parts:
+                    consumer.pause(*parts)
+                paused = True
+                print(f"[infer:{POD_NAME}] paused by flag; waiting retrain to finish…", flush=True)
+            last_data_ts = time.time()  # 避免因 idle 退出
+            time.sleep(0.5)
+            continue
+        elif paused:
+            parts = list(consumer.assignment())
+            if parts:
+                consumer.resume(*parts)
+            paused = False
+            print(f"[infer:{POD_NAME}] resumed; continue consuming.", flush=True)
+
         polled = consumer.poll(timeout_ms=1000)
         got_data = False
         for _, records in polled.items():

@@ -14,6 +14,7 @@ from drst_common.config import (
 )
 from drst_common.minio_helper import load_csv, s3
 from drst_common.kafka_io import create_producer, broadcast_sentinel, partitions_for_topic
+from drst_common.resource_probe import start as start_probe  # <<< 新增
 
 TOPIC = os.getenv("KAFKA_TOPIC", "latencyTopic")
 RUN_ID = os.getenv("RUN_ID") or time.strftime("%Y%m%d%H%M%S", time.gmtime())
@@ -91,53 +92,61 @@ def _align(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
     return df
 
 def main():
-    feat_cols = _load_feature_cols()
-    parts = partitions_for_topic(TOPIC)
-    print(f"[producer:producer] partitions discovered: {parts}", flush=True)
+    # 资源采样（producer）
+    stop_probe = start_probe("producer")
 
-    df1 = _select_rows(load_csv(KEY_COMBINED), "tail", BRIDGE_N)
-    print(f"[producer:producer] stage1: key={KEY_COMBINED} take=tail rows={len(df1)}", flush=True)
-    df2 = _select_rows(load_csv(KEY_RANDOM), "head", RAND_N)
-    print(f"[producer:producer] stage2: key={KEY_RANDOM} take=head rows={len(df2)}", flush=True)
     try:
-        df3 = _select_rows(load_csv(KEY_STIM), "head", STIM_N)
-    except Exception:
-        df3 = pd.DataFrame()
-    print(f"[producer:producer] stage3: key={KEY_STIM} take=head rows={len(df3)}", flush=True)
+        feat_cols = _load_feature_cols()
+        parts = partitions_for_topic(TOPIC)
+        print(f"[producer:producer] partitions discovered: {parts}", flush=True)
 
-    df_list = [
-        _align(df1, feat_cols),
-        _align(df2, feat_cols),
-        (_align(df3, feat_cols) if not df3.empty else pd.DataFrame(columns=feat_cols+[TARGET_COL]))
-    ]
+        df1 = _select_rows(load_csv(KEY_COMBINED), "tail", BRIDGE_N)
+        print(f"[producer:producer] stage1: key={KEY_COMBINED} take=tail rows={len(df1)}", flush=True)
+        df2 = _select_rows(load_csv(KEY_RANDOM), "head", RAND_N)
+        print(f"[producer:producer] stage2: key={KEY_RANDOM} take=head rows={len(df2)}", flush=True)
+        try:
+            df3 = _select_rows(load_csv(KEY_STIM), "head", STIM_N)
+        except Exception:
+            df3 = pd.DataFrame()
+        print(f"[producer:producer] stage3: key={KEY_STIM} take=head rows={len(df3)}", flush=True)
 
-    per_msg = _per_msg_sleep_s()
-    if per_msg > 0:
-        tps = 1.0 / per_msg if per_msg > 0 else 0.0
-        print(f"[producer:producer] throttling enabled: {tps:.2f} msgs/sec (~{per_msg*1000:.0f} ms/record)", flush=True)
+        df_list = [
+            _align(df1, feat_cols),
+            _align(df2, feat_cols),
+            (_align(df3, feat_cols) if not df3.empty else pd.DataFrame(columns=feat_cols+[TARGET_COL]))
+        ]
 
-    producer = create_producer(client_id=f"producer-{RUN_ID}")
-    sent = 0
-    for df in df_list:
-        if df.empty: continue
-        for _, row in df.iterrows():
-            payload = {
-                "features": {c: float(row[c]) for c in feat_cols},
-                "label":    float(row[TARGET_COL]),
-                "send_ts":  datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-            }
-            producer.send(TOPIC, value=payload, headers=[("run_id", RUN_ID.encode("utf-8"))])
-            sent += 1
-            _sleep_for_rate(per_msg)
+        per_msg = _per_msg_sleep_s()
+        if per_msg > 0:
+            tps = 1.0 / per_msg if per_msg > 0 else 0.0
+            print(f"[producer:producer] throttling enabled: {tps:.2f} msgs/sec (~{per_msg*1000:.0f} ms/record)", flush=True)
 
-    n_sentinels = broadcast_sentinel(producer, TOPIC, run_id=RUN_ID, partitions=parts)
-    try:
-        producer.flush(10)
-        producer.close(10)
-    except Exception:
-        pass
+        producer = create_producer(client_id=f"producer-{RUN_ID}")
+        sent = 0
+        for df in df_list:
+            if df.empty: continue
+            for _, row in df.iterrows():
+                payload = {
+                    "features": {c: float(row[c]) for c in feat_cols},
+                    "label":    float(row[TARGET_COL]),
+                    "send_ts":  datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+                }
+                producer.send(TOPIC, value=payload, headers=[("run_id", RUN_ID.encode("utf-8"))])
+                sent += 1
+                _sleep_for_rate(per_msg)
 
-    print(f"[producer:producer] done. sent={sent}, sentinels={n_sentinels}", flush=True)
+        n_sentinels = broadcast_sentinel(producer, TOPIC, run_id=RUN_ID, partitions=parts)
+        try:
+            producer.flush(10)
+            producer.close(10)
+        except Exception:
+            pass
+
+        print(f"[producer:producer] done. sent={sent}, sentinels={n_sentinels}", flush=True)
+
+    finally:
+        # 强制 flush + 写运行时长
+        stop_probe()
 
 if __name__ == "__main__":
     main()

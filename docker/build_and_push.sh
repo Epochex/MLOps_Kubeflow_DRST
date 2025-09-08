@@ -6,11 +6,9 @@ REPO="${DOCKER_REPO:-hirschazer}"
 TAG="${TAG:-latest}"
 FILE="${DOCKERFILE:-docker/dockerfile}"
 
-# 准备 buildx（若还没有）
 docker buildx inspect drst-builder >/dev/null 2>&1 || \
   docker buildx create --use --name drst-builder
 
-# 可选：把缓存推到本地目录，加速多 target 连续构建
 CACHE_DIR="${CACHE_DIR:-/tmp/.drst-buildx-cache}"
 
 build_one () {
@@ -31,6 +29,7 @@ build_one monitor  "${REPO}/monitor"
 build_one producer "${REPO}/producer"
 build_one infer    "${REPO}/infer"
 build_one plot     "${REPO}/plot"
+build_one retrain  "${REPO}/retrain"
 
 echo "######pushed############:"
 echo "  ${REPO}/offline:${TAG}"
@@ -38,3 +37,4 @@ echo "  ${REPO}/monitor:${TAG}"
 echo "  ${REPO}/producer:${TAG}"
 echo "  ${REPO}/infer:${TAG}"
 echo "  ${REPO}/plot:${TAG}"
+echo "  ${REPO}/retrain:${TAG}"

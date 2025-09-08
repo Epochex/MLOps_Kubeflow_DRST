@@ -2,7 +2,7 @@
 # drst_drift/dynamic_retrain.py
 # 记录 retrain_wall_s + 进程资源曲线（results/retrain_resources.csv）
 from __future__ import annotations
-import io, os, time
+import io, os, time, json
 from itertools import product
 from typing import Tuple, List, Optional, Dict
 
@@ -15,6 +15,7 @@ from drst_common.config import (
     RESULT_DIR, TARGET_COL, abc_grids, BUCKET,
     RETRAIN_WARM_EPOCHS, RETRAIN_EPOCHS_FULL, RETRAIN_EARLY_PATIENCE,
     RETRAIN_MODE, RETRAIN_FREEZE_N, RETRAIN_VAL_FRAC,
+    RETRAIN_WATCH_MAX_SECS,   # ← 统一读取
 )
 from drst_common.minio_helper import load_np, save_bytes, s3
 from drst_common.artefacts import load_scaler, load_selected_feats, read_latest, load_model_by_key, write_latest
@@ -29,6 +30,12 @@ _thr_str = ("%.2f" % ACC_THR).rstrip("0").rstrip(".")
 
 device   = "cuda" if torch.cuda.is_available() else "cpu"
 pod_name = os.getenv("HOSTNAME", "retrain")  # 仅用于可读日志，无超参含义
+
+# --- 监听相关配置与对象键 ---
+LOCK_KEY = f"{RESULT_DIR}/retrain_lock.flag"
+DONE_KEY = f"{RESULT_DIR}/retrain_done.flag"
+WATCH    = os.getenv("RETRAIN_WATCH", "0") in ("1", "true", "True")
+POLL_S   = int(os.getenv("POLL_INTERVAL_S", "2") or 2)
 
 def _read_grid_flag() -> str:
     try:
@@ -96,6 +103,18 @@ def _align_to_dim(X: np.ndarray, in_dim: int) -> np.ndarray:
     pad = np.zeros((X.shape[0], in_dim - d), dtype=np.float32)
     return np.concatenate([X, pad], axis=1)
 
+def _obj_mtime(key: str) -> float | None:
+    try:
+        return s3.head_object(Bucket=BUCKET, Key=key)["LastModified"].timestamp()
+    except Exception:
+        return None
+
+def _exists(key: str) -> bool:
+    try:
+        s3.head_object(Bucket=BUCKET, Key=key); return True
+    except Exception:
+        return False
+
 def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: str,
                lr: float, batch: int, loss_name: str, weight_decay: float,
                mode: str, maybe_base_model) -> Tuple[torch.nn.Module, Dict[str, float]]:
@@ -103,8 +122,8 @@ def _train_one(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: st
         model = maybe_base_model
     else:
         model = MLPRegressor(in_dim, hidden=hidden, act=act, dropout=0.0)
-    if mode == "finetune" and RETRAIN_FREEZE_N > 0:
-        _freeze_n_linear(model, RETRAIN_FREEZE_N)
+    if mode == "finetune" and _cfg.RETRAIN_FREEZE_N > 0:
+        _freeze_n_linear(model, _cfg.RETRAIN_FREEZE_N)
 
     ds = TensorDataset(torch.from_numpy(Xtr).float(), torch.from_numpy(Ytr).float().view(-1,1))
     dl = DataLoader(ds, batch_size=int(batch), shuffle=True, drop_last=False)
@@ -170,24 +189,25 @@ def _warm_score(Xtr, Ytr, Xva, Yva, in_dim: int, hidden: Tuple[int, ...], act: s
     _, rmse, _, _ = _eval_metrics(Yva, pv)
     return rmse
 
-def main():
-    touch_ready("retrain", pod_name)
-    stop_probe = start_probe("retrain")
+def _run_once() -> bool:
+    """
+    原有单次重训流程；成功训练并写出 DONE 返回 True；
+    若缺 batch / 无标签而跳过，返回 False。
+    """
     t0_wall = time.time()
-
     try:
         try:
             arr = load_np(f"{RESULT_DIR}/latest_batch.npy")
         except Exception as e:
             print(f"[retrain] latest_batch.npy not found: {e}")
-            return
+            return False
 
         grid_letter = _read_grid_flag()
         feat_names = load_selected_feats()
         scaler = load_scaler()
         try:
             raw = s3.get_object(Bucket=BUCKET, Key=f"{RESULT_DIR}/latest_batch.columns.json")["Body"].read()
-            cols = (raw and __import__("json").loads(raw.decode())) or None
+            cols = (raw and json.loads(raw.decode())) or None
         except Exception:
             cols = None
 
@@ -196,7 +216,7 @@ def main():
             save_bytes(f"{RESULT_DIR}/retrain_skipped_no_labels.flag", b"", "text/plain")
             log_metric(component="retrain", event="skipped", train_rows=int(X.shape[0]))
             sync_all_metrics_to_minio(); write_kfp_metadata()
-            return
+            return False
 
         Xs = scaler.transform(X.astype(np.float32))
         n = len(Xs)
@@ -284,8 +304,16 @@ def main():
             **best_cfg,
         }
 
-        write_latest(model_bytes, metrics, model_key=f"model_{ts}.pt", metrics_key=f"metrics_{ts}.json")
-        save_bytes(f"{RESULT_DIR}/retrain_done.flag", f"ts={ts}\n".encode(), "text/plain")
+        model_key   = f"model_{ts}.pt"
+        metrics_key = f"metrics_{ts}.json"
+        write_latest(model_bytes, metrics, model_key=model_key, metrics_key=metrics_key)
+
+        done_info = {
+            "ts": ts, "grid": grid_letter,
+            "best_rmse": metrics["rmse"], "best_mae": metrics["mae"],
+            "model_key": model_key, "metrics_key": metrics_key
+        }
+        save_bytes(f"{RESULT_DIR}/retrain_done.flag", json.dumps(done_info).encode("utf-8"), "application/json")
 
         log_metric(component="retrain", event="summary",
                    train_rows=int(len(tr_idx)), mae=metrics["mae"], rmse=metrics["rmse"],
@@ -299,5 +327,51 @@ def main():
               f"rmse={metrics['rmse']:.4f} acc@{_thr_str}={metrics[f'acc@{_thr_str}']:.4f} "
               f"(baseline rmse={base_rmse:.4f} acc@{_thr_str}={base_acc_thr:.4f}) "
               f"wall={train_secs:.3f}s")
+        return True
+    except Exception as ex:
+        print(f"[retrain] ERROR during run_once: {ex}")
+        return False
+
+def main():
+    touch_ready("retrain", pod_name)
+    stop_probe = start_probe("retrain")
+    try:
+        if not WATCH:
+            _ = _run_once()
+            return
+
+        # 统一的 watcher 超时：来自 config.RETRAIN_WATCH_MAX_SECS
+        max_secs = int(RETRAIN_WATCH_MAX_SECS)
+        print(f"[retrain] watcher started: poll={POLL_S}s, max_watch={max_secs}s (<=0 means infinite)", flush=True)
+
+        start_ts = time.time()
+        last_done_ts = _obj_mtime(DONE_KEY) or 0.0
+        last_lock_attempt_ts: float | None = None
+
+        # 0/负数 → 无限等待；>0 → 限时
+        def _still_in_window() -> bool:
+            return (max_secs <= 0) or ((time.time() - start_ts) < max_secs)
+
+        while _still_in_window():
+            lock_ts = _obj_mtime(LOCK_KEY)
+
+            if lock_ts and lock_ts > last_done_ts and lock_ts != last_lock_attempt_ts:
+                last_lock_attempt_ts = lock_ts
+                print(f"[retrain] lock detected (ts={lock_ts}); start one retrain...", flush=True)
+                _ = _run_once()
+
+                for _wait in range(20):
+                    new_done = _obj_mtime(DONE_KEY) or last_done_ts
+                    if new_done > last_done_ts:
+                        last_done_ts = new_done
+                        break
+                    time.sleep(0.5)
+
+            time.sleep(POLL_S)
+
+        print("[retrain] watcher timeout reached; exit.", flush=True)
     finally:
         stop_probe()
+
+if __name__ == "__main__":
+    main()
