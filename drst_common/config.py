@@ -59,9 +59,9 @@ PRODUCER_STAGES: List[dict] = [
 DRIFT_WINDOW = 300
 EVAL_STRIDE  = 50
 HIST_BINS    = 64
-JS_THR_A     = 0.2
-JS_THR_B     = 0.4
-JS_THR_C     = 0.7
+JS_THR_A     = 0.7
+JS_THR_B     = 0.3
+JS_THR_C     = 0.8
 
 # monitor 把“最新 JS”广播到这个对象键；infer 实时读取
 JS_CURRENT_KEY = f"{RESULT_DIR}/js_current.json"

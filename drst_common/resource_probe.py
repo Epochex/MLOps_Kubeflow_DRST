@@ -25,8 +25,8 @@ _HOST_THREAD = None                        # 保存 host 线程句柄，便于 a
 _THREADS: Dict[str, "ProbeHandle"] = {}    # 每个组件一个采样线程
 _ATEXIT_REGISTERED = False
 
-# 采样/落盘
-SAMPLING_MS = int(os.getenv("RESOURCE_SAMPLING_MS", "100") or 100)     # 采样周期 (ms)
+# 采样/落盘（默认 500ms，用于过程观察/检测；如需更细改环境变量）
+SAMPLING_MS = int(os.getenv("RESOURCE_SAMPLING_MS", "500") or 500)     # 采样周期 (ms)
 FLUSH_EVERY = int(os.getenv("RESOURCE_FLUSH_EVERY", "200") or 100)     # 每多少行上传一次
 ROUND_CPU = 6
 ROUND_MEM = 3
@@ -94,7 +94,6 @@ class _CsvBuffer:
             if v is None:
                 vals.append("")
             else:
-                # 避免逗号问题
                 vals.append(str(v))
         return ",".join(vals) + "\n"
 
@@ -170,7 +169,7 @@ class ProbeHandle:
         self._last_cpu_s: Optional[float] = None
 
     def _prime(self):
-        # 不依赖 cpu_percent 的窗口；建立差分基线即可
+        # 建立差分基线（不依赖 cpu_percent 的内部窗口）
         cpu_s, _ = _proc_cpu_mem_totals(self.proc, include_children=PROBE_CHILDREN)
         self._last_cpu_s = cpu_s
         self._last_ts = _now_ts()
@@ -254,13 +253,19 @@ def _ensure_host_thread():
             self.buf = _CsvBuffer(f"{RESULT_DIR}/host_resources.csv")
 
         def run(self):
+            # prime 一下，避免第一次 0.0
+            try:
+                psutil.cpu_percent(None)
+            except Exception:
+                pass
+
             period_s = max(0.01, float(SAMPLING_MS) / 1000.0)
             ncpu = max(1, psutil.cpu_count(logical=True) or 1)
             while not self.stop_evt.is_set():
                 time.sleep(period_s)
                 ts = _now_ts()
                 try:
-                    # 系统级用 cpu_percent 就够了
+                    # 系统级用 cpu_percent(None) 即“自上一次调用以来”的利用率
                     cpu_pct = float(psutil.cpu_percent(None))
                     vm = psutil.virtual_memory()
                     rss_mb = float(vm.used) / (1024.0 * 1024.0)

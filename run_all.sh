@@ -1,5 +1,5 @@
 #! /bin/bash
-set -euxo pipefail   # <- 多一个 -x 便于排错
+set -euxo pipefail  
 
 bash docker/build_and_push.sh
 python3 experiments/kubeflow/clean_minio.py

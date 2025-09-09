@@ -17,7 +17,7 @@
 #    producer_interval_ms: int [Default: 200.0]
 #    producer_stages: str [Default: '']
 #    retrain_cooldown_s: int [Default: 10.0]
-#    retrain_max_wall_secs: int [Default: 480.0]
+#    retrain_max_wall_secs: int [Default: 120.0]
 #    retrain_poll_interval_s: int [Default: 2.0]
 #    retrain_watch: bool [Default: True]
 components:
@@ -144,7 +144,7 @@ components:
     inputDefinitions:
       parameters:
         max_wall_secs:
-          defaultValue: 480.0
+          defaultValue: 120.0
           isOptional: true
           parameterType: NUMBER_INTEGER
         poll_interval_s:
@@ -183,17 +183,16 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = \"\
-          latencyTopic\",\n    wait_retrain: bool = False,\n    max_wall_secs: int\
-          \ = 480,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\"\
-          ,   \"http://minio-service.kubeflow.svc.cluster.local:9000\")\n    os.environ[\"\
-          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\")\n    os.environ[\"\
-          S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\")\n    os.environ[\"\
-          S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\")\n    os.environ[\"\
-          S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\")\n    os.environ[\"\
-          KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", \"kafka.default.svc.cluster.local:9092\"\
-          )\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
+          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
+          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
+          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
+          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
           ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
           \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
           \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
@@ -226,17 +225,16 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = \"\
-          latencyTopic\",\n    wait_retrain: bool = False,\n    max_wall_secs: int\
-          \ = 480,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\"\
-          ,   \"http://minio-service.kubeflow.svc.cluster.local:9000\")\n    os.environ[\"\
-          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\")\n    os.environ[\"\
-          S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\")\n    os.environ[\"\
-          S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\")\n    os.environ[\"\
-          S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\")\n    os.environ[\"\
-          KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", \"kafka.default.svc.cluster.local:9092\"\
-          )\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
+          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
+          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
+          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
+          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
           ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
           \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
           \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
@@ -269,17 +267,16 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = \"\
-          latencyTopic\",\n    wait_retrain: bool = False,\n    max_wall_secs: int\
-          \ = 480,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\"\
-          ,   \"http://minio-service.kubeflow.svc.cluster.local:9000\")\n    os.environ[\"\
-          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\")\n    os.environ[\"\
-          S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\")\n    os.environ[\"\
-          S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\")\n    os.environ[\"\
-          S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\")\n    os.environ[\"\
-          KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", \"kafka.default.svc.cluster.local:9092\"\
-          )\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
+          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
+          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
+          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
+          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
           ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
           \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
           \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
@@ -312,29 +309,32 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef monitor_op(\n    kafka_topic: str               = \"latencyTopic\"\
-          ,\n    drift_window: int              = 300,\n    eval_stride: int     \
-          \          = 50,\n    hist_bins: int                 = 64,\n    idle_timeout_s:\
-          \ int            = 60,\n    max_wall_secs: int             = 480,\n    js_quantiles:\
-          \ str              = \"0.90,0.97,0.995\",\n    js_calib_samples: int   \
-          \       = 400,\n    infer_pause_on_retrain: bool   = False,\n    retrain_cooldown_s:\
-          \ int        = 10,\n) -> None:\n    import os, subprocess\n    os.environ[\"\
-          PYTHONPATH\"] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"\
-          S3_ENDPOINT\",   \"http://minio-service.kubeflow.svc.cluster.local:9000\"\
-          )\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\"\
-          )\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\"\
-          )\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\"\
-          )\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\"\
-          )\n    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", \"kafka.default.svc.cluster.local:9092\"\
-          )\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"DRIFT_WINDOW\"\
+          \ *\n\ndef monitor_op(\n    # \u2014\u2014 monitor \u4E13\u5C5E\u53C2\u6570\
+          \uFF08\u4E0D\u4F1A\u5F71\u54CD retrain\uFF09\u2014\u2014\n    kafka_topic:\
+          \ str               = DEFAULT_KAFKA_TOPIC,\n    drift_window: int      \
+          \        = 300,\n    eval_stride: int               = 50,\n    hist_bins:\
+          \ int                 = 64,\n    idle_timeout_s: int            = 60,\n\
+          \    max_wall_secs: int             = 480,   # monitor \u7684 wall \u4E0A\
+          \u9650\uFF08\u9ED8\u8BA4 480\uFF09\n    js_quantiles: str              =\
+          \ \"0.90,0.97,0.995\",\n    js_calib_samples: int          = 400,\n    infer_pause_on_retrain:\
+          \ bool   = False,\n    retrain_cooldown_s: int        = 10,\n) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
+          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
+          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
+          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n\n    os.environ[\"DRIFT_WINDOW\"\
           ]  = str(drift_window)\n    os.environ[\"EVAL_STRIDE\"]   = str(eval_stride)\n\
           \    os.environ[\"HIST_BINS\"]     = str(hist_bins)\n    os.environ[\"MONITOR_IDLE_TIMEOUT_S\"\
-          ] = str(idle_timeout_s)\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\n\
-          \    os.environ[\"JS_QUANTILES\"]     = js_quantiles\n    os.environ[\"\
-          JS_CALIB_SAMPLES\"] = str(js_calib_samples)\n    os.environ[\"MONITOR_SIGNAL_INFER_PAUSE\"\
-          ] = \"1\" if infer_pause_on_retrain else \"0\"\n    os.environ[\"RETRAIN_COOLDOWN_S\"\
-          ] = str(retrain_cooldown_s)\n    subprocess.run([\"python\", \"-m\", \"\
-          drst_drift.monitor\"], check=True)\n\n"
+          ] = str(idle_timeout_s)\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\
+          \  # \u2190 \u4EC5 monitor \u4F7F\u7528\n\n    os.environ[\"JS_QUANTILES\"\
+          ]     = js_quantiles\n    os.environ[\"JS_CALIB_SAMPLES\"] = str(js_calib_samples)\n\
+          \    os.environ[\"MONITOR_SIGNAL_INFER_PAUSE\"] = \"1\" if infer_pause_on_retrain\
+          \ else \"0\"\n    os.environ[\"RETRAIN_COOLDOWN_S\"] = str(retrain_cooldown_s)\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_drift.monitor\"], check=True)\n\
+          \n"
         image: hirschazer/monitor:latest
     exec-offline-training-op:
       container:
@@ -364,12 +364,12 @@ deploymentSpec:
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef offline_training_op() -> None:\n    import os, subprocess\n \
           \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"\
-          ]   = os.getenv(\"S3_ENDPOINT\",   \"http://minio-service.kubeflow.svc.cluster.local:9000\"\
-          )\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\"\
-          )\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\"\
-          )\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\"\
-          )\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\"\
-          )\n    subprocess.run([\"python\", \"-m\", \"drst_inference.offline.train_offline\"\
+          ]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"\
+          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n   \
+          \ os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_inference.offline.train_offline\"\
           ], check=True)\n\n"
         image: hirschazer/offline:latest
     exec-plot-op:
@@ -400,12 +400,12 @@ deploymentSpec:
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef plot_op() -> None:\n    import os, subprocess\n    os.environ[\"\
           PYTHONPATH\"] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"\
-          S3_ENDPOINT\",   \"http://minio-service.kubeflow.svc.cluster.local:9000\"\
-          )\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\"\
-          )\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\"\
-          )\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\"\
-          )\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\"\
-          )\n    try:\n        subprocess.run([\"python\", \"-m\", \"drst_inference.plotting.plot_final\"\
+          S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]   \
+          \  = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"\
+          S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    try:\n        subprocess.run([\"python\", \"-m\", \"drst_inference.plotting.plot_final\"\
           ], check=True)\n    except Exception as e:\n        print(f\"[plot_final]\
           \ skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\"\
           , \"experiments/kubeflow/summarize_resources.py\"], check=True)\n    except\
@@ -440,17 +440,17 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef producer_op(\n    kafka_topic: str = \"latencyTopic\",\n    interval_ms:\
-          \ int = 200,\n    producer_stages: str = \"\",\n) -> None:\n    import os,\
-          \ subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"\
-          KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", \"kafka.default.svc.cluster.local:9092\"\
-          )\n    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"S3_ENDPOINT\"\
-          ]   = os.getenv(\"S3_ENDPOINT\",   \"http://minio-service.kubeflow.svc.cluster.local:9000\"\
-          )\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\"\
-          )\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\"\
-          )\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\"\
-          )\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\"\
-          )\n    if producer_stages:\n        os.environ[\"PRODUCER_STAGES\"] = producer_stages\n\
+          \ *\n\ndef producer_op(\n    kafka_topic: str = DEFAULT_KAFKA_TOPIC,\n \
+          \   interval_ms: int = 200,\n    producer_stages: str = \"\",\n) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
+          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"S3_ENDPOINT\"\
+          ]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"\
+          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n   \
+          \ os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
+          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    if producer_stages:\n        os.environ[\"PRODUCER_STAGES\"] = producer_stages\n\
           \    os.environ[\"INTERVAL_MS\"] = str(interval_ms)\n    subprocess.run([\"\
           python\", \"-m\", \"drst_inference.online.producer\"], check=True)\n\n"
         image: hirschazer/producer:latest
@@ -480,18 +480,21 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef retrain_op(\n    watch: bool          = True,\n    poll_interval_s:\
-          \ int = 2,\n    max_wall_secs: int   = 480,\n) -> None:\n    import os,\
-          \ subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"\
-          S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   \"http://minio-service.kubeflow.svc.cluster.local:9000\"\
-          )\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     \"mlpipeline\"\
-          )\n    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", \"minio\"\
-          )\n    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", \"minio123\"\
-          )\n    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     \"false\"\
-          )\n    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else \"0\"\n   \
-          \ os.environ[\"POLL_INTERVAL_S\"] = str(poll_interval_s)\n    os.environ[\"\
-          MAX_WALL_SECS\"]   = str(max_wall_secs)\n    subprocess.run([\"python\"\
-          , \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
+          \ *\n\ndef retrain_op(\n    # \u2014\u2014 retrain \u4E13\u5C5E\u53C2\u6570\
+          \uFF08\u4E0D\u5F71\u54CD monitor\uFF09\u2014\u2014\n    watch: bool    \
+          \      = True,\n    poll_interval_s: int = 2,\n    max_wall_secs: int  \
+          \ = 120,   # retrain \u7684 wall \u4E0A\u9650\uFF08\u9ED8\u8BA4 120\uFF09\
+          \n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
+          \ = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\"\
+          ,   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"\
+          S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] =\
+          \ os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"\
+          S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
+          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
+          \    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else \"0\"\n    os.environ[\"\
+          POLL_INTERVAL_S\"] = str(poll_interval_s)\n    os.environ[\"MAX_WALL_SECS\"\
+          ]   = str(max_wall_secs)  # \u2190 \u4EC5 retrain \u4F7F\u7528\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
         image: hirschazer/retrain:latest
 pipelineInfo:
   description: Drift monitoring + dynamic retraining + online inference (v2)
@@ -700,7 +703,7 @@ root:
         isOptional: true
         parameterType: NUMBER_INTEGER
       retrain_max_wall_secs:
-        defaultValue: 480.0
+        defaultValue: 120.0
         isOptional: true
         parameterType: NUMBER_INTEGER
       retrain_poll_interval_s:
