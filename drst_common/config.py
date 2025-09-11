@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import Dict, List, Optional, Union
 import os
 
-# ===== MinIO / S3 =====
-MINIO_ACCESS_MODE = "cluster"
-MINIO_SCHEME      = "http"
-MINIO_ENDPOINT    = "minio-service.kubeflow.svc.cluster.local:9000"
+"""
+本文件是 DRST 的**唯一显式配置入口**：
+- S3/MinIO、Kafka、离线/在线/重训/监控的所有默认参数，都在这里定义
+- 其余代码应通过导入本文件读取配置，而非依赖外部 export
+- 仅墙时长允许在运行期用环境变量或 set_* 覆盖（见文末的 MAX_WALL_SECS 接口）
+"""
+
+# ===== MinIO / S3（显式配置）=====
+MINIO_ACCESS_MODE = "cluster"  # cluster / local（仅用于你们内部语义）
+MINIO_SCHEME      = "http"     # http / https
+MINIO_ENDPOINT    = "minio-service.kubeflow.svc.cluster.local:9000"  # 不含 scheme
 BUCKET            = "onvm-demo2"
 
+# 目录（S3 前缀）
 MODEL_DIR  = "models"
 RESULT_DIR = "results"
 DATA_DIR   = "datasets"
 
-# ===== Kafka =====
+# ===== Kafka（显式配置）=====
 KAFKA_SERVERS = "kafka.default.svc.cluster.local:9092"
 KAFKA_TOPIC   = "latencyTopic"
 
@@ -22,33 +31,30 @@ FEATURE_SRC_KEY = f"{DATA_DIR}/combined.csv"
 EXCLUDE_COLS    = ["Unnamed: 0", "input_rate", "latency"]
 TARGET_COL      = "output_rate"
 OFFLINE_TOPK    = 10
-ACC_THR         = 0.25   # 累计命中阈值（infer 打 cum@ 时用）
+ACC_THR         = 0.25  # 累计命中阈值（infer 里累积准确率使用）
 
-# ===== 批大小（逐条推理）=====
-BATCH_SIZE = 1
+# ===== 在线推理（Consumer）=====
+BATCH_SIZE          = 1
+CONSUME_IDLE_S      = 30
+RELOAD_INTERVAL_S   = 30
+INFER_STDOUT_EVERY  = 1
+GAIN_THR_PP         = 0.01
+RETRAIN_TOPIC       = KAFKA_TOPIC + "_infer_count"
+INFER_HIT_THR       = 0.15  # 批内“命中”阈值（打印/指标用）
 
-# ===== Consumer（在线推理）=====
-CONSUME_IDLE_S     = 30
-RELOAD_INTERVAL_S  = 30
-INFER_STDOUT_EVERY = 1
-GAIN_THR_PP        = 0.01
-RETRAIN_TOPIC      = KAFKA_TOPIC + "_infer_count"
-
-# infer 打印：本批命中阈值（可改）
-INFER_HIT_THR = 0.15
-
-# ===== Producer（速率与分区策略）=====
-# 速率优先级：env(PRODUCER_TPS) > env(INTERVAL_MS) > PRODUCER_TPS/PRODUCE_INTERVAL_MS
-PRODUCER_TPS        = 10.0          # 每秒 5 条（可被 env 覆盖）
-PRODUCE_INTERVAL_MS = 100          # 兼容老参数，若无 TPS 则用它
+# ===== Producer（速率与分段）=====
+# 说明：runtime 若未传入 pipeline 参数，则按本文件配置执行；无需依赖环境变量。
+PRODUCER_TPS        = 10.0   # 若 >0，则大约每秒条数 ≈ TPS
+PRODUCE_INTERVAL_MS = 100    # 若 TPS<=0，则使用固定间隔（毫秒）
 PRODUCER_JITTER_MS  = 0
-PRODUCER_PARTITION_MODE = "rr"     # "auto" | "rr" | "hash"
+PRODUCER_PARTITION_MODE = "rr"  # "auto" | "rr" | "hash"
 
 # 分段条数
 PRODUCER_BRIDGE_N = 500
 PRODUCER_RAND_N   = 1000
 PRODUCER_STIM_N   = 1000
 
+# 按顺序发送的阶段（键、取法、行数）
 PRODUCER_STAGES: List[dict] = [
     {"key": f"{DATA_DIR}/combined.csv",     "take": "tail", "rows": PRODUCER_BRIDGE_N},
     {"key": f"{DATA_DIR}/random_rates.csv", "take": "head", "rows": PRODUCER_RAND_N},
@@ -59,28 +65,28 @@ PRODUCER_STAGES: List[dict] = [
 DRIFT_WINDOW = 300
 EVAL_STRIDE  = 50
 HIST_BINS    = 64
-JS_THR_A     = 0.7
-JS_THR_B     = 0.3
+JS_THR_A     = 0.2
+JS_THR_B     = 0.5
 JS_THR_C     = 0.8
 
-# monitor 把“最新 JS”广播到这个对象键；infer 实时读取
+# monitor 广播“最新 JS”的对象键；infer 侧会按需读取
 JS_CURRENT_KEY = f"{RESULT_DIR}/js_current.json"
 
 # ===== Monitor 其它 =====
 WAIT_FEATURES_SECS      = 120
-MONITOR_IDLE_TIMEOUT_S  = 60
+MONITOR_IDLE_TIMEOUT_S  = 120
 
-# ---- 统一全局墙时长入口（替代过去“导入即绑定”的常量）----
+# ===== 统一全局墙时长入口（仅此项允许运行期覆盖）=====
 def _parse_int_like(x, default: int) -> int:
     try:
         return int(float(str(x)))
     except Exception:
         return default
 
-# 默认值（未设环境变量时的兜底）。你也可以通过环境变量 DEFAULT_MAX_WALL_SECS 覆盖。
+# 默认值（未设环境变量时的兜底）；如需改动建议直接改此常量
 DEFAULT_MAX_WALL_SECS: int = _parse_int_like(os.getenv("DEFAULT_MAX_WALL_SECS", None), -1)
 
-# 快照：模块导入时根据环境变量计算一次（兼容旧代码直接引用 MAX_WALL_SECS）
+# 模块导入快照：从环境变量读取一次（兼容旧逻辑），作为 get_max_wall_secs 的默认返回
 # 兼容旧名：RETRAIN_MAX_WALL_SECS
 MAX_WALL_SECS: int = _parse_int_like(
     os.getenv("MAX_WALL_SECS", os.getenv("RETRAIN_MAX_WALL_SECS", None)),
@@ -115,18 +121,14 @@ def get_max_wall_secs() -> int:
         except Exception:
             pass
     return MAX_WALL_SECS
-# ---- 统一全局墙时长入口（END）----
 
-# 当触发重训时，monitor 是否给 infer 下发“暂停”旗标（默认 False：不暂停，保证预测连续性）
-MONITOR_SIGNAL_INFER_PAUSE = False
-# infer 是否响应暂停旗标（默认 True）
-INFER_RESPECT_PAUSE_FLAG   = True
-# 暂停旗标对象键
-PAUSE_INFER_KEY = f"{RESULT_DIR}/pause_infer.flag"
-# 老名字，避免他处引用报错；锁定逻辑现在始终开启
-MONITOR_WAIT_RETRAIN = False
+# ===== 重训期间暂停/恢复控制（monitor<->infer）=====
+MONITOR_SIGNAL_INFER_PAUSE = False  # monitor 触发重训时，是否给 infer 下发“暂停”旗标
+INFER_RESPECT_PAUSE_FLAG   = True   # infer 是否响应暂停旗标
+PAUSE_INFER_KEY            = f"{RESULT_DIR}/pause_infer.flag"
+MONITOR_WAIT_RETRAIN       = False  # 保留旧名，避免外部引用报错（逻辑已内置）
 
-# ===== Offline 训练控制 =====
+# ===== Offline 训练控制（显式配置）=====
 TRAIN_TRIGGER     = 1
 OFFLINE_TRAIN_KEY = f"{DATA_DIR}/combined.csv"
 
@@ -140,7 +142,7 @@ FULL_PATIENCE   = 10
 FULL_LR         = 1e-3
 FULL_BS         = 16
 
-# ===== Retrain =====
+# ===== Retrain（显式配置）=====
 RETRAIN_WARM_EPOCHS    = 3
 RETRAIN_EPOCHS_FULL    = 8
 RETRAIN_EARLY_PATIENCE = 2
@@ -148,13 +150,14 @@ RETRAIN_MODE           = "auto"   # "scratch" | "finetune" | "auto"
 RETRAIN_FREEZE_N       = 0
 RETRAIN_VAL_FRAC       = 0.2
 
-# ===== 动态重训网格 =====
+# ===== 动态重训网格（显式配置）=====
 def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
     def uniq_layers(cands: List[List[int]]) -> List[List[int]]:
         seen = set(); out = []
         for h in cands:
             k = tuple(h)
-            if k in seen: continue
+            if k in seen:
+                continue
             seen.add(k); out.append(h)
         return out
 
@@ -190,7 +193,7 @@ def abc_grids(current_hidden: List[int] | None = None) -> Dict[str, Dict]:
             "learning_rate": [1e-3, 3e-3, 1e-2],
             "batch_size":    [16, 32],
             "hidden_layers": base_large,
-            "activation":    ["relu", "gelu"],
+            "activation":    ["relu", "mse"],
             "loss":          ["smoothl1", "mse"],
             "wd":            [0.0, 1e-4],
             "topk":          3,

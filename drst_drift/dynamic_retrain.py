@@ -31,6 +31,9 @@ pod_name = os.getenv("HOSTNAME", "retrain")
 
 LOCK_KEY = f"{RESULT_DIR}/retrain_lock.flag"
 DONE_KEY = f"{RESULT_DIR}/retrain_done.flag"
+# 新增：跟随 monitor 的退出标志
+MON_DONE_KEY = f"{RESULT_DIR}/monitor_done.flag"
+
 WATCH    = os.getenv("RETRAIN_WATCH", "0") in ("1", "true", "True")
 POLL_S   = int(os.getenv("POLL_INTERVAL_S", "2") or 2)
 
@@ -331,7 +334,7 @@ def main():
             return
 
         max_secs = int(_cfg.get_max_wall_secs())
-        print(f"[retrain] watcher started: poll={POLL_S}s, max_watch={max_secs} (<=0 means infinite)", flush=True)
+        print(f"[retrain] watcher started: poll={POLL_S}s, max_watch={max_secs} (<=0 means infinite), follow monitor_done.flag", flush=True)
 
         start_ts = time.time()
         last_done_ts = _obj_mtime(DONE_KEY) or 0.0
@@ -341,6 +344,15 @@ def main():
             return (max_secs <= 0) or ((time.time() - start_ts) < max_secs)
 
         while _still_in_window():
+            # ——“跟随 monitor”逻辑：如果 monitor 已退出且没有新的重训锁，立即退出 —— #
+            mon_done = _obj_mtime(MON_DONE_KEY)
+            if mon_done:
+                has_lock = _exists(LOCK_KEY)
+                lock_ts  = _obj_mtime(LOCK_KEY) or 0.0
+                if (not has_lock) or (lock_ts <= mon_done):
+                    print(f"[retrain] monitor_done seen (ts={mon_done}), no outstanding lock → exit.", flush=True)
+                    break
+
             lock_ts = _obj_mtime(LOCK_KEY)
 
             if lock_ts and lock_ts > last_done_ts and lock_ts != last_lock_attempt_ts:
@@ -348,6 +360,7 @@ def main():
                 print(f"[retrain] lock detected (ts={lock_ts}); start one retrain...", flush=True)
                 _ = _run_once()
 
+                # 等待 monitor 写入 DONE（最多 10s）
                 for _wait in range(20):
                     new_done = _obj_mtime(DONE_KEY) or last_done_ts
                     if new_done > last_done_ts:
@@ -357,7 +370,7 @@ def main():
 
             time.sleep(POLL_S)
 
-        print("[retrain] watcher timeout reached; exit.", flush=True)
+        print("[retrain] watcher timeout reached or monitor closed; exit.", flush=True)
     finally:
         stop_probe()
 

@@ -28,6 +28,9 @@ BATCH_KEY = f"{RESULT_DIR}/latest_batch.npy"
 BATCH_COL = f"{RESULT_DIR}/latest_batch.columns.json"
 DONE_KEY  = f"{RESULT_DIR}/retrain_done.flag"
 
+# 新增：monitor 退出标志（供 retrain 跟随）
+MON_DONE_KEY = f"{RESULT_DIR}/monitor_done.flag"
+
 RETRAIN_COOLDOWN_S = int(os.getenv("RETRAIN_COOLDOWN_S", "10") or 10)
 
 def _exists(key:str)->bool:
@@ -118,6 +121,23 @@ def main():
 
     stop_probe = start_probe("monitor")
 
+    # —— 封装统一“优雅退出”，写 monitor_done.flag —— #
+    def _finish(reason: str):
+        try:
+            payload = {
+                "ts": int(time.time()),
+                "iso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "reason": reason,
+                "run_tag": RUN_TAG,
+                "topic": TOPIC,
+            }
+            save_bytes(MON_DONE_KEY, json.dumps(payload).encode("utf-8"), "application/json")
+        except Exception as e:
+            print(f"[monitor:{pod}] WARN write monitor_done.flag failed: {e}", flush=True)
+        sync_all_metrics_to_minio()
+        stop_probe()
+        print(f"[monitor:{pod}] metrics synced; bye. (reason={reason})", flush=True)
+
     window: Deque[Tuple[np.ndarray, Optional[float]]] = collections.deque(maxlen=DRIFT_WINDOW)
     baseline_x = None
 
@@ -135,7 +155,8 @@ def main():
         if not polled:
             if wall_secs > 0 and (time.time() - t_start > wall_secs):
                 print(f"[monitor:{pod}] max wall exceeded while warming baseline; exit.", flush=True)
-                sync_all_metrics_to_minio(); stop_probe(); return
+                _finish("warmup_wall_exceeded")
+                return
             continue
         for _, recs in polled.items():
             for rec in recs:
@@ -156,15 +177,17 @@ def main():
 
     while True:
         if (idle_secs > 0) and ((time.time() - last_rx) > idle_secs):
-            if retrain_in_progress and not _last_modified_ts(DONE_KEY) or (retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0)))):
+            if retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                 time.sleep(1.0); continue
             print(f"[monitor:{pod}] idle > {idle_secs}s; exit.", flush=True)
-            break
+            _finish("idle_timeout")
+            return
         if (wall_secs > 0) and (time.time() - t_start > wall_secs):
             if retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                 time.sleep(1.0); continue
             print(f"[monitor:{pod}] max wall exceeded; exit.", flush=True)
-            break
+            _finish("wall_exceeded")
+            return
 
         polled = consumer.poll(timeout_ms=500)
         if not polled:
@@ -201,7 +224,8 @@ def main():
                         if retrain_in_progress and not (_last_modified_ts(DONE_KEY) and (_last_modified_ts(DONE_KEY) >= (lock_started_ts or 0.0))):
                             time.sleep(1.0); continue
                         print(f"[monitor:{pod}] all sentinels seen; exit.", flush=True)
-                        sync_all_metrics_to_minio(); stop_probe(); return
+                        _finish("all_sentinels")
+                        return
                     continue
 
                 obj = json.loads(rec.value.decode("utf-8"))
@@ -279,9 +303,8 @@ def main():
 
                     log_metric(component="monitor", event="js_tick", js=round(js, 6))
 
-    sync_all_metrics_to_minio()
-    stop_probe()
-    print(f"[monitor:{pod}] metrics synced; bye.", flush=True)
+    # 正常落幕（理论上不会到这里，防御性）
+    _finish("normal_exit")
 
 if __name__ == "__main__":
     try:

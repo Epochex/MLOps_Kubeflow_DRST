@@ -1,25 +1,11 @@
 # PIPELINE DEFINITION
 # Name: drift-stream-v2
-# Description: Drift monitoring + dynamic retraining + online inference (v2)
+# Description: Drift monitoring + dynamic retraining + online inference (v2) — simplified
 # Inputs:
-#    drift_window: int [Default: 300.0]
-#    eval_stride: int [Default: 50.0]
-#    hist_bins: int [Default: 64.0]
-#    idle_timeout_s: int [Default: 60.0]
-#    image: str [Default: 'unused']
-#    infer_max_wall_secs: int [Default: 480.0]
-#    infer_pause_on_retrain: bool [Default: False]
-#    infer_wait_retrain: bool [Default: False]
-#    js_calib_samples: int [Default: 400.0]
-#    js_quantiles: str [Default: '0.90,0.97,0.995']
 #    kafka_topic: str [Default: 'latencyTopic']
-#    max_wall_secs: int [Default: 480.0]
+#    monitor_max_wall_secs: int [Default: 0.0]
 #    producer_interval_ms: int [Default: 200.0]
 #    producer_stages: str [Default: '']
-#    retrain_cooldown_s: int [Default: 10.0]
-#    retrain_max_wall_secs: int [Default: 120.0]
-#    retrain_poll_interval_s: int [Default: 2.0]
-#    retrain_watch: bool [Default: True]
 components:
   comp-infer-op:
     executorLabel: exec-infer-op
@@ -29,16 +15,8 @@ components:
           defaultValue: latencyTopic
           isOptional: true
           parameterType: STRING
-        max_wall_secs:
-          defaultValue: 480.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
         replica_id:
           parameterType: NUMBER_INTEGER
-        wait_retrain:
-          defaultValue: false
-          isOptional: true
-          parameterType: BOOLEAN
   comp-infer-op-2:
     executorLabel: exec-infer-op-2
     inputDefinitions:
@@ -47,16 +25,8 @@ components:
           defaultValue: latencyTopic
           isOptional: true
           parameterType: STRING
-        max_wall_secs:
-          defaultValue: 480.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
         replica_id:
           parameterType: NUMBER_INTEGER
-        wait_retrain:
-          defaultValue: false
-          isOptional: true
-          parameterType: BOOLEAN
   comp-infer-op-3:
     executorLabel: exec-infer-op-3
     inputDefinitions:
@@ -65,58 +35,14 @@ components:
           defaultValue: latencyTopic
           isOptional: true
           parameterType: STRING
-        max_wall_secs:
-          defaultValue: 480.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
         replica_id:
           parameterType: NUMBER_INTEGER
-        wait_retrain:
-          defaultValue: false
-          isOptional: true
-          parameterType: BOOLEAN
   comp-monitor-op:
     executorLabel: exec-monitor-op
     inputDefinitions:
       parameters:
-        drift_window:
-          defaultValue: 300.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        eval_stride:
-          defaultValue: 50.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        hist_bins:
-          defaultValue: 64.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        idle_timeout_s:
-          defaultValue: 60.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        infer_pause_on_retrain:
-          defaultValue: false
-          isOptional: true
-          parameterType: BOOLEAN
-        js_calib_samples:
-          defaultValue: 400.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        js_quantiles:
-          defaultValue: 0.90,0.97,0.995
-          isOptional: true
-          parameterType: STRING
-        kafka_topic:
-          defaultValue: latencyTopic
-          isOptional: true
-          parameterType: STRING
         max_wall_secs:
-          defaultValue: 480.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        retrain_cooldown_s:
-          defaultValue: 10.0
+          defaultValue: 0.0
           isOptional: true
           parameterType: NUMBER_INTEGER
   comp-offline-training-op:
@@ -143,10 +69,6 @@ components:
     executorLabel: exec-retrain-op
     inputDefinitions:
       parameters:
-        max_wall_secs:
-          defaultValue: 120.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
         poll_interval_s:
           defaultValue: 2.0
           isOptional: true
@@ -183,21 +105,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
-          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
-          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
-          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
-          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
-          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
-          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
-          ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
-          \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
-          \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
-          INFER_REPLICA_ID\"] = str(replica_id)\n    subprocess.run([\"python\", \"\
-          -m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
+          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
+          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ], check=True)\n\n"
         image: hirschazer/infer:latest
     exec-infer-op-2:
       container:
@@ -225,21 +138,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
-          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
-          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
-          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
-          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
-          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
-          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
-          ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
-          \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
-          \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
-          INFER_REPLICA_ID\"] = str(replica_id)\n    subprocess.run([\"python\", \"\
-          -m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
+          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
+          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ], check=True)\n\n"
         image: hirschazer/infer:latest
     exec-infer-op-3:
       container:
@@ -267,21 +171,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str   = DEFAULT_KAFKA_TOPIC,\n\
-          \    wait_retrain: bool = False,\n    max_wall_secs: int = 480,\n) -> None:\n\
-          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
-          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
-          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
-          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
-          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"CONSUMER_WAIT_RETRAIN\"\
-          ] = \"1\" if wait_retrain else \"0\"\n    os.environ[\"MAX_WALL_SECS\"]\
-          \ = str(max_wall_secs)\n    # \u4F20\u7ED9\u5BB9\u5668\uFF0C\u4FBF\u4E8E\
-          \u8D44\u6E90\u6587\u4EF6\u547D\u540D\u56FA\u5B9A\u4E3A infer1/2/3\n    os.environ[\"\
-          INFER_REPLICA_ID\"] = str(replica_id)\n    subprocess.run([\"python\", \"\
-          -m\", \"drst_inference.online.inference_consumer\"], check=True)\n\n"
+          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
+          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
+          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
+          ], check=True)\n\n"
         image: hirschazer/infer:latest
     exec-monitor-op:
       container:
@@ -309,30 +204,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef monitor_op(\n    # \u2014\u2014 monitor \u4E13\u5C5E\u53C2\u6570\
-          \uFF08\u4E0D\u4F1A\u5F71\u54CD retrain\uFF09\u2014\u2014\n    kafka_topic:\
-          \ str               = DEFAULT_KAFKA_TOPIC,\n    drift_window: int      \
-          \        = 300,\n    eval_stride: int               = 50,\n    hist_bins:\
-          \ int                 = 64,\n    idle_timeout_s: int            = 60,\n\
-          \    max_wall_secs: int             = 480,   # monitor \u7684 wall \u4E0A\
-          \u9650\uFF08\u9ED8\u8BA4 480\uFF09\n    js_quantiles: str              =\
-          \ \"0.90,0.97,0.995\",\n    js_calib_samples: int          = 400,\n    infer_pause_on_retrain:\
-          \ bool   = False,\n    retrain_cooldown_s: int        = 10,\n) -> None:\n\
-          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
-          \    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n\
-          \    os.environ[\"S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n\
-          \    os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
-          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n\n    os.environ[\"DRIFT_WINDOW\"\
-          ]  = str(drift_window)\n    os.environ[\"EVAL_STRIDE\"]   = str(eval_stride)\n\
-          \    os.environ[\"HIST_BINS\"]     = str(hist_bins)\n    os.environ[\"MONITOR_IDLE_TIMEOUT_S\"\
-          ] = str(idle_timeout_s)\n    os.environ[\"MAX_WALL_SECS\"] = str(max_wall_secs)\
-          \  # \u2190 \u4EC5 monitor \u4F7F\u7528\n\n    os.environ[\"JS_QUANTILES\"\
-          ]     = js_quantiles\n    os.environ[\"JS_CALIB_SAMPLES\"] = str(js_calib_samples)\n\
-          \    os.environ[\"MONITOR_SIGNAL_INFER_PAUSE\"] = \"1\" if infer_pause_on_retrain\
-          \ else \"0\"\n    os.environ[\"RETRAIN_COOLDOWN_S\"] = str(retrain_cooldown_s)\n\
+          \ *\n\ndef monitor_op(\n    max_wall_secs: int = 0,   # \u9ED8\u8BA4 0=\u5173\
+          \u95ED\u5899\u65F6\u957F\uFF0C\u53EA\u6309 idle \u8D85\u65F6\u9000\u51FA\
+          \n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
+          \ = \"/app\"\n    # \u4EC5\u5F53 >0 \u65F6\u624D\u8BBE\u7F6E\uFF0C\u907F\
+          \u514D\u65E0\u610F\u4E2D\u542F\u7528\u5899\u65F6\u957F\n    if int(max_wall_secs)\
+          \ > 0:\n        os.environ[\"MAX_WALL_SECS\"] = str(int(max_wall_secs))\n\
           \    subprocess.run([\"python\", \"-m\", \"drst_drift.monitor\"], check=True)\n\
           \n"
         image: hirschazer/monitor:latest
@@ -363,14 +240,8 @@ deploymentSpec:
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef offline_training_op() -> None:\n    import os, subprocess\n \
-          \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"\
-          ]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"\
-          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n   \
-          \ os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    subprocess.run([\"python\", \"-m\", \"drst_inference.offline.train_offline\"\
-          ], check=True)\n\n"
+          \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    subprocess.run([\"python\"\
+          , \"-m\", \"drst_inference.offline.train_offline\"], check=True)\n\n"
         image: hirschazer/offline:latest
     exec-plot-op:
       container:
@@ -399,20 +270,15 @@ deploymentSpec:
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef plot_op() -> None:\n    import os, subprocess\n    os.environ[\"\
-          PYTHONPATH\"] = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"\
-          S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]   \
-          \  = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"\
-          S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    try:\n        subprocess.run([\"python\", \"-m\", \"drst_inference.plotting.plot_final\"\
-          ], check=True)\n    except Exception as e:\n        print(f\"[plot_final]\
+          PYTHONPATH\"] = \"/app\"\n    try:\n        subprocess.run([\"python\",\
+          \ \"-m\", \"drst_inference.plotting.plot_final\"], check=True)\n    except\
+          \ Exception as e:\n        print(f\"[plot_final] skipped: {e}\", flush=True)\n\
+          \    try:\n        subprocess.run([\"python\", \"experiments/kubeflow/summarize_resources.py\"\
+          ], check=True)\n    except Exception as e:\n        print(f\"[plot_op] summarize_resources.py\
           \ skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\"\
-          , \"experiments/kubeflow/summarize_resources.py\"], check=True)\n    except\
-          \ Exception as e:\n        print(f\"[plot_op] summarize_resources.py skipped:\
-          \ {e}\", flush=True)\n    try:\n        subprocess.run([\"python\", \"-m\"\
-          , \"drst_inference.plotting.plot_report\"], check=True)\n    except Exception\
-          \ as e:\n        print(f\"[plot_report] skipped: {e}\", flush=True)\n\n"
+          , \"-m\", \"drst_inference.plotting.plot_report\"], check=True)\n    except\
+          \ Exception as e:\n        print(f\"[plot_report] skipped: {e}\", flush=True)\n\
+          \n"
         image: hirschazer/plot:latest
     exec-producer-op:
       container:
@@ -440,18 +306,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef producer_op(\n    kafka_topic: str = DEFAULT_KAFKA_TOPIC,\n \
-          \   interval_ms: int = 200,\n    producer_stages: str = \"\",\n) -> None:\n\
-          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
-          \    os.environ[\"KAFKA_BROKERS\"] = os.getenv(\"KAFKA_BROKERS\", DEFAULT_KAFKA_BROKERS)\n\
-          \    os.environ[\"KAFKA_TOPIC\"]   = kafka_topic\n    os.environ[\"S3_ENDPOINT\"\
-          ]   = os.getenv(\"S3_ENDPOINT\",   DEFAULT_S3_ENDPOINT)\n    os.environ[\"\
-          S3_BUCKET\"]     = os.getenv(\"S3_BUCKET\",     DEFAULT_S3_BUCKET)\n   \
-          \ os.environ[\"S3_ACCESS_KEY\"] = os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n\
-          \    os.environ[\"S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    if producer_stages:\n        os.environ[\"PRODUCER_STAGES\"] = producer_stages\n\
-          \    os.environ[\"INTERVAL_MS\"] = str(interval_ms)\n    subprocess.run([\"\
+          \ *\n\ndef producer_op(\n    kafka_topic: str = \"latencyTopic\",\n    interval_ms:\
+          \ int = 200,\n    producer_stages: str = \"\",\n) -> None:\n    import os,\
+          \ subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    if kafka_topic:\n\
+          \        os.environ[\"KAFKA_TOPIC\"] = str(kafka_topic)\n    os.environ[\"\
+          INTERVAL_MS\"] = str(int(interval_ms))\n    if producer_stages:\n      \
+          \  os.environ[\"PRODUCER_STAGES\"] = producer_stages\n    subprocess.run([\"\
           python\", \"-m\", \"drst_inference.online.producer\"], check=True)\n\n"
         image: hirschazer/producer:latest
     exec-retrain-op:
@@ -480,24 +340,21 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef retrain_op(\n    # \u2014\u2014 retrain \u4E13\u5C5E\u53C2\u6570\
-          \uFF08\u4E0D\u5F71\u54CD monitor\uFF09\u2014\u2014\n    watch: bool    \
-          \      = True,\n    poll_interval_s: int = 2,\n    max_wall_secs: int  \
-          \ = 120,   # retrain \u7684 wall \u4E0A\u9650\uFF08\u9ED8\u8BA4 120\uFF09\
-          \n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
-          \ = \"/app\"\n    os.environ[\"S3_ENDPOINT\"]   = os.getenv(\"S3_ENDPOINT\"\
-          ,   DEFAULT_S3_ENDPOINT)\n    os.environ[\"S3_BUCKET\"]     = os.getenv(\"\
-          S3_BUCKET\",     DEFAULT_S3_BUCKET)\n    os.environ[\"S3_ACCESS_KEY\"] =\
-          \ os.getenv(\"S3_ACCESS_KEY\", DEFAULT_S3_ACCESS_KEY)\n    os.environ[\"\
-          S3_SECRET_KEY\"] = os.getenv(\"S3_SECRET_KEY\", DEFAULT_S3_SECRET_KEY)\n\
-          \    os.environ[\"S3_SECURE\"]     = os.getenv(\"S3_SECURE\",     DEFAULT_S3_SECURE)\n\
-          \    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else \"0\"\n    os.environ[\"\
-          POLL_INTERVAL_S\"] = str(poll_interval_s)\n    os.environ[\"MAX_WALL_SECS\"\
-          ]   = str(max_wall_secs)  # \u2190 \u4EC5 retrain \u4F7F\u7528\n    subprocess.run([\"\
-          python\", \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
+          \ *\n\ndef retrain_op(\n    watch: bool = True,\n    poll_interval_s: int\
+          \ = 2,\n) -> None:\n    \"\"\"\n    retrain watcher\uFF1A\u4E0D\u518D\u8BBE\
+          \u7F6E MAX_WALL_SECS\uFF0C\u9ED8\u8BA4\u65E0\u9650\u5B88\u62A4\uFF0C\n \
+          \   \u4EC5\u5904\u7406\u9501\u5E76\u201C\u8DDF\u968F monitor_done.flag\u201D\
+          \u9000\u51FA\uFF08\u903B\u8F91\u5728 dynamic_retrain.py \u91CC\uFF09\u3002\
+          \n    \"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
+          \ = \"/app\"\n    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else\
+          \ \"0\"\n    os.environ[\"POLL_INTERVAL_S\"] = str(int(poll_interval_s))\n\
+          \    # \u523B\u610F\u4E0D\u8BBE\u7F6E MAX_WALL_SECS\uFF1A\u8BA9 watcher\
+          \ \u4E0D\u53D7\u5899\u65F6\u957F\u5F71\u54CD\n    subprocess.run([\"python\"\
+          , \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
         image: hirschazer/retrain:latest
 pipelineInfo:
-  description: Drift monitoring + dynamic retraining + online inference (v2)
+  description: "Drift monitoring + dynamic retraining + online inference (v2) \u2014\
+    \ simplified"
   name: drift-stream-v2
 root:
   dag:
@@ -512,13 +369,9 @@ root:
           parameters:
             kafka_topic:
               componentInputParameter: kafka_topic
-            max_wall_secs:
-              componentInputParameter: infer_max_wall_secs
             replica_id:
               runtimeValue:
                 constant: 0.0
-            wait_retrain:
-              componentInputParameter: infer_wait_retrain
         taskInfo:
           name: infer-op
       infer-op-2:
@@ -531,13 +384,9 @@ root:
           parameters:
             kafka_topic:
               componentInputParameter: kafka_topic
-            max_wall_secs:
-              componentInputParameter: infer_max_wall_secs
             replica_id:
               runtimeValue:
                 constant: 1.0
-            wait_retrain:
-              componentInputParameter: infer_wait_retrain
         taskInfo:
           name: infer-op-2
       infer-op-3:
@@ -550,13 +399,9 @@ root:
           parameters:
             kafka_topic:
               componentInputParameter: kafka_topic
-            max_wall_secs:
-              componentInputParameter: infer_max_wall_secs
             replica_id:
               runtimeValue:
                 constant: 2.0
-            wait_retrain:
-              componentInputParameter: infer_wait_retrain
         taskInfo:
           name: infer-op-3
       monitor-op:
@@ -567,26 +412,8 @@ root:
         - offline-training-op
         inputs:
           parameters:
-            drift_window:
-              componentInputParameter: drift_window
-            eval_stride:
-              componentInputParameter: eval_stride
-            hist_bins:
-              componentInputParameter: hist_bins
-            idle_timeout_s:
-              componentInputParameter: idle_timeout_s
-            infer_pause_on_retrain:
-              componentInputParameter: infer_pause_on_retrain
-            js_calib_samples:
-              componentInputParameter: js_calib_samples
-            js_quantiles:
-              componentInputParameter: js_quantiles
-            kafka_topic:
-              componentInputParameter: kafka_topic
             max_wall_secs:
-              componentInputParameter: max_wall_secs
-            retrain_cooldown_s:
-              componentInputParameter: retrain_cooldown_s
+              componentInputParameter: monitor_max_wall_secs
         taskInfo:
           name: monitor-op
       offline-training-op:
@@ -632,62 +459,22 @@ root:
         - offline-training-op
         inputs:
           parameters:
-            max_wall_secs:
-              componentInputParameter: retrain_max_wall_secs
             poll_interval_s:
-              componentInputParameter: retrain_poll_interval_s
+              runtimeValue:
+                constant: 2.0
             watch:
-              componentInputParameter: retrain_watch
+              runtimeValue:
+                constant: true
         taskInfo:
           name: retrain-op
   inputDefinitions:
     parameters:
-      drift_window:
-        defaultValue: 300.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      eval_stride:
-        defaultValue: 50.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      hist_bins:
-        defaultValue: 64.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      idle_timeout_s:
-        defaultValue: 60.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      image:
-        defaultValue: unused
-        isOptional: true
-        parameterType: STRING
-      infer_max_wall_secs:
-        defaultValue: 480.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      infer_pause_on_retrain:
-        defaultValue: false
-        isOptional: true
-        parameterType: BOOLEAN
-      infer_wait_retrain:
-        defaultValue: false
-        isOptional: true
-        parameterType: BOOLEAN
-      js_calib_samples:
-        defaultValue: 400.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      js_quantiles:
-        defaultValue: 0.90,0.97,0.995
-        isOptional: true
-        parameterType: STRING
       kafka_topic:
         defaultValue: latencyTopic
         isOptional: true
         parameterType: STRING
-      max_wall_secs:
-        defaultValue: 480.0
+      monitor_max_wall_secs:
+        defaultValue: 0.0
         isOptional: true
         parameterType: NUMBER_INTEGER
       producer_interval_ms:
@@ -698,21 +485,5 @@ root:
         defaultValue: ''
         isOptional: true
         parameterType: STRING
-      retrain_cooldown_s:
-        defaultValue: 10.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      retrain_max_wall_secs:
-        defaultValue: 120.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      retrain_poll_interval_s:
-        defaultValue: 2.0
-        isOptional: true
-        parameterType: NUMBER_INTEGER
-      retrain_watch:
-        defaultValue: true
-        isOptional: true
-        parameterType: BOOLEAN
 schemaVersion: 2.1.0
 sdkVersion: kfp-2.12.2
