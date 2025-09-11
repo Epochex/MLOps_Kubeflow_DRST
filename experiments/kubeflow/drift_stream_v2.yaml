@@ -1,12 +1,86 @@
 # PIPELINE DEFINITION
 # Name: drift-stream-v2
-# Description: Drift monitoring + dynamic retraining + online inference (v2) — simplified
+# Description: Drift monitoring + dynamic retraining + online inference (v2) — with forecasting (Plan A, slim)
 # Inputs:
+#    fc_horizon: int [Default: 12.0]
+#    fc_lookback: int [Default: 48.0]
 #    kafka_topic: str [Default: 'latencyTopic']
 #    monitor_max_wall_secs: int [Default: 0.0]
 #    producer_interval_ms: int [Default: 200.0]
 #    producer_stages: str [Default: '']
 components:
+  comp-forecast-explain-op:
+    executorLabel: exec-forecast-explain-op
+    inputDefinitions:
+      parameters:
+        hidden:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        horizon:
+          defaultValue: 12.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        layers:
+          defaultValue: 1.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 48.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        shap_n:
+          defaultValue: 256.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-forecast-serve-op:
+    executorLabel: exec-forecast-serve-op
+    inputDefinitions:
+      parameters:
+        horizon:
+          defaultValue: 12.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 48.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-forecast-train-op:
+    executorLabel: exec-forecast-train-op
+    inputDefinitions:
+      parameters:
+        batch_size:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        epochs:
+          defaultValue: 20.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        hidden:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        horizon:
+          defaultValue: 12.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        layers:
+          defaultValue: 1.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 48.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        patience:
+          defaultValue: 5.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        take_last:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
   comp-infer-op:
     executorLabel: exec-infer-op
     inputDefinitions:
@@ -79,6 +153,113 @@ components:
           parameterType: BOOLEAN
 deploymentSpec:
   executors:
+    exec-forecast-explain-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - forecast_explain_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef forecast_explain_op(\n    lookback: int = 48,\n    horizon: int\
+          \ = 12,\n    shap_n: int = 256,\n    hidden: int = 64,\n    layers: int\
+          \ = 1,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    os.environ[\"\
+          FORECAST_SHAP_N\"]   = str(int(shap_n))\n    os.environ[\"FORECAST_HIDDEN\"\
+          ]   = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]   = str(int(layers))\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_forecasting.explain\"],\
+          \ check=True)\n\n"
+        image: hirschazer/forecast:latest
+    exec-forecast-serve-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - forecast_serve_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef forecast_serve_op(\n    lookback: int = 48,\n    horizon: int\
+          \ = 12,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_forecasting.serve_forecaster\"], check=True)\n\n"
+        image: hirschazer/forecast:latest
+    exec-forecast-train-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - forecast_train_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef forecast_train_op(\n    lookback: int = 48,\n    horizon: int\
+          \ = 12,\n    epochs: int = 20,\n    patience: int = 5,\n    hidden: int\
+          \ = 64,\n    layers: int = 1,\n    batch_size: int = 64,\n    take_last:\
+          \ int = 0,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"]  = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]   = str(int(horizon))\n    os.environ[\"\
+          FORECAST_EPOCHS\"]    = str(int(epochs))\n    os.environ[\"FORECAST_PATIENCE\"\
+          ]  = str(int(patience))\n    os.environ[\"FORECAST_HIDDEN\"]    = str(int(hidden))\n\
+          \    os.environ[\"FORECAST_LAYERS\"]    = str(int(layers))\n    os.environ[\"\
+          FORECAST_BS\"]        = str(int(batch_size))\n    os.environ[\"FORECAST_TAKE_LAST\"\
+          ] = str(int(take_last))\n    subprocess.run([\"python\", \"-m\", \"drst_forecasting.train_benchmark\"\
+          ], check=True)\n\n"
+        image: hirschazer/forecast:latest
     exec-infer-op:
       container:
         args:
@@ -105,12 +286,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
-          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
-          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
-          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
-          ], check=True)\n\n"
+          \ *\n\ndef infer_op(replica_id: int, kafka_topic: str = \"latencyTopic\"\
+          ) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] =\
+          \ \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] = str(kafka_topic)\n\
+          \    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\
+          \n"
         image: hirschazer/infer:latest
     exec-infer-op-2:
       container:
@@ -138,12 +319,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
-          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
-          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
-          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
-          ], check=True)\n\n"
+          \ *\n\ndef infer_op(replica_id: int, kafka_topic: str = \"latencyTopic\"\
+          ) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] =\
+          \ \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] = str(kafka_topic)\n\
+          \    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\
+          \n"
         image: hirschazer/infer:latest
     exec-infer-op-3:
       container:
@@ -171,12 +352,12 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef infer_op(\n    replica_id: int,\n    kafka_topic: str = \"latencyTopic\"\
-          ,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] =\
-          \ str(kafka_topic)\n    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n\
-          \    subprocess.run([\"python\", \"-m\", \"drst_inference.online.inference_consumer\"\
-          ], check=True)\n\n"
+          \ *\n\ndef infer_op(replica_id: int, kafka_topic: str = \"latencyTopic\"\
+          ) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] =\
+          \ \"/app\"\n    if kafka_topic:\n        os.environ[\"KAFKA_TOPIC\"] = str(kafka_topic)\n\
+          \    os.environ[\"INFER_REPLICA_ID\"] = str(int(replica_id))\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_inference.online.inference_consumer\"], check=True)\n\
+          \n"
         image: hirschazer/infer:latest
     exec-monitor-op:
       container:
@@ -204,12 +385,9 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef monitor_op(\n    max_wall_secs: int = 0,   # \u9ED8\u8BA4 0=\u5173\
-          \u95ED\u5899\u65F6\u957F\uFF0C\u53EA\u6309 idle \u8D85\u65F6\u9000\u51FA\
-          \n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
-          \ = \"/app\"\n    # \u4EC5\u5F53 >0 \u65F6\u624D\u8BBE\u7F6E\uFF0C\u907F\
-          \u514D\u65E0\u610F\u4E2D\u542F\u7528\u5899\u65F6\u957F\n    if int(max_wall_secs)\
-          \ > 0:\n        os.environ[\"MAX_WALL_SECS\"] = str(int(max_wall_secs))\n\
+          \ *\n\ndef monitor_op(max_wall_secs: int = 0) -> None:\n    import os, subprocess\n\
+          \    os.environ[\"PYTHONPATH\"] = \"/app\"\n    if int(max_wall_secs) >\
+          \ 0:\n        os.environ[\"MAX_WALL_SECS\"] = str(int(max_wall_secs))\n\
           \    subprocess.run([\"python\", \"-m\", \"drst_drift.monitor\"], check=True)\n\
           \n"
         image: hirschazer/monitor:latest
@@ -278,6 +456,7 @@ deploymentSpec:
           \ skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\"\
           , \"-m\", \"drst_inference.plotting.plot_report\"], check=True)\n    except\
           \ Exception as e:\n        print(f\"[plot_report] skipped: {e}\", flush=True)\n\
+          \    # \u6CE8\uFF1A\u4E0D\u518D\u5355\u72EC\u751F\u6210 drst_forecasting.report\n\
           \n"
         image: hirschazer/plot:latest
     exec-producer-op:
@@ -340,25 +519,61 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef retrain_op(\n    watch: bool = True,\n    poll_interval_s: int\
-          \ = 2,\n) -> None:\n    \"\"\"\n    retrain watcher\uFF1A\u4E0D\u518D\u8BBE\
-          \u7F6E MAX_WALL_SECS\uFF0C\u9ED8\u8BA4\u65E0\u9650\u5B88\u62A4\uFF0C\n \
-          \   \u4EC5\u5904\u7406\u9501\u5E76\u201C\u8DDF\u968F monitor_done.flag\u201D\
-          \u9000\u51FA\uFF08\u903B\u8F91\u5728 dynamic_retrain.py \u91CC\uFF09\u3002\
-          \n    \"\"\"\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"]\
-          \ = \"/app\"\n    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else\
-          \ \"0\"\n    os.environ[\"POLL_INTERVAL_S\"] = str(int(poll_interval_s))\n\
-          \    # \u523B\u610F\u4E0D\u8BBE\u7F6E MAX_WALL_SECS\uFF1A\u8BA9 watcher\
-          \ \u4E0D\u53D7\u5899\u65F6\u957F\u5F71\u54CD\n    subprocess.run([\"python\"\
+          \ *\n\ndef retrain_op(watch: bool = True, poll_interval_s: int = 2) -> None:\n\
+          \    import os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n\
+          \    os.environ[\"RETRAIN_WATCH\"]   = \"1\" if watch else \"0\"\n    os.environ[\"\
+          POLL_INTERVAL_S\"] = str(int(poll_interval_s))\n    subprocess.run([\"python\"\
           , \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
         image: hirschazer/retrain:latest
 pipelineInfo:
   description: "Drift monitoring + dynamic retraining + online inference (v2) \u2014\
-    \ simplified"
+    \ with forecasting (Plan A, slim)"
   name: drift-stream-v2
 root:
   dag:
     tasks:
+      forecast-explain-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-forecast-explain-op
+        dependentTasks:
+        - forecast-train-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+        taskInfo:
+          name: forecast-explain-op
+      forecast-serve-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-forecast-serve-op
+        dependentTasks:
+        - forecast-train-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+        taskInfo:
+          name: forecast-serve-op
+      forecast-train-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-forecast-train-op
+        dependentTasks:
+        - offline-training-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+        taskInfo:
+          name: forecast-train-op
       infer-op:
         cachingOptions: {}
         componentRef:
@@ -427,6 +642,8 @@ root:
         componentRef:
           name: comp-plot-op
         dependentTasks:
+        - forecast-explain-op
+        - forecast-serve-op
         - infer-op
         - infer-op-2
         - infer-op-3
@@ -469,6 +686,14 @@ root:
           name: retrain-op
   inputDefinitions:
     parameters:
+      fc_horizon:
+        defaultValue: 12.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      fc_lookback:
+        defaultValue: 48.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
       kafka_topic:
         defaultValue: latencyTopic
         isOptional: true

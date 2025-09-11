@@ -30,6 +30,7 @@ build_one producer "${REPO}/producer"
 build_one infer    "${REPO}/infer"
 build_one plot     "${REPO}/plot"
 build_one retrain  "${REPO}/retrain"
+build_one forecast "${REPO}/forecast"
 
 echo "######pushed############:"
 echo "  ${REPO}/offline:${TAG}"
@@ -38,3 +39,4 @@ echo "  ${REPO}/producer:${TAG}"
 echo "  ${REPO}/infer:${TAG}"
 echo "  ${REPO}/plot:${TAG}"
 echo "  ${REPO}/retrain:${TAG}"
+echo "  ${REPO}/forecast:${TAG}"   # 新增

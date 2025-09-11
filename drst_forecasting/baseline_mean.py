@@ -1,21 +1,12 @@
-#!/usr/bin/env python3
-# drst_forecasting/baseline_mean.py
+# /data/mlops/DRST-SoftwarizedNetworks/drst_forecasting/baseline_mean.py
 from __future__ import annotations
 import numpy as np
 
-class BaselineMean:
-    def __init__(self, window: int = 10):
-        self.window = int(window)
-        self.buf: list[float] = []
-
-    def update(self, y: float) -> float:
-        self.buf.append(float(y))
-        if len(self.buf) > self.window:
-            self.buf = self.buf[-self.window:]
-        return float(np.mean(self.buf))
-
-    def predict(self, arr: np.ndarray) -> np.ndarray:
-        out = []
-        for v in arr:
-            out.append(self.update(float(v)))
-        return np.array(out, dtype=np.float32)
+def moving_mean_baseline(y_hist: np.ndarray, horizon: int) -> np.ndarray:
+    """
+    y_hist: [B, lookback] 仅目标序列的历史窗口
+    return: [B, horizon]   用 lookback 平均值复制 horizon 次
+    """
+    y_hist = np.asarray(y_hist, dtype=np.float32)
+    mu = np.mean(y_hist, axis=1, keepdims=True)   # [B,1]
+    return np.repeat(mu, int(horizon), axis=1)
