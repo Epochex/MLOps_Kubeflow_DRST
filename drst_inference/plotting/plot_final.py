@@ -4,27 +4,24 @@ from __future__ import annotations
 import os
 import io
 import numpy as np
+
+# 显式使用 Agg 后端，避免容器内无 DISPLAY 报错
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from typing import Optional
+
+from typing import Optional, List, Tuple
 
 from drst_common.minio_helper import s3, save_bytes
 from drst_common.config import BUCKET, RESULT_DIR
 
-def _latest_trace_key() -> Optional[str]:
-    # Find the most recent *_inference_trace.npz under results/
+def _list_trace_keys() -> List[str]:
+    """列出 results/ 下所有 *_inference_trace.npz（来自 infer1/2/3）。"""
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"{RESULT_DIR}/")
-    items = resp.get("Contents", [])
-    cand = [o for o in items if o["Key"].endswith("_inference_trace.npz")]
-    if not cand:
-        return None
-    cand.sort(key=lambda o: o["LastModified"], reverse=True)
-    return cand[0]["Key"]
+    items = resp.get("Contents", []) or []
+    return sorted([o["Key"] for o in items if o["Key"].endswith("_inference_trace.npz")])
 
-def main():
-    key = _latest_trace_key()
-    if not key:
-        print("[plot_final] no inference trace npz found in results/")
-        return
+def _load_npz_from_s3(key: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     obj = s3.get_object(Bucket=BUCKET, Key=key)
     with io.BytesIO(obj["Body"].read()) as bio:
         npz = np.load(bio)
@@ -32,15 +29,43 @@ def main():
         pred_adj  = npz["pred_adj"]
         pred_orig = npz["pred_orig"]
         y_true    = npz["true"]
+    return ts, pred_adj, pred_orig, y_true
 
-    # 1) Time-series comparison
+def main():
+    keys = _list_trace_keys()
+    if not keys:
+        print("[plot_final] no inference trace npz found in results/")
+        return
+
+    # 汇总所有副本的 trace
+    all_ts, all_true, all_pred_orig, all_pred_adj = [], [], [], []
+    for k in keys:
+        try:
+            ts, pa, po, yt = _load_npz_from_s3(k)
+            all_ts.append(ts.astype(np.float64))
+            all_true.append(yt.astype(np.float32))
+            all_pred_orig.append(po.astype(np.float32))
+            all_pred_adj.append(pa.astype(np.float32))
+        except Exception as e:
+            print(f"[plot_final] skip bad trace {k}: {e}")
+
+    if not all_true:
+        print("[plot_final] no valid traces")
+        return
+
+    ts = np.concatenate(all_ts)
+    y_true    = np.concatenate(all_true)
+    pred_orig = np.concatenate(all_pred_orig)
+    pred_adj  = np.concatenate(all_pred_adj)
+
+    # 1) Time-series comparison（合并后整体画一张）
     plt.figure(figsize=(10, 4.5))
-    plt.plot(ts, y_true, label="truth")
+    plt.plot(ts, y_true,    label="truth")
     plt.plot(ts, pred_orig, label="baseline")
-    plt.plot(ts, pred_adj, label="adaptive")
+    plt.plot(ts, pred_adj,  label="adaptive")
     plt.xlabel("timestamp (s, epoch)")
     plt.ylabel("value")
-    plt.title("Inference trace")
+    plt.title("Inference trace (combined)")
     plt.legend(loc="best")
     buf = io.BytesIO()
     plt.tight_layout()
@@ -56,7 +81,7 @@ def main():
     plt.hist(relerr, bins=50)
     plt.xlabel("relative error")
     plt.ylabel("count")
-    plt.title("Adaptive relative error histogram")
+    plt.title("Adaptive relative error histogram (combined)")
     buf2 = io.BytesIO()
     plt.tight_layout()
     plt.savefig(buf2, format="png", dpi=150)

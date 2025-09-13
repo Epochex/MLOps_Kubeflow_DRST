@@ -27,3 +27,7 @@ kfp>=2.6
 
 # Others
 pyyaml>=6.0
+
+fastapi>=0.111
+uvicorn[standard]>=0.23
+xgboost>=1.7

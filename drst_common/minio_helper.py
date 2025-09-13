@@ -4,14 +4,15 @@ from __future__ import annotations
 import os
 import io
 import json
+import time
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import boto3
 from botocore.client import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
-# ---- 兼容读取配置：优先 MINIO_*，否则回退旧名或环境变量 ----
 try:
     from . import config as _cfg
 except Exception:
@@ -26,7 +27,6 @@ def _get(name: str, *alts, env: Optional[str] = None, default=None):
         v = os.getenv(env)
         if v is not None:
             return v
-    # 也尝试用变量名本身找 env（方便 MINIO_BUCKET 这类）
     v = os.getenv(name)
     if v is not None:
         return v
@@ -39,11 +39,11 @@ MINIO_ACCESS   = _get("MINIO_ACCESS_KEY", "ACCESS_KEY", default=os.getenv("MINIO
 MINIO_SECRET   = _get("MINIO_SECRET_KEY", "SECRET_KEY", default=os.getenv("MINIO_SECRET_KEY", "minio123"))
 MINIO_REGION   = _get("MINIO_REGION", default="us-east-1")
 
-# 对外暴露的常量（历史上其他模块会从这里取 BUCKET）
 BUCKET = str(MINIO_BUCKET)
 
+_endpoint_url = os.getenv("MINIO_ENDPOINT_URL") or f"{MINIO_SCHEME}://{MINIO_ENDPOINT}".rstrip("/")
+
 # ---- boto3 S3 客户端 ----
-_endpoint_url = f"{MINIO_SCHEME}://{MINIO_ENDPOINT}".rstrip("/")
 s3 = boto3.client(
     "s3",
     endpoint_url=_endpoint_url,
@@ -53,13 +53,28 @@ s3 = boto3.client(
     config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
 )
 
-# ---- 便捷 I/O ----
+# ---- 便捷 I/O（带轻量重试）----
+def _retry(fn, *, tries: int = 3, delay: float = 0.5):
+    last = None
+    for _ in range(max(1, tries)):
+        try:
+            return fn()
+        except (BotoCoreError, ClientError) as e:
+            last = e
+            time.sleep(delay)
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    if last:
+        raise last
+
 def save_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
-    s3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=content_type)
+    def _put():
+        s3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=content_type)
+    _retry(_put)
 
 def save_np(key: str, arr: np.ndarray, allow_pickle: bool = False) -> None:
     bio = io.BytesIO()
-    # 使用 np.save（而非 savez）保持最简单的单数组存储
     np.save(bio, arr, allow_pickle=allow_pickle)
     bio.seek(0)
     save_bytes(key, bio.read(), "application/npy")
@@ -69,18 +84,11 @@ def load_np(key: str, allow_pickle: bool = False) -> np.ndarray:
     return np.load(io.BytesIO(obj["Body"].read()), allow_pickle=allow_pickle)
 
 def load_csv(key: str) -> pd.DataFrame:
-    """
-    从 MinIO 读取 CSV（不做“整表 dropna”）：
-    - 去掉多余索引列（如 Unnamed: 0）
-    - 将特定哨兵字符串替换为 NaN，保留其他数据以便下游自行处理
-    """
     obj = s3.get_object(Bucket=BUCKET, Key=key)
     df = pd.read_csv(obj["Body"])
-    # 常见多余索引列
     for c in list(df.columns):
         if str(c).startswith("Unnamed:"):
             df = df.drop(columns=[c])
-    # 将哨兵字符串替换为 NaN；不在此处 dropna
     df = df.replace({"<not counted>": np.nan})
     return df
 

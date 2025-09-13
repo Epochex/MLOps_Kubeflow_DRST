@@ -12,7 +12,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/src
-COPY requirements.txt ./
+COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && pip install -r requirements.txt
 
@@ -50,10 +50,8 @@ CMD ["bash","-lc","python -V && echo infer image ready"]
 # ---------------------------- plot ----------------------------
 FROM base AS plot
 COPY drst_inference/plotting ./drst_inference/plotting
-# 确保路径与运行时一致（experiments/kubeflow/summarize_resources.py）
 RUN mkdir -p experiments/kubeflow
 COPY experiments/kubeflow/summarize_resources.py ./experiments/kubeflow/summarize_resources.py
-# 让 plot 节点也能生成 forecasting 报告
 COPY drst_forecasting ./drst_forecasting
 CMD ["bash","-lc","python -V && echo plot image ready"]
 
@@ -64,7 +62,28 @@ COPY drst_inference/offline ./drst_inference/offline
 CMD ["bash","-lc","python -V && echo retrain image ready"]
 
 # ------------------------- forecast ---------------------------
-# 通用 forecasting 镜像（训练/解释/serve 都用它）
-FROM base AS forecast
-COPY drst_forecasting ./drst_forecasting
-CMD ["bash","-lc","python -V && echo forecast image ready"]
+# 训练/解释镜像（KFP 组件用）
+FROM python:3.10-slim AS forecast
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+      numpy pandas scikit-learn joblib boto3 fastapi uvicorn matplotlib shap xgboost \
+      --extra-index-url https://download.pytorch.org/whl/cpu torch
+WORKDIR /app
+COPY drst_common/ drst_common/
+COPY drst_forecasting/ drst_forecasting/
+CMD ["python", "-m", "drst_forecasting.train_benchmark"]
+
+# ---------------------- forecast_api (Service) ----------------
+FROM python:3.10-slim AS forecast_api
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+      fastapi uvicorn[standard] numpy pandas boto3 scikit-learn joblib xgboost shap \
+      --extra-index-url https://download.pytorch.org/whl/cpu torch
+WORKDIR /app
+COPY drst_common/ drst_common/
+COPY drst_forecasting/ drst_forecasting/
+EXPOSE 8000
+ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5
+CMD ["uvicorn", "drst_forecasting.api_server:app", "--host", "0.0.0.0", "--port", "8000"]

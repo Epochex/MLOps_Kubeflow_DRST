@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forecast-api
+  labels:
+    app: forecast-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forecast-api
+  template:
+    metadata:
+      labels:
+        app: forecast-api
+    spec:
+      containers:
+        - name: forecast-api
+          image: drst/forecast_api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            # —— 明确走外网 MinIO 网关；Pipeline 里仍走集群内 Service，不冲突 —— #
+            - name: MINIO_ENDPOINT_URL
+              value: "http://s3.45.149.207.13.nip.io:30080"
+            - name: MINIO_ACCESS_KEY
+              value: "minio"
+            - name: MINIO_SECRET_KEY
+              value: "minio123"
+            - name: MINIO_BUCKET
+              value: "onvm-demo2"
+            # （可选）预测窗口默认值；如果不写，使用镜像内默认 48/12
+            - name: FORECAST_LOOKBACK
+              value: "48"
+            - name: FORECAST_HORIZON
+              value: "12"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forecast-api
+  labels:
+    app: forecast-api
+spec:
+  selector:
+    app: forecast-api
+  type: NodePort
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30081

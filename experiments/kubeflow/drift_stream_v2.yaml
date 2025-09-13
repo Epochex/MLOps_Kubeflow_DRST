@@ -1,52 +1,16 @@
 # PIPELINE DEFINITION
 # Name: drift-stream-v2
-# Description: Drift monitoring + dynamic retraining + online inference (v2) — with forecasting (Plan A, slim)
+# Description: Drift monitoring + dynamic retraining + online inference (v2) — Forecast GridSearch → XAI（只解释最佳）
 # Inputs:
-#    fc_horizon: int [Default: 12.0]
-#    fc_lookback: int [Default: 48.0]
+#    fc_horizon: int [Default: 5.0]
+#    fc_lookback: int [Default: 10.0]
 #    kafka_topic: str [Default: 'latencyTopic']
 #    monitor_max_wall_secs: int [Default: 0.0]
 #    producer_interval_ms: int [Default: 200.0]
 #    producer_stages: str [Default: '']
 components:
-  comp-forecast-explain-op:
-    executorLabel: exec-forecast-explain-op
-    inputDefinitions:
-      parameters:
-        hidden:
-          defaultValue: 64.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        horizon:
-          defaultValue: 12.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        layers:
-          defaultValue: 1.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        lookback:
-          defaultValue: 48.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        shap_n:
-          defaultValue: 256.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-  comp-forecast-serve-op:
-    executorLabel: exec-forecast-serve-op
-    inputDefinitions:
-      parameters:
-        horizon:
-          defaultValue: 12.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        lookback:
-          defaultValue: 48.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-  comp-forecast-train-op:
-    executorLabel: exec-forecast-train-op
+  comp-forecast-gridsearch-op:
+    executorLabel: exec-forecast-gridsearch-op
     inputDefinitions:
       parameters:
         batch_size:
@@ -54,7 +18,7 @@ components:
           isOptional: true
           parameterType: NUMBER_INTEGER
         epochs:
-          defaultValue: 20.0
+          defaultValue: 50.0
           isOptional: true
           parameterType: NUMBER_INTEGER
         hidden:
@@ -62,7 +26,7 @@ components:
           isOptional: true
           parameterType: NUMBER_INTEGER
         horizon:
-          defaultValue: 12.0
+          defaultValue: 5.0
           isOptional: true
           parameterType: NUMBER_INTEGER
         layers:
@@ -70,15 +34,39 @@ components:
           isOptional: true
           parameterType: NUMBER_INTEGER
         lookback:
-          defaultValue: 48.0
+          defaultValue: 10.0
           isOptional: true
           parameterType: NUMBER_INTEGER
         patience:
-          defaultValue: 5.0
+          defaultValue: 8.0
           isOptional: true
           parameterType: NUMBER_INTEGER
         take_last:
           defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+  comp-forecast-xai-op:
+    executorLabel: exec-forecast-xai-op
+    inputDefinitions:
+      parameters:
+        hidden:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        horizon:
+          defaultValue: 5.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        layers:
+          defaultValue: 1.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 10.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        shap_n:
+          defaultValue: 256.0
           isOptional: true
           parameterType: NUMBER_INTEGER
   comp-infer-op:
@@ -153,13 +141,13 @@ components:
           parameterType: BOOLEAN
 deploymentSpec:
   executors:
-    exec-forecast-explain-op:
+    exec-forecast-gridsearch-op:
       container:
         args:
         - --executor_input
         - '{{$}}'
         - --function_to_execute
-        - forecast_explain_op
+        - forecast_gridsearch_op
         command:
         - sh
         - -c
@@ -179,23 +167,36 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef forecast_explain_op(\n    lookback: int = 48,\n    horizon: int\
-          \ = 12,\n    shap_n: int = 256,\n    hidden: int = 64,\n    layers: int\
-          \ = 1,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
-          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    os.environ[\"\
-          FORECAST_SHAP_N\"]   = str(int(shap_n))\n    os.environ[\"FORECAST_HIDDEN\"\
-          ]   = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]   = str(int(layers))\n\
-          \    subprocess.run([\"python\", \"-m\", \"drst_forecasting.explain\"],\
-          \ check=True)\n\n"
+          \ *\n\ndef forecast_gridsearch_op(\n    lookback: int = 10,     # \u6CE8\
+          \u610F\uFF1A\u7ED9\u8F83\u5C0F\u7684\u9ED8\u8BA4\uFF0C\u907F\u514D\u201C\
+          \u6ED1\u7A97\u6837\u672C\u4E0D\u8DB3\u201D\u62A5\u9519\n    horizon: int\
+          \ = 5,       # \u4E0E\u8BBA\u6587\u8BBE\u5B9A\u4E00\u81F4\uFF1A\u8F93\u5165\
+          10\u6B65\u3001\u9884\u6D4B5\u6B65\n    epochs: int = 50,\n    patience:\
+          \ int = 8,\n    hidden: int = 64,       # \u5BF9 LSTM/Transformer \u7B49\
+          \u4F5C\u4E3A\u9ED8\u8BA4\n    layers: int = 1,\n    batch_size: int = 64,\n\
+          \    take_last: int = 0,     # 0=\u7528\u5168\u91CF\uFF1B\u82E5\u4F60\u60F3\
+          \u53EA\u622A\u5C3E\u90E8\uFF0C\u53EF\u4F20>0\n) -> None:\n    \"\"\"\n \
+          \   \u8FD9\u91CC\u8C03\u7528 drst_forecasting.train_benchmark\uFF1A\n  \
+          \  - \u5185\u90E8\u505A\u591A\u6A21\u578B\u5BF9\u6BD4/\u7F51\u683C\u641C\
+          \u7D22\uFF0C\u5E76\u628A\u201C\u6700\u4F73\u6A21\u578B\u201D\u4E0E metrics\
+          \ \u5199\u5230 MinIO\n    - \u4EA7\u7269\u901A\u5E38\u4EE5 latest.txt \u6307\
+          \u5411\uFF08model_key, metrics_key\uFF09\n    \"\"\"\n    import os, subprocess\n\
+          \    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"\
+          ]  = str(int(lookback))\n    os.environ[\"FORECAST_HORIZON\"]   = str(int(horizon))\n\
+          \    os.environ[\"FORECAST_EPOCHS\"]    = str(int(epochs))\n    os.environ[\"\
+          FORECAST_PATIENCE\"]  = str(int(patience))\n    os.environ[\"FORECAST_HIDDEN\"\
+          ]    = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]    = str(int(layers))\n\
+          \    os.environ[\"FORECAST_BS\"]        = str(int(batch_size))\n    os.environ[\"\
+          FORECAST_TAKE_LAST\"] = str(int(take_last))\n    subprocess.run([\"python\"\
+          , \"-m\", \"drst_forecasting.train_benchmark\"], check=True)\n\n"
         image: hirschazer/forecast:latest
-    exec-forecast-serve-op:
+    exec-forecast-xai-op:
       container:
         args:
         - --executor_input
         - '{{$}}'
         - --function_to_execute
-        - forecast_serve_op
+        - forecast_xai_op
         command:
         - sh
         - -c
@@ -215,50 +216,19 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef forecast_serve_op(\n    lookback: int = 48,\n    horizon: int\
-          \ = 12,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
-          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    subprocess.run([\"\
-          python\", \"-m\", \"drst_forecasting.serve_forecaster\"], check=True)\n\n"
-        image: hirschazer/forecast:latest
-    exec-forecast-train-op:
-      container:
-        args:
-        - --executor_input
-        - '{{$}}'
-        - --function_to_execute
-        - forecast_train_op
-        command:
-        - sh
-        - -c
-        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
-          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
-          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
-          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
-          $0\" \"$@\"\n"
-        - sh
-        - -ec
-        - 'program_path=$(mktemp -d)
-
-
-          printf "%s" "$0" > "$program_path/ephemeral_component.py"
-
-          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
-
-          '
-        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef forecast_train_op(\n    lookback: int = 48,\n    horizon: int\
-          \ = 12,\n    epochs: int = 20,\n    patience: int = 5,\n    hidden: int\
-          \ = 64,\n    layers: int = 1,\n    batch_size: int = 64,\n    take_last:\
-          \ int = 0,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"]  = str(int(lookback))\n\
-          \    os.environ[\"FORECAST_HORIZON\"]   = str(int(horizon))\n    os.environ[\"\
-          FORECAST_EPOCHS\"]    = str(int(epochs))\n    os.environ[\"FORECAST_PATIENCE\"\
-          ]  = str(int(patience))\n    os.environ[\"FORECAST_HIDDEN\"]    = str(int(hidden))\n\
-          \    os.environ[\"FORECAST_LAYERS\"]    = str(int(layers))\n    os.environ[\"\
-          FORECAST_BS\"]        = str(int(batch_size))\n    os.environ[\"FORECAST_TAKE_LAST\"\
-          ] = str(int(take_last))\n    subprocess.run([\"python\", \"-m\", \"drst_forecasting.train_benchmark\"\
-          ], check=True)\n\n"
+          \ *\n\ndef forecast_xai_op(\n    lookback: int = 10,\n    horizon: int =\
+          \ 5,\n    shap_n: int = 256,\n    hidden: int = 64,\n    layers: int = 1,\n\
+          ) -> None:\n    \"\"\"\n    \u53EA\u89E3\u91CA\u201C\u6700\u4F73\u6A21\u578B\
+          \u201D\uFF1A\n    - \u7EC4\u4EF6\u5185\u90E8\u901A\u8FC7 latest.txt\uFF08\
+          \u6216 registry\uFF09\u8BFB\u53D6\u4E0A\u4E00\u8282\u70B9\u6311\u9009\u51FA\
+          \u7684\u6700\u4F73\u6A21\u578B\n    - \u751F\u6210\u7279\u5F81\u91CD\u8981\
+          \u6027/SHAP \u62A5\u544A\u5E76\u5199\u5165 MinIO\n    \"\"\"\n    import\
+          \ os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"\
+          FORECAST_LOOKBACK\"] = str(int(lookback))\n    os.environ[\"FORECAST_HORIZON\"\
+          ]  = str(int(horizon))\n    os.environ[\"FORECAST_SHAP_N\"]   = str(int(shap_n))\n\
+          \    os.environ[\"FORECAST_HIDDEN\"]   = str(int(hidden))\n    os.environ[\"\
+          FORECAST_LAYERS\"]   = str(int(layers))\n    subprocess.run([\"python\"\
+          , \"-m\", \"drst_forecasting.explain\"], check=True)\n\n"
         image: hirschazer/forecast:latest
     exec-infer-op:
       container:
@@ -456,7 +426,6 @@ deploymentSpec:
           \ skipped: {e}\", flush=True)\n    try:\n        subprocess.run([\"python\"\
           , \"-m\", \"drst_inference.plotting.plot_report\"], check=True)\n    except\
           \ Exception as e:\n        print(f\"[plot_report] skipped: {e}\", flush=True)\n\
-          \    # \u6CE8\uFF1A\u4E0D\u518D\u5355\u72EC\u751F\u6210 drst_forecasting.report\n\
           \n"
         image: hirschazer/plot:latest
     exec-producer-op:
@@ -527,43 +496,15 @@ deploymentSpec:
         image: hirschazer/retrain:latest
 pipelineInfo:
   description: "Drift monitoring + dynamic retraining + online inference (v2) \u2014\
-    \ with forecasting (Plan A, slim)"
+    \ Forecast GridSearch \u2192 XAI\uFF08\u53EA\u89E3\u91CA\u6700\u4F73\uFF09"
   name: drift-stream-v2
 root:
   dag:
     tasks:
-      forecast-explain-op:
+      forecast-gridsearch-op:
         cachingOptions: {}
         componentRef:
-          name: comp-forecast-explain-op
-        dependentTasks:
-        - forecast-train-op
-        inputs:
-          parameters:
-            horizon:
-              componentInputParameter: fc_horizon
-            lookback:
-              componentInputParameter: fc_lookback
-        taskInfo:
-          name: forecast-explain-op
-      forecast-serve-op:
-        cachingOptions: {}
-        componentRef:
-          name: comp-forecast-serve-op
-        dependentTasks:
-        - forecast-train-op
-        inputs:
-          parameters:
-            horizon:
-              componentInputParameter: fc_horizon
-            lookback:
-              componentInputParameter: fc_lookback
-        taskInfo:
-          name: forecast-serve-op
-      forecast-train-op:
-        cachingOptions: {}
-        componentRef:
-          name: comp-forecast-train-op
+          name: comp-forecast-gridsearch-op
         dependentTasks:
         - offline-training-op
         inputs:
@@ -573,7 +514,21 @@ root:
             lookback:
               componentInputParameter: fc_lookback
         taskInfo:
-          name: forecast-train-op
+          name: Forecast-GridSearch-op
+      forecast-xai-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-forecast-xai-op
+        dependentTasks:
+        - forecast-gridsearch-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+        taskInfo:
+          name: Forecast-XAI-op
       infer-op:
         cachingOptions: {}
         componentRef:
@@ -588,7 +543,7 @@ root:
               runtimeValue:
                 constant: 0.0
         taskInfo:
-          name: infer-op
+          name: Infer-1-op
       infer-op-2:
         cachingOptions: {}
         componentRef:
@@ -603,7 +558,7 @@ root:
               runtimeValue:
                 constant: 1.0
         taskInfo:
-          name: infer-op-2
+          name: Infer-2-op
       infer-op-3:
         cachingOptions: {}
         componentRef:
@@ -618,7 +573,7 @@ root:
               runtimeValue:
                 constant: 2.0
         taskInfo:
-          name: infer-op-3
+          name: Infer-3-op
       monitor-op:
         cachingOptions: {}
         componentRef:
@@ -630,20 +585,19 @@ root:
             max_wall_secs:
               componentInputParameter: monitor_max_wall_secs
         taskInfo:
-          name: monitor-op
+          name: Monitor-op
       offline-training-op:
         cachingOptions: {}
         componentRef:
           name: comp-offline-training-op
         taskInfo:
-          name: offline-training-op
+          name: Offline-Training-op
       plot-op:
         cachingOptions: {}
         componentRef:
           name: comp-plot-op
         dependentTasks:
-        - forecast-explain-op
-        - forecast-serve-op
+        - forecast-xai-op
         - infer-op
         - infer-op-2
         - infer-op-3
@@ -651,7 +605,7 @@ root:
         - producer-op
         - retrain-op
         taskInfo:
-          name: plot-op
+          name: Plot-Report-op
       producer-op:
         cachingOptions: {}
         componentRef:
@@ -667,7 +621,7 @@ root:
             producer_stages:
               componentInputParameter: producer_stages
         taskInfo:
-          name: producer-op
+          name: Producer-op
       retrain-op:
         cachingOptions: {}
         componentRef:
@@ -683,15 +637,15 @@ root:
               runtimeValue:
                 constant: true
         taskInfo:
-          name: retrain-op
+          name: Retrain-op
   inputDefinitions:
     parameters:
       fc_horizon:
-        defaultValue: 12.0
+        defaultValue: 5.0
         isOptional: true
         parameterType: NUMBER_INTEGER
       fc_lookback:
-        defaultValue: 48.0
+        defaultValue: 10.0
         isOptional: true
         parameterType: NUMBER_INTEGER
       kafka_topic:

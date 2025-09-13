@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Kubeflow Pipeline (v2) — 简化版：用 idle 超时为主，wall 只作兜底（0=关闭）
-- monitor 的 MAX_WALL_SECS 仅在传入 >0 时启用
-- retrain 不再设置 MAX_WALL_SECS，始终跟随 monitor 的 monitor_done.flag 退出
-- 方案A：在同一条流水线里集成 forecasting（训练 -> 解释 -> serve），与原先 offline/monitor/infer 并行但受 offline 产物约束
+Kubeflow Pipeline (v2) — 只做会“结束”的任务：
+- Offline 训练、Producer、Monitor、Retrain、Infer×3、Plot 汇总
+- 预测子系统：Forecast-GridSearch-op（先选最佳）→ Forecast-XAI-op（只解释最佳）
+- API 在线服务仍通过 K8s Deployment/Service 部署，**不**放到 Pipeline 里，以免 run 被长驻节点卡住
 """
 
 import os
 from kfp import dsl
 from kfp.dsl import component, pipeline
 
-# 镜像（可通过环境变量在编译时替换）
+# 镜像（可通过环境变量在编译时替换；留空就用仓库里默认值）
 IMG_OFFLINE:   str = os.getenv("IMAGE_OFFLINE",   "hirschazer/offline:latest")
 IMG_MONITOR:   str = os.getenv("IMAGE_MONITOR",   "hirschazer/monitor:latest")
 IMG_PRODUCER:  str = os.getenv("IMAGE_PRODUCER",  "hirschazer/producer:latest")
 IMG_INFER:     str = os.getenv("IMAGE_INFER",     "hirschazer/infer:latest")
 IMG_PLOT:      str = os.getenv("IMAGE_PLOT",      "hirschazer/plot:latest")
 IMG_RETRAIN:   str = os.getenv("IMAGE_RETRAIN",   "hirschazer/retrain:latest")
-# 新增：forecast 通用镜像
 IMG_FORECAST:  str = os.getenv("IMAGE_FORECAST",  "hirschazer/forecast:latest")
 
 # ----------------------------
-# Components
+# 基础组件
 # ----------------------------
 @component(base_image=IMG_OFFLINE)
 def offline_training_op() -> None:
@@ -85,22 +84,26 @@ def plot_op() -> None:
         subprocess.run(["python", "-m", "drst_inference.plotting.plot_report"], check=True)
     except Exception as e:
         print(f"[plot_report] skipped: {e}", flush=True)
-    # 注：不再单独生成 drst_forecasting.report
 
 # ----------------------------
-# Forecasting components（直接调用核心模块）
+# Forecasting 组件（GridSearch → XAI）
 # ----------------------------
 @component(base_image=IMG_FORECAST)
-def forecast_train_op(
-    lookback: int = 48,
-    horizon: int = 12,
-    epochs: int = 20,
-    patience: int = 5,
-    hidden: int = 64,
+def forecast_gridsearch_op(
+    lookback: int = 10,     # 注意：给较小的默认，避免“滑窗样本不足”报错
+    horizon: int = 5,       # 与论文设定一致：输入10步、预测5步
+    epochs: int = 50,
+    patience: int = 8,
+    hidden: int = 64,       # 对 LSTM/Transformer 等作为默认
     layers: int = 1,
     batch_size: int = 64,
-    take_last: int = 0,
+    take_last: int = 0,     # 0=用全量；若你想只截尾部，可传>0
 ) -> None:
+    """
+    这里调用 drst_forecasting.train_benchmark：
+    - 内部做多模型对比/网格搜索，并把“最佳模型”与 metrics 写到 MinIO
+    - 产物通常以 latest.txt 指向（model_key, metrics_key）
+    """
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     os.environ["FORECAST_LOOKBACK"]  = str(int(lookback))
@@ -114,13 +117,18 @@ def forecast_train_op(
     subprocess.run(["python", "-m", "drst_forecasting.train_benchmark"], check=True)
 
 @component(base_image=IMG_FORECAST)
-def forecast_explain_op(
-    lookback: int = 48,
-    horizon: int = 12,
+def forecast_xai_op(
+    lookback: int = 10,
+    horizon: int = 5,
     shap_n: int = 256,
     hidden: int = 64,
     layers: int = 1,
 ) -> None:
+    """
+    只解释“最佳模型”：
+    - 组件内部通过 latest.txt（或 registry）读取上一节点挑选出的最佳模型
+    - 生成特征重要性/SHAP 报告并写入 MinIO
+    """
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     os.environ["FORECAST_LOOKBACK"] = str(int(lookback))
@@ -130,34 +138,24 @@ def forecast_explain_op(
     os.environ["FORECAST_LAYERS"]   = str(int(layers))
     subprocess.run(["python", "-m", "drst_forecasting.explain"], check=True)
 
-@component(base_image=IMG_FORECAST)
-def forecast_serve_op(
-    lookback: int = 48,
-    horizon: int = 12,
-) -> None:
-    import os, subprocess
-    os.environ["PYTHONPATH"] = "/app"
-    os.environ["FORECAST_LOOKBACK"] = str(int(lookback))
-    os.environ["FORECAST_HORIZON"]  = str(int(horizon))
-    subprocess.run(["python", "-m", "drst_forecasting.serve_forecaster"], check=True)
-
 # ----------------------------
 # Pipeline
 # ----------------------------
 @pipeline(
     name="drift-stream-v2",
-    description="Drift monitoring + dynamic retraining + online inference (v2) — with forecasting (Plan A, slim)"
+    description="Drift monitoring + dynamic retraining + online inference (v2) — Forecast GridSearch → XAI（只解释最佳）"
 )
 def drift_stream_v2_pipeline(
     kafka_topic: str = "latencyTopic",
     producer_interval_ms: int = 200,
     producer_stages: str = "",
-    monitor_max_wall_secs: int = 0,
-    fc_lookback: int = 48,
-    fc_horizon:  int = 12,
+    monitor_max_wall_secs: int = 0,   # 0=不设上限（由 idle 控制）
+    fc_lookback: int = 10,
+    fc_horizon:  int = 5,
 ) -> None:
     # 1) offline
     offline = offline_training_op().set_caching_options(False)
+    offline.set_display_name("Offline-Training-op")
 
     # 2) producer
     producer = producer_op(
@@ -166,34 +164,44 @@ def drift_stream_v2_pipeline(
         producer_stages=producer_stages,
     ).set_caching_options(False)
     producer.after(offline)
+    producer.set_display_name("Producer-op")
 
     # 3) monitor
     monitor = monitor_op(max_wall_secs=monitor_max_wall_secs).set_caching_options(False)
     monitor.after(offline)
+    monitor.set_display_name("Monitor-op")
 
     # 4) retrain watcher
     retrain = retrain_op(watch=True, poll_interval_s=2).set_caching_options(False)
     retrain.after(offline)
+    retrain.set_display_name("Retrain-op")
 
     # 5) infer x3
     infer0 = infer_op(replica_id=0, kafka_topic=kafka_topic).set_caching_options(False)
     infer1 = infer_op(replica_id=1, kafka_topic=kafka_topic).set_caching_options(False)
     infer2 = infer_op(replica_id=2, kafka_topic=kafka_topic).set_caching_options(False)
     infer0.after(offline); infer1.after(offline); infer2.after(offline)
+    infer0.set_display_name("Infer-1-op")
+    infer1.set_display_name("Infer-2-op")
+    infer2.set_display_name("Infer-3-op")
 
-    # 6) forecasting（受 offline 产物约束，因此也 .after(offline)）
-    fc_train = forecast_train_op(lookback=fc_lookback, horizon=fc_horizon).set_caching_options(False)
-    fc_train.after(offline)
+    # 6) forecasting：GridSearch → XAI（只解释最佳）
+    fc_grid = forecast_gridsearch_op(
+        lookback=fc_lookback, horizon=fc_horizon
+    ).set_caching_options(False)
+    fc_grid.after(offline)
+    fc_grid.set_display_name("Forecast-GridSearch-op")
 
-    fc_explain = forecast_explain_op(lookback=fc_lookback, horizon=fc_horizon).set_caching_options(False)
-    fc_explain.after(fc_train)
+    fc_xai = forecast_xai_op(
+        lookback=fc_lookback, horizon=fc_horizon
+    ).set_caching_options(False)
+    fc_xai.after(fc_grid)
+    fc_xai.set_display_name("Forecast-XAI-op")
 
-    fc_serve = forecast_serve_op(lookback=fc_lookback, horizon=fc_horizon).set_caching_options(False)
-    fc_serve.after(fc_train)
-
-    # 7) plot 汇总
+    # 7) plot 汇总（在所有可结束节点之后）
     plot = plot_op().set_caching_options(False)
-    plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_explain, fc_serve)
+    plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_xai)
+    plot.set_display_name("Plot-Report-op")
 
 if __name__ == "__main__":
     import kfp

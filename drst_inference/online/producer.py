@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, json, time, random
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,9 +14,10 @@ from drst_common.config import (
 )
 from drst_common.minio_helper import load_csv, s3
 from drst_common.kafka_io import create_producer, broadcast_sentinel, partitions_for_topic
-from drst_common.resource_probe import start as start_probe  # <<< 新增
+from drst_common.resource_probe import start as start_probe
 
-TOPIC = os.getenv("KAFKA_TOPIC", "latencyTopic")
+# ------- 基本参数（尽量沿用 config 的默认）-------
+TOPIC  = os.getenv("KAFKA_TOPIC", "latencyTopic")
 RUN_ID = os.getenv("RUN_ID") or time.strftime("%Y%m%d%H%M%S", time.gmtime())
 
 BRIDGE_N = int(os.getenv("BRIDGE_N", str(PRODUCER_BRIDGE_N)))
@@ -29,6 +30,10 @@ KEY_STIM     = os.getenv("STAGE3_KEY", f"{DATA_DIR}/resource_stimulus_global_A-B
 
 WAIT_FEATURES_SECS = int(os.getenv("WAIT_FEATURES_SECS", "120"))
 
+# 阶段白名单（可选；默认全开）：PRODUCER_STAGES=bridge,rand,stim
+STAGES = {s.strip().lower() for s in os.getenv("PRODUCER_STAGES", "").split(",") if s.strip()} or {"bridge", "rand", "stim"}
+
+# ------- 发送速率：TPS 优先，其次 INTERVAL_MS，最后 config 默认 -------
 def _per_msg_sleep_s() -> float:
     tps_env = os.getenv("PRODUCER_TPS")
     if tps_env is not None and tps_env.strip():
@@ -40,6 +45,7 @@ def _per_msg_sleep_s() -> float:
             pass
     if PRODUCER_TPS and PRODUCER_TPS > 0:
         return 1.0 / float(PRODUCER_TPS)
+
     interval_ms_env = os.getenv("INTERVAL_MS")
     if interval_ms_env is not None and interval_ms_env.strip():
         try:
@@ -58,6 +64,7 @@ def _sleep_for_rate(base_s: float):
     else:
         time.sleep(base_s)
 
+# ------- 等待并读取特征列 -------
 def _load_feature_cols() -> List[str]:
     key = f"{MODEL_DIR}/feature_cols.json"
     deadline = time.time() + WAIT_FEATURES_SECS
@@ -73,6 +80,7 @@ def _load_feature_cols() -> List[str]:
         time.sleep(2)
     raise RuntimeError(f"wait feature_cols.json timeout: {last_err}")
 
+# ------- 数据裁剪/对齐 -------
 def _select_rows(df: pd.DataFrame, how: str, n: int) -> pd.DataFrame:
     n = min(n, len(df))
     return df.tail(n) if how == "tail" else df.head(n)
@@ -91,40 +99,48 @@ def _align(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
     df = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
     return df
 
-def main():
-    # 资源采样（producer）
-    stop_probe = start_probe("producer")
+def _load_stage_slices(feat_cols: List[str]) -> List[Tuple[str, pd.DataFrame]]:
+    df1 = _select_rows(load_csv(KEY_COMBINED), "tail", BRIDGE_N)
+    print(f"[producer] stage1 bridge: key={KEY_COMBINED} take=tail rows={len(df1)}", flush=True)
 
+    df2 = _select_rows(load_csv(KEY_RANDOM), "head", RAND_N)
+    print(f"[producer] stage2 rand  : key={KEY_RANDOM} take=head rows={len(df2)}", flush=True)
+
+    try:
+        df3 = _select_rows(load_csv(KEY_STIM), "head", STIM_N)
+    except Exception:
+        df3 = pd.DataFrame()
+    print(f"[producer] stage3 stim  : key={KEY_STIM} take=head rows={len(df3)}", flush=True)
+
+    return [
+        ("bridge", _align(df1, feat_cols)),
+        ("rand",   _align(df2, feat_cols)),
+        ("stim",   (_align(df3, feat_cols) if not df3.empty else pd.DataFrame(columns=feat_cols+[TARGET_COL]))),
+    ]
+
+# ------- 主流程：顺序发完一遍 -> sentinel -> 退出 -------
+def main():
+    stop_probe = start_probe("producer")
     try:
         feat_cols = _load_feature_cols()
         parts = partitions_for_topic(TOPIC)
-        print(f"[producer:producer] partitions discovered: {parts}", flush=True)
+        print(f"[producer] topic={TOPIC} partitions={parts}", flush=True)
 
-        df1 = _select_rows(load_csv(KEY_COMBINED), "tail", BRIDGE_N)
-        print(f"[producer:producer] stage1: key={KEY_COMBINED} take=tail rows={len(df1)}", flush=True)
-        df2 = _select_rows(load_csv(KEY_RANDOM), "head", RAND_N)
-        print(f"[producer:producer] stage2: key={KEY_RANDOM} take=head rows={len(df2)}", flush=True)
-        try:
-            df3 = _select_rows(load_csv(KEY_STIM), "head", STIM_N)
-        except Exception:
-            df3 = pd.DataFrame()
-        print(f"[producer:producer] stage3: key={KEY_STIM} take=head rows={len(df3)}", flush=True)
-
-        df_list = [
-            _align(df1, feat_cols),
-            _align(df2, feat_cols),
-            (_align(df3, feat_cols) if not df3.empty else pd.DataFrame(columns=feat_cols+[TARGET_COL]))
-        ]
-
+        pairs = _load_stage_slices(feat_cols)
         per_msg = _per_msg_sleep_s()
         if per_msg > 0:
-            tps = 1.0 / per_msg if per_msg > 0 else 0.0
-            print(f"[producer:producer] throttling enabled: {tps:.2f} msgs/sec (~{per_msg*1000:.0f} ms/record)", flush=True)
+            print(f"[producer] throttling: ~{(1.0/per_msg):.2f} msg/s (≈{per_msg*1000:.0f} ms/record)", flush=True)
 
         producer = create_producer(client_id=f"producer-{RUN_ID}")
+
         sent = 0
-        for df in df_list:
-            if df.empty: continue
+        for name, df in pairs:
+            if name not in STAGES:
+                print(f"[producer] skip stage={name} (PRODUCER_STAGES)", flush=True)
+                continue
+            if df.empty:
+                print(f"[producer] stage={name} is empty; skip.", flush=True)
+                continue
             for _, row in df.iterrows():
                 payload = {
                     "features": {c: float(row[c]) for c in feat_cols},
@@ -141,11 +157,9 @@ def main():
             producer.close(10)
         except Exception:
             pass
-
-        print(f"[producer:producer] done. sent={sent}, sentinels={n_sentinels}", flush=True)
+        print(f"[producer] done. sent={sent}, sentinels={n_sentinels}", flush=True)
 
     finally:
-        # 强制 flush + 写运行时长
         stop_probe()
 
 if __name__ == "__main__":

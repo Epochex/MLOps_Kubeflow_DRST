@@ -15,7 +15,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from sklearn.model_selection import train_test_split
 
-from drst_common.config import MODEL_DIR, RESULT_DIR, TARGET_COL, BUCKET
+from drst_common.config import MODEL_DIR, RESULT_DIR, TARGET_COL, BUCKET, TRAIN_TRIGGER as CFG_TRAIN_TRIGGER
 from drst_common.minio_helper import load_csv, save_bytes, s3
 from drst_common.metric_logger import log_metric
 from drst_common.utils import calculate_accuracy_within_threshold
@@ -33,7 +33,9 @@ BRIDGE_N     = int(os.getenv("BRIDGE_N", "500"))
 RAND_N       = int(os.getenv("RAND_N", "500"))
 TOPK         = int(os.getenv("OFFLINE_TOPK", "10"))
 
-TRAIN_TRIGGER= int(os.getenv("TRAIN_TRIGGER", "0"))  # 默认0不训练，但若 baseline 不在，会自动训练
+# 重要：默认从 config 取值，环境变量仅覆盖
+TRAIN_TRIGGER = int(os.getenv("TRAIN_TRIGGER", str(CFG_TRAIN_TRIGGER)))
+
 LR           = float(os.getenv("OFFLINE_LR", "1e-2"))
 BATCH_SIZE   = int(os.getenv("OFFLINE_BS", "16"))
 MAX_EPOCH    = int(os.getenv("OFFLINE_MAX_EPOCH", "100"))
@@ -87,7 +89,7 @@ def _rand_head_eval(model: nn.Module, scaler, selected: List[str]) -> float:
     except Exception:
         print(f"[offline] WARN: cannot load {RAND_KEY}, skip rand-head eval.")
         return 0.0
-    # 预处理与对齐（与 features._read_clean 一致的最小子集）
+    # 预处理与对齐
     df = df.replace({"<not counted>": np.nan, r"^\s*$": np.nan}, regex=True)
     df = df.dropna(how="any").reset_index(drop=True)
     df = df.drop(columns=[c for c in ["Unnamed: 0","input_rate","latency"] if c in df.columns], errors="ignore")
@@ -123,7 +125,7 @@ def main():
     X_all = scaler.transform(df_all[selected].astype(np.float32).values)
     y_all = df_all[TARGET_COL].astype(np.float32).values
 
-    # 2) 划分 7:3（固定种子），验证集用于调度/早停/最佳权重
+    # 2) 划分 7:3（固定种子）
     Xtr, Xva, Ytr, Yva = train_test_split(X_all, y_all, test_size=VAL_FRAC, random_state=SEED_SPLIT)
 
     # 3) 模型与训练流程
