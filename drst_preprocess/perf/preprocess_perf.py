@@ -13,19 +13,23 @@
 - datasets/perf/random_rates_exp-*.csv
 - datasets/perf/resource_stimulus_exp-*.csv
 - datasets/perf/intervention_exp-*.csv
+
+并行：默认 8 个 worker。可通过命令行参数或环境变量 N_WORKERS 覆盖。
 """
 
 from __future__ import annotations
 import io
 import math
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Iterable, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+from multiprocessing import Pool, cpu_count
 
-# 直接复用你的 MinIO 小工具
+# 直接复用你的 MinIO 小工具（每个进程都会各自 import，得到独立的 boto3 client）
 from drst_common.minio_helper import s3, BUCKET
 
 # ------------ 常量：标准列顺序（与“标准答案”一致）------------
@@ -213,7 +217,6 @@ def _find_experiments() -> List[Exp]:
                     exps.append(Exp(scenario=scenario, name=exp, base=f"{pref}{exp}/"))
     # 自然排序：按数字
     def natkey(e: Exp):
-        import re
         m = re.search(r"(\d+)", e.name)
         return (e.scenario, int(m.group(1)) if m else 1_000_000)
     exps.sort(key=natkey)
@@ -273,33 +276,86 @@ def _build_one_df(exp: Exp) -> pd.DataFrame:
     df = df[cols]
     return df
 
+# ------------ 并行 worker ------------
+def _process_one(exp: Exp) -> Dict:
+    try:
+        df = _build_one_df(exp)
+        out_key = f"{OUT_PREFIX}/{exp.scenario}_{exp.name}.csv"
+        _s3_write_csv_df(out_key, df)
+        expected_cols = 3 + len(PERF_FEATURES) * len(VNF_ORDER)
+        warn = None
+        if len(df.columns) != expected_cols:
+            miss = [c for c in STANDARD_COLS if c not in df.columns]
+            extra = [c for c in df.columns if c not in set(STANDARD_COLS)]
+            warn = {
+                "cols": len(df.columns),
+                "expected": expected_cols,
+                "missing_n": len(miss),
+                "extra_n": len(extra),
+                "missing": miss[:10],
+                "extra": extra[:10],
+            }
+        return {"ok": 1, "err": 0, "exp": asdict(exp), "rows": len(df), "cols": len(df.columns),
+                "out": out_key, "warn": warn}
+    except Exception as ex:
+        return {"ok": 0, "err": 1, "exp": asdict(exp), "error": str(ex)}
+
+def _choose_workers(cli_arg: Optional[str]) -> int:
+    # 优先级：命令行参数 > 环境变量 N_WORKERS > 默认 8 > 不超过 cpu_count()
+    n = None
+    if cli_arg:
+        try:
+            n = int(cli_arg)
+        except Exception:
+            n = None
+    if n is None:
+        env = os.getenv("N_WORKERS")
+        if env:
+            try:
+                n = int(env)
+            except Exception:
+                n = None
+    if n is None:
+        n = 8
+    return max(1, min(n, cpu_count()))
+
 # ------------ 主入口 ------------
 def main():
     print("=" * 88, flush=True)
-    print(f"[START] Perf preprocess (MinIO) — bucket={BUCKET} raw_prefix={RAW_PREFIX} out_prefix={OUT_PREFIX}", flush=True)
+    print(f"[START] Perf preprocess (MinIO, parallel) — bucket={BUCKET} raw_prefix={RAW_PREFIX} out_prefix={OUT_PREFIX}", flush=True)
 
     exps = _find_experiments()
+    if not exps:
+        print("[INFO] 未发现实验目录，直接退出。", flush=True)
+        print("=" * 88, flush=True)
+        return
+
     print(f"[INFO] 发现 {len(exps)} 个实验：", flush=True)
     for e in exps:
         print(f"   - {e.scenario} :: {e.name} -> {e.base}", flush=True)
 
-    ok = err = 0
-    for e in exps:
-        try:
-            df = _build_one_df(e)
-            out_key = f"{OUT_PREFIX}/{e.scenario}_{e.name}.csv"
-            _s3_write_csv_df(out_key, df)
-            print(f"[OK] write -> s3://{BUCKET}/{out_key} (rows={len(df)}, cols={len(df.columns)})", flush=True)
+    # 选择并行度
+    import sys
+    n_workers = _choose_workers(sys.argv[1] if len(sys.argv) > 1 else None)
+    print(f"[INFO] 并行进程数：{n_workers}（系统可用：{cpu_count()}）", flush=True)
 
-            expected_cols = 3 + len(PERF_FEATURES) * len(VNF_ORDER)
-            if len(df.columns) != expected_cols:
-                miss = [c for c in STANDARD_COLS if c not in df.columns]
-                extra = [c for c in df.columns if c not in set(STANDARD_COLS)]
-                print(f"[WARN] 列数 {len(df.columns)} != 期望 {expected_cols}. 缺失={len(miss)} 多余={len(extra)}", flush=True)
-            ok += 1
-        except Exception as ex:
-            err += 1
-            print(f"[ERR] {e.scenario} :: {e.name} -> {ex}", flush=True)
+    ok = err = 0
+    # 进程池：以“每个实验”为任务单元
+    with Pool(processes=n_workers) as pool:
+        for res in pool.imap_unordered(_process_one, exps, chunksize=1):
+            if res.get("ok"):
+                ok += 1
+                exp = res["exp"]
+                print(f"[OK] {exp['scenario']}::{exp['name']} -> s3://{BUCKET}/{res['out']} "
+                      f"(rows={res['rows']}, cols={res['cols']})", flush=True)
+                if res.get("warn"):
+                    w = res["warn"]
+                    print(f"[WARN] 列数 {w['cols']} != 期望 {w['expected']} "
+                          f"缺失={w['missing_n']} 多余={w['extra_n']}", flush=True)
+            else:
+                err += 1
+                exp = res.get("exp", {})
+                print(f"[ERR] {exp.get('scenario','?')}::{exp.get('name','?')} -> {res.get('error')}", flush=True)
 
     print(f"[DONE] 成功 {ok} 个，失败 {err} 个。", flush=True)
     print("=" * 88, flush=True)

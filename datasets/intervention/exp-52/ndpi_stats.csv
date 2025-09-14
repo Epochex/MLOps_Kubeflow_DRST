@@ -1,0 +1,13 @@
+# started on Wed Apr  5 16:44:55 2023
+
+     1.000454260,5083,,instructions,0.00%,49889,100.00,,
+     1.000454260,1026,,branches,0.00%,49889,100.00,66.714,M/sec
+     1.000454260,146,,branch-misses,0.00%,49889,100.00,14.23,of all branches
+     1.000454260,146,,branch-load-misses,0.00%,49889,100.00,9.493,M/sec
+     1.000454260,82,,cache-misses,0.00%,49889,100.00,0.000,of all cache refs
+     1.000454260,<not counted>,,cache-references,0.00%,0,0.00,,
+     1.000454260,<not counted>,,cycles,0.00%,0,0.00,,
+     1.000454260,1,,context-switches,0.00%,15654,100.00,0.065,M/sec
+     1.000454260,0.015104,,cpu-clock,0.00%,15654,100.00,0.000,CPUs utilized
+     1.000454260,0,,minor-faults,0.00%,15654,100.00,0.000,K/sec
+     1.000454260,0,,page-faults,0.00%,15654,100.00,0.000,K/sec

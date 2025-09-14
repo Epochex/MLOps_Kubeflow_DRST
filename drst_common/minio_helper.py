@@ -34,7 +34,7 @@ def _get(name: str, *alts, env: Optional[str] = None, default=None):
 
 MINIO_SCHEME   = _get("MINIO_SCHEME", default="http")
 MINIO_ENDPOINT = _get("MINIO_ENDPOINT", "ENDPOINT", default="minio-service.kubeflow.svc.cluster.local:9000")
-MINIO_BUCKET   = _get("MINIO_BUCKET", "BUCKET", default="mlpipeline")
+MINIO_BUCKET   = _get("BUCKET", "MINIO_BUCKET", default="mlpipeline")
 MINIO_ACCESS   = _get("MINIO_ACCESS_KEY", "ACCESS_KEY", default=os.getenv("MINIO_ACCESS_KEY", "minio"))
 MINIO_SECRET   = _get("MINIO_SECRET_KEY", "SECRET_KEY", default=os.getenv("MINIO_SECRET_KEY", "minio123"))
 MINIO_REGION   = _get("MINIO_REGION", default="us-east-1")
@@ -86,10 +86,11 @@ def load_np(key: str, allow_pickle: bool = False) -> np.ndarray:
 def load_csv(key: str) -> pd.DataFrame:
     obj = s3.get_object(Bucket=BUCKET, Key=key)
     df = pd.read_csv(obj["Body"])
+    # 清理多余索引列/占位字符串
     for c in list(df.columns):
         if str(c).startswith("Unnamed:"):
             df = df.drop(columns=[c])
-df = df.replace({"<not counted>": np.nan})
+    df = df.replace({"<not counted>": np.nan})
     return df
 
 # ---- 小工具：调试信息（可选）----
