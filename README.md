@@ -122,7 +122,7 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 
 ---
 
-#### Raw Bundles (zip) and Notes
+#### Raw Bundles Sources
 
 | scenarios (zip) | explanation |
 |---|---|
