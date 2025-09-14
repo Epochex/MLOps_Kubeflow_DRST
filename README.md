@@ -97,11 +97,68 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 
 ![Infra Overview](<docs/structure_infra.png>)
 
+
+---
+
 ## 2. Software Overview
 **This repository is organized as follows.** 
 
 ### 2.1 `datasets/`
-Network-flow datasets. Offline training uses `combined.csv` to produce the baseline model. Stage 1 uses `random_rates.csv` for initial adaptation. Stage 2 injects `resource_stimulus_global_A-B-C_modified.csv` to simulate inference under CPU resource contention.
+
+> This directory stores **CSV files directly consumable by the system** (either preprocessed/merged results, or 12-row excerpts from each CSV for integration testing).  
+> Raw bundles are stored in MinIO under `raw/`. Processed artifacts live in `datasets/` (online inference branch, **perf**) and `datasets_pcm/` (forecast branch, **pcm**).
+
+---
+
+#### Scenarios and Usage (scenarios → explanation)
+
+| scenarios | explanation |
+|---|---|
+| **stage0 – baseline (offline)** → `datasets/combined.csv` | **Offline training set** for regular traffic (linear topology). The `offline` component trains the baseline on this file and produces `feature_cols.json / model.pt` under `models/`. |
+| **stage1 – random rates** → `datasets/stage1_random_rates.csv` | **Traffic-only stimulation** (random rates). Derived from VNF + TX/RX + Latency raw files in `raw/random_rates/exp-*/`, merged by **perf** preprocessing. Used by the Producer as the input for the **first online adaptation**. |
+| **stage2 – resource stimulus** → `datasets/stage2_resource_stimulus_global_A-B-C_modified.csv` | **CPU resource contention only** (no additional traffic changes). Derived from `raw/resource_stimulus/`, preprocessed by **perf**, then filtered to the **A-B-C_modified** subset to emulate deployments under resource contention. |
+| **stage3 – intervention** → `datasets/stage3_intervention_global.csv` | **Most complex intervention**: **traffic variation + resource contention** simultaneously. Derived from `raw/intervention/`, merged via **perf** preprocessing. Used to evaluate robustness under extreme disturbances. |
+| **forecasting (PCM branch)** → `datasets_pcm/*.csv` | Used **only** by the **time-series forecasting branch** (Forecast-GridSearch / XAI). Raw bundles in `raw/pcm/const-?gbps/` are turned into sequences via **pcm** preprocessing/extraction. Runs **in parallel** with the online inference branch, with **no mutual dependency**. |
+
+---
+
+#### Raw Bundles (zip) and Notes
+
+| scenarios (zip) | explanation |
+|---|---|
+| `random_rates` | Source of Stage 1: multiple `exp-*` experiment folders containing `perf stat` counters for 5 VNFs (`firewall.csv`, `nf_router.csv`, `ndpi_stats.csv`, `payload_scan.csv`, `bridge.csv`) plus `tx_stats.csv`, `rx_stats.csv`, and `latency.csv`. Merged by **perf** preprocessing → `datasets/stage1_random_rates.csv`. |
+| `resource_stimulus` | Source of Stage 2: various CPU stress patterns. Preprocessed by **perf** → merged, then filtered to **A-B-C_modified** → `datasets/stage2_resource_stimulus_global_A-B-C_modified.csv`. |
+| `intervention` | Source of Stage 3: complex interventions that change both traffic and resources. Preprocessed by **perf** → `datasets/stage3_intervention_global.csv`. |
+| `pcm_const_*` (or `pcm/const-?gbps/`) | Forecast branch: multiple constant-rate experiments (with richer hardware counters such as CPU/LLC/memory/PCIe). Preprocessed/extracted by **pcm** → `datasets_pcm/*.csv` for time-series forecasting and explanation. |
+| `load_stimulus` / `fixed_rate.zip` / `incremental.zip` | Additional **traffic-stimulation** or historical experiment materials. They can be normalized by the **perf** toolchain into CSVs with unified headers; **not included by default** in the three main stages above—enable/switch in Producer as needed. |
+
+---
+
+#### Meaning of Raw CSVs (Perf example)
+
+- **VNF counter files**: `firewall.csv`, `nf_router.csv`, `ndpi_stats.csv`, `payload_scan.csv`, `bridge.csv`  
+  - Sourced from `perf stat` (comma-separated), each row advances in time; during preprocessing, events are matched by full-line event name and the **largest-magnitude** numeric value on that line is taken as the event count (to avoid picking the `scale≈1.x` field).  
+  - Event set (12 items):  
+    `instructions, branches, branch-misses, branch-load-misses, cache-misses, cache-references, cycles, L1-dcache-load-misses, L1-dcache-loads, LLC-load-misses, LLC-stores, LLC-loads`  
+  - Columns after preprocessing: `\<vnf>_\<event>` (e.g., `firewall_instructions`).
+
+- **TX/RX traffic files**: `tx_stats.csv`, `rx_stats.csv`  
+  - If a header exists, prefer columns `Mbit` or `PacketRate`; otherwise fall back to fixed positional parsing.  
+  - Preprocessing aligns them to KPIs: `input_rate` and `output_rate` (units follow the source columns: typically **Mb/s** or **pps**).
+
+- **End-to-end latency**: `latency.csv` (or `latency_old.csv`)  
+  - One latency per row; units are auto-detected: if large numeric scales are detected, convert **μs → ms**.  
+  - Exposed as KPI: `latency` (milliseconds) after preprocessing.
+
+- **Alignment strategy**: use the length of `firewall_instructions` as the anchor (fallback to TX/RX/Latency if missing) and truncate/pad all columns to the **same sequence length**; fill missing values with `NaN`.
+
+- **Output column schema** (uniform **63 columns**):  
+  `["input_rate", "output_rate", "latency"] + [f"{vnf}_{event}" for vnf in (firewall, nf_router, ndpi_stats, payload_scan, bridge) for event in the 12 events]`
+
+> The above processing is implemented by `drst_preprocess/perf/preprocess_perf.py` (per-experiment parsing/alignment) and `drst_preprocess/perf/extract_perf.py` (merging within the same scenario).
+
+
+
 
 ### 2.2 `drst_common/`
 The runtime backbone that turns the whole system into a low-latency, loosely-coupled graph: rules live as code with env-overrides (drift tiers → on-the-fly A/B/C search spaces), artifacts flow through an **immutable-object + mutable-pointer** pattern (timestamped model/metrics with a 2-line “latest” head for atomic hot reloads and easy rollback), and storage follows **PVC-first write → async S3 upload** so training/inference never stall on the network.  

@@ -1,6 +1,6 @@
 # PIPELINE DEFINITION
 # Name: drift-stream-v2
-# Description: Drift monitoring + dynamic retraining + online inference (v2) — Forecast GridSearch → XAI（只解释最佳）
+# Description: Drift monitoring + dynamic retraining + online inference + preprocessing (PCM/Perf)
 # Inputs:
 #    fc_horizon: int [Default: 5.0]
 #    fc_lookback: int [Default: 10.0]
@@ -109,6 +109,10 @@ components:
           parameterType: NUMBER_INTEGER
   comp-offline-training-op:
     executorLabel: exec-offline-training-op
+  comp-pcm-pre-op:
+    executorLabel: exec-pcm-pre-op
+  comp-perf-pre-op:
+    executorLabel: exec-perf-pre-op
   comp-plot-op:
     executorLabel: exec-plot-op
   comp-producer-op:
@@ -167,28 +171,18 @@ deploymentSpec:
 
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef forecast_gridsearch_op(\n    lookback: int = 10,     # \u6CE8\
-          \u610F\uFF1A\u7ED9\u8F83\u5C0F\u7684\u9ED8\u8BA4\uFF0C\u907F\u514D\u201C\
-          \u6ED1\u7A97\u6837\u672C\u4E0D\u8DB3\u201D\u62A5\u9519\n    horizon: int\
-          \ = 5,       # \u4E0E\u8BBA\u6587\u8BBE\u5B9A\u4E00\u81F4\uFF1A\u8F93\u5165\
-          10\u6B65\u3001\u9884\u6D4B5\u6B65\n    epochs: int = 50,\n    patience:\
-          \ int = 8,\n    hidden: int = 64,       # \u5BF9 LSTM/Transformer \u7B49\
-          \u4F5C\u4E3A\u9ED8\u8BA4\n    layers: int = 1,\n    batch_size: int = 64,\n\
-          \    take_last: int = 0,     # 0=\u7528\u5168\u91CF\uFF1B\u82E5\u4F60\u60F3\
-          \u53EA\u622A\u5C3E\u90E8\uFF0C\u53EF\u4F20>0\n) -> None:\n    \"\"\"\n \
-          \   \u8FD9\u91CC\u8C03\u7528 drst_forecasting.train_benchmark\uFF1A\n  \
-          \  - \u5185\u90E8\u505A\u591A\u6A21\u578B\u5BF9\u6BD4/\u7F51\u683C\u641C\
-          \u7D22\uFF0C\u5E76\u628A\u201C\u6700\u4F73\u6A21\u578B\u201D\u4E0E metrics\
-          \ \u5199\u5230 MinIO\n    - \u4EA7\u7269\u901A\u5E38\u4EE5 latest.txt \u6307\
-          \u5411\uFF08model_key, metrics_key\uFF09\n    \"\"\"\n    import os, subprocess\n\
-          \    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"\
-          ]  = str(int(lookback))\n    os.environ[\"FORECAST_HORIZON\"]   = str(int(horizon))\n\
-          \    os.environ[\"FORECAST_EPOCHS\"]    = str(int(epochs))\n    os.environ[\"\
-          FORECAST_PATIENCE\"]  = str(int(patience))\n    os.environ[\"FORECAST_HIDDEN\"\
-          ]    = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]    = str(int(layers))\n\
-          \    os.environ[\"FORECAST_BS\"]        = str(int(batch_size))\n    os.environ[\"\
-          FORECAST_TAKE_LAST\"] = str(int(take_last))\n    subprocess.run([\"python\"\
-          , \"-m\", \"drst_forecasting.train_benchmark\"], check=True)\n\n"
+          \ *\n\ndef forecast_gridsearch_op(\n    lookback: int = 10,\n    horizon:\
+          \ int = 5,\n    epochs: int = 50,\n    patience: int = 8,\n    hidden: int\
+          \ = 64,\n    layers: int = 1,\n    batch_size: int = 64,\n    take_last:\
+          \ int = 0,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"]  = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]   = str(int(horizon))\n    os.environ[\"\
+          FORECAST_EPOCHS\"]    = str(int(epochs))\n    os.environ[\"FORECAST_PATIENCE\"\
+          ]  = str(int(patience))\n    os.environ[\"FORECAST_HIDDEN\"]    = str(int(hidden))\n\
+          \    os.environ[\"FORECAST_LAYERS\"]    = str(int(layers))\n    os.environ[\"\
+          FORECAST_BS\"]        = str(int(batch_size))\n    os.environ[\"FORECAST_TAKE_LAST\"\
+          ] = str(int(take_last))\n    subprocess.run([\"python\", \"-m\", \"drst_forecasting.train_benchmark\"\
+          ], check=True)\n\n"
         image: hirschazer/forecast:latest
     exec-forecast-xai-op:
       container:
@@ -218,17 +212,13 @@ deploymentSpec:
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef forecast_xai_op(\n    lookback: int = 10,\n    horizon: int =\
           \ 5,\n    shap_n: int = 256,\n    hidden: int = 64,\n    layers: int = 1,\n\
-          ) -> None:\n    \"\"\"\n    \u53EA\u89E3\u91CA\u201C\u6700\u4F73\u6A21\u578B\
-          \u201D\uFF1A\n    - \u7EC4\u4EF6\u5185\u90E8\u901A\u8FC7 latest.txt\uFF08\
-          \u6216 registry\uFF09\u8BFB\u53D6\u4E0A\u4E00\u8282\u70B9\u6311\u9009\u51FA\
-          \u7684\u6700\u4F73\u6A21\u578B\n    - \u751F\u6210\u7279\u5F81\u91CD\u8981\
-          \u6027/SHAP \u62A5\u544A\u5E76\u5199\u5165 MinIO\n    \"\"\"\n    import\
-          \ os, subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"\
-          FORECAST_LOOKBACK\"] = str(int(lookback))\n    os.environ[\"FORECAST_HORIZON\"\
-          ]  = str(int(horizon))\n    os.environ[\"FORECAST_SHAP_N\"]   = str(int(shap_n))\n\
-          \    os.environ[\"FORECAST_HIDDEN\"]   = str(int(hidden))\n    os.environ[\"\
-          FORECAST_LAYERS\"]   = str(int(layers))\n    subprocess.run([\"python\"\
-          , \"-m\", \"drst_forecasting.explain\"], check=True)\n\n"
+          ) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"] =\
+          \ \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    os.environ[\"\
+          FORECAST_SHAP_N\"]   = str(int(shap_n))\n    os.environ[\"FORECAST_HIDDEN\"\
+          ]   = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]   = str(int(layers))\n\
+          \    subprocess.run([\"python\", \"-m\", \"drst_forecasting.explain\"],\
+          \ check=True)\n\n"
         image: hirschazer/forecast:latest
     exec-infer-op:
       container:
@@ -391,6 +381,38 @@ deploymentSpec:
           \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    subprocess.run([\"python\"\
           , \"-m\", \"drst_inference.offline.train_offline\"], check=True)\n\n"
         image: hirschazer/offline:latest
+    exec-pcm-pre-op:
+      container:
+        args:
+        - "\n            set -e\n            export PYTHONPATH=/app\n            echo\
+          \ \"[PCM-Pre-op] preprocess -> extract (MinIO I/O inside scripts)\"\n  \
+          \          /opt/venv/bin/python -V\n            which python || true\n \
+          \           /opt/venv/bin/python -c \"import sys; print(sys.executable)\"\
+          \n            /opt/venv/bin/python -c \"import pandas, numpy; print('pandas',\
+          \ pandas.__version__, 'numpy', numpy.__version__)\"\n            /opt/venv/bin/python\
+          \ -m drst_preprocess.pcm.preprocess_pcm\n            /opt/venv/bin/python\
+          \ -m drst_preprocess.pcm.extract_pcm\n            echo \"[PCM-Pre-op] done.\"\
+          \n        "
+        command:
+        - bash
+        - -lc
+        image: hirschazer/offline:latest
+    exec-perf-pre-op:
+      container:
+        args:
+        - "\n            set -e\n            export PYTHONPATH=/app\n            echo\
+          \ \"[Perf-Pre-op] preprocess -> extract (MinIO I/O inside scripts)\"\n \
+          \           /opt/venv/bin/python -V\n            which python || true\n\
+          \            /opt/venv/bin/python -c \"import sys; print(sys.executable)\"\
+          \n            /opt/venv/bin/python -c \"import pandas, numpy; print('pandas',\
+          \ pandas.__version__, 'numpy', numpy.__version__)\"\n            /opt/venv/bin/python\
+          \ -m drst_preprocess.perf.preprocess_perf\n            /opt/venv/bin/python\
+          \ -m drst_preprocess.perf.extract_perf\n            echo \"[Perf-Pre-op]\
+          \ done.\"\n        "
+        command:
+        - bash
+        - -lc
+        image: hirschazer/offline:latest
     exec-plot-op:
       container:
         args:
@@ -495,8 +517,8 @@ deploymentSpec:
           , \"-m\", \"drst_drift.dynamic_retrain\"], check=True)\n\n"
         image: hirschazer/retrain:latest
 pipelineInfo:
-  description: "Drift monitoring + dynamic retraining + online inference (v2) \u2014\
-    \ Forecast GridSearch \u2192 XAI\uFF08\u53EA\u89E3\u91CA\u6700\u4F73\uFF09"
+  description: Drift monitoring + dynamic retraining + online inference + preprocessing
+    (PCM/Perf)
   name: drift-stream-v2
 root:
   dag:
@@ -506,7 +528,7 @@ root:
         componentRef:
           name: comp-forecast-gridsearch-op
         dependentTasks:
-        - offline-training-op
+        - pcm-pre-op
         inputs:
           parameters:
             horizon:
@@ -590,8 +612,22 @@ root:
         cachingOptions: {}
         componentRef:
           name: comp-offline-training-op
+        dependentTasks:
+        - perf-pre-op
         taskInfo:
           name: Offline-Training-op
+      pcm-pre-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-pcm-pre-op
+        taskInfo:
+          name: PCM-Pre-op
+      perf-pre-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-perf-pre-op
+        taskInfo:
+          name: Perf-Pre-op
       plot-op:
         cachingOptions: {}
         componentRef:

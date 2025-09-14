@@ -1,53 +1,62 @@
 # /data/mlops/DRST-SoftwarizedNetworks/docker/dockerfile
 # syntax=docker/dockerfile:1.6
 
+############################ deps ############################
 FROM python:3.10-slim AS deps
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# 基础系统依赖（编译 & 常用native依赖）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      gcc g++ curl ca-certificates git \
+      gcc g++ build-essential curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+# venv
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/src
+# 建议把所有通用依赖都写进 requirements.txt（务必包含 pandas、numpy、boto3、pyarrow/openpyxl、minio 等）
 COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && pip install -r requirements.txt
 
-# ---------------------------- base ----------------------------
+############################ base ############################
 FROM python:3.10-slim AS base
 ENV PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ENV APP_DIR=/app PYTHONPATH=/app
 COPY --from=deps /opt/venv /opt/venv
 WORKDIR /app
+
+# 公共代码（MinIO 工具、配置等）
 COPY drst_common ./drst_common
+# 预处理代码（Perf/PCM 两个目录都会被用到）
+COPY drst_preprocess ./drst_preprocess
+# 如需在运行时参考（不是必须）
 COPY requirements.txt ./requirements.txt
 
-# -------------------------- offline ---------------------------
+############################ offline ############################
 FROM base AS offline
 COPY drst_inference/offline ./drst_inference/offline
 COPY datasets ./datasets
 CMD ["bash","-lc","python -V && echo offline image ready"]
 
-# -------------------------- monitor ---------------------------
+############################ monitor ############################
 FROM base AS monitor
 COPY drst_drift ./drst_drift
 CMD ["bash","-lc","python -V && echo monitor image ready"]
 
-# -------------------------- producer --------------------------
+############################ producer ############################
 FROM base AS producer
 COPY drst_inference/online ./drst_inference/online
 CMD ["bash","-lc","python -V && echo producer image ready"]
 
-# --------------------------- infer ----------------------------
+############################ infer ############################
 FROM base AS infer
 COPY drst_inference/online ./drst_inference/online
 COPY drst_inference/offline ./drst_inference/offline
 CMD ["bash","-lc","python -V && echo infer image ready"]
 
-# ---------------------------- plot ----------------------------
+############################ plot ############################
 FROM base AS plot
 COPY drst_inference/plotting ./drst_inference/plotting
 RUN mkdir -p experiments/kubeflow
@@ -55,35 +64,35 @@ COPY experiments/kubeflow/summarize_resources.py ./experiments/kubeflow/summariz
 COPY drst_forecasting ./drst_forecasting
 CMD ["bash","-lc","python -V && echo plot image ready"]
 
-# -------------------------- retrain ---------------------------
+############################ retrain ############################
 FROM base AS retrain
 COPY drst_drift ./drst_drift
 COPY drst_inference/offline ./drst_inference/offline
 CMD ["bash","-lc","python -V && echo retrain image ready"]
 
-# ------------------------- forecast ---------------------------
-# 训练/解释镜像（KFP 组件用）
+############################ forecast ############################
+# 训练/解释镜像（单独做是为了减少与基础镜像的耦合；也可改为 FROM base）
 FROM python:3.10-slim AS forecast
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir \
-      numpy pandas scikit-learn joblib boto3 fastapi uvicorn matplotlib shap xgboost \
+      numpy pandas scikit-learn joblib boto3 minio pyarrow openpyxl \
+      fastapi uvicorn matplotlib shap xgboost \
       --extra-index-url https://download.pytorch.org/whl/cpu torch
 WORKDIR /app
 COPY drst_common/ drst_common/
 COPY drst_forecasting/ drst_forecasting/
 CMD ["python", "-m", "drst_forecasting.train_benchmark"]
 
-# ---------------------- forecast_api (Service) ----------------
+############################ forecast_api ############################
 FROM python:3.10-slim AS forecast_api
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir \
-      fastapi uvicorn[standard] numpy pandas boto3 scikit-learn joblib xgboost shap \
+      fastapi uvicorn[standard] numpy pandas boto3 minio pyarrow openpyxl scikit-learn joblib xgboost shap \
       --extra-index-url https://download.pytorch.org/whl/cpu torch
 WORKDIR /app
 COPY drst_common/ drst_common/
 COPY drst_forecasting/ drst_forecasting/
 EXPOSE 8000
-ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5
-CMD ["uvicorn", "drst_forecasting.api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5pp

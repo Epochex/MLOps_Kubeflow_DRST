@@ -1,3 +1,4 @@
+# DRST-SoftwarizedNetworks/drst_common/config.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -49,16 +50,34 @@ PRODUCE_INTERVAL_MS = 100    # 若 TPS<=0，则使用固定间隔（毫秒）
 PRODUCER_JITTER_MS  = 0
 PRODUCER_PARTITION_MODE = "rr"  # "auto" | "rr" | "hash"
 
-# 分段条数
+# ---- 各阶段默认条数（可按需调整）----
+# stage0：regular traffic（combined，给 offline；这里也作为在线的第 0 段推流）
 PRODUCER_BRIDGE_N = 500
+# stage1：random rates
 PRODUCER_RAND_N   = 1000
+# stage2：resource stimulus（CPU 资源争用）
 PRODUCER_STIM_N   = 1000
+# stage3：intervention（流量+资源均不稳定）
+PRODUCER_INTERV_N = 1000
 
-# 按顺序发送的阶段（键、取法、行数）
+# ---- 在线按顺序发送的阶段清单 ----
+# 说明：
+# - name：阶段名（用于日志/消息里的 "stage" 字段，以及环境变量 PRODUCER_STAGES 白名单）
+# - key ：MinIO 对象键（**指向 perf 预处理/合并后的产物**）
+# - take：从 CSV 取哪一端（"head" | "tail"）
+# - rows：取多少行（<=0 表示取尽）
 PRODUCER_STAGES: List[dict] = [
-    {"key": f"{DATA_DIR}/combined.csv",     "take": "tail", "rows": PRODUCER_BRIDGE_N},
-    {"key": f"{DATA_DIR}/random_rates.csv", "take": "head", "rows": PRODUCER_RAND_N},
-    {"key": f"{DATA_DIR}/resource_stimulus_global_A-B-C_modified.csv", "take": "head", "rows": PRODUCER_STIM_N},
+    # stage0：combined 作为 warm-up/基线（你之前的“bridge”）
+    {"name": "stage0", "key": f"{DATA_DIR}/combined.csv", "take": "tail", "rows": PRODUCER_BRIDGE_N},
+
+    # stage1：random（来自 perf 预处理合并后的全量；Producer 内按 rows 截取）
+    {"name": "stage1", "key": f"{DATA_DIR}/perf/stage1_random_rates.csv", "take": "head", "rows": PRODUCER_RAND_N},
+
+    # stage2：resource_stimulus（A-B-C_modified 别名文件）
+    {"name": "stage2", "key": f"{DATA_DIR}/perf/stage2_resource_stimulus_global_A-B-C_modified.csv", "take": "head", "rows": PRODUCER_STIM_N},
+
+    # stage3：intervention
+    {"name": "stage3", "key": f"{DATA_DIR}/perf/stage3_intervention_global.csv", "take": "head", "rows": PRODUCER_INTERV_N},
 ]
 
 # ===== 漂移监控窗口 / 阈值 =====

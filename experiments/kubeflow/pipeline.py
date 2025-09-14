@@ -1,9 +1,13 @@
+# DRST-SoftwarizedNetworks/experiments/kubeflow/pipeline.py
 # -*- coding: utf-8 -*-
 """
-Kubeflow Pipeline (v2) — 只做会“结束”的任务：
-- Offline 训练、Producer、Monitor、Retrain、Infer×3、Plot 汇总
-- 预测子系统：Forecast-GridSearch-op（先选最佳）→ Forecast-XAI-op（只解释最佳）
-- API 在线服务仍通过 K8s Deployment/Service 部署，**不**放到 Pipeline 里，以免 run 被长驻节点卡住
+Kubeflow Pipeline (v2)
+- PCM-Pre-op：运行 drst_preprocess.pcm.preprocess_pcm 与 drst_preprocess.pcm.extract_pcm
+- Perf-Pre-op：运行 drst_preprocess.perf.preprocess_perf 与 drst_preprocess.perf.extract_perf
+
+依赖关系：
+- Perf-Pre-op  →  Offline-Training-op
+- PCM-Pre-op   →  Forecast-GridSearch-op → Forecast-XAI-op
 """
 
 import os
@@ -19,9 +23,54 @@ IMG_PLOT:      str = os.getenv("IMAGE_PLOT",      "hirschazer/plot:latest")
 IMG_RETRAIN:   str = os.getenv("IMAGE_RETRAIN",   "hirschazer/retrain:latest")
 IMG_FORECAST:  str = os.getenv("IMAGE_FORECAST",  "hirschazer/forecast:latest")
 
-# ----------------------------
-# 基础组件
-# ----------------------------
+# 复用 offline 镜像来跑预处理（镜像里已包含 /app/drst_preprocess）
+IMG_PREPROC:   str = os.getenv("IMAGE_PREPROC",   IMG_OFFLINE)
+
+# ========== （如需要PVC可保留；若仅走MinIO，挂载可不生效也不影响） ==========
+DATA_PVC_NAME: str = os.getenv("DATA_PVC_NAME", "YOUR_DATA_PVC")
+DATA_MOUNT     = "/data"
+
+# ---------------------------- 预处理组件 ----------------------------
+@dsl.container_component
+def pcm_pre_op():
+    return dsl.ContainerSpec(
+        image=IMG_PREPROC,
+        command=["bash","-lc"],
+        args=[r"""
+            set -e
+            export PYTHONPATH=/app
+            echo "[PCM-Pre-op] preprocess -> extract (MinIO I/O inside scripts)"
+            /opt/venv/bin/python -V
+            which python || true
+            /opt/venv/bin/python -c "import sys; print(sys.executable)"
+            /opt/venv/bin/python -c "import pandas, numpy; print('pandas', pandas.__version__, 'numpy', numpy.__version__)"
+            /opt/venv/bin/python -m drst_preprocess.pcm.preprocess_pcm
+            /opt/venv/bin/python -m drst_preprocess.pcm.extract_pcm
+            echo "[PCM-Pre-op] done."
+        """],
+    )
+
+@dsl.container_component
+def perf_pre_op():
+    return dsl.ContainerSpec(
+        image=IMG_PREPROC,
+        command=["bash","-lc"],
+        args=[r"""
+            set -e
+            export PYTHONPATH=/app
+            echo "[Perf-Pre-op] preprocess -> extract (MinIO I/O inside scripts)"
+            /opt/venv/bin/python -V
+            which python || true
+            /opt/venv/bin/python -c "import sys; print(sys.executable)"
+            /opt/venv/bin/python -c "import pandas, numpy; print('pandas', pandas.__version__, 'numpy', numpy.__version__)"
+            /opt/venv/bin/python -m drst_preprocess.perf.preprocess_perf
+            /opt/venv/bin/python -m drst_preprocess.perf.extract_perf
+            echo "[Perf-Pre-op] done."
+        """],
+    )
+
+
+# ---------------------------- 其余组件（与你现有保持一致） ----------------------------
 @component(base_image=IMG_OFFLINE)
 def offline_training_op() -> None:
     import os, subprocess
@@ -85,25 +134,17 @@ def plot_op() -> None:
     except Exception as e:
         print(f"[plot_report] skipped: {e}", flush=True)
 
-# ----------------------------
-# Forecasting 组件（GridSearch → XAI）
-# ----------------------------
 @component(base_image=IMG_FORECAST)
 def forecast_gridsearch_op(
-    lookback: int = 10,     # 注意：给较小的默认，避免“滑窗样本不足”报错
-    horizon: int = 5,       # 与论文设定一致：输入10步、预测5步
+    lookback: int = 10,
+    horizon: int = 5,
     epochs: int = 50,
     patience: int = 8,
-    hidden: int = 64,       # 对 LSTM/Transformer 等作为默认
+    hidden: int = 64,
     layers: int = 1,
     batch_size: int = 64,
-    take_last: int = 0,     # 0=用全量；若你想只截尾部，可传>0
+    take_last: int = 0,
 ) -> None:
-    """
-    这里调用 drst_forecasting.train_benchmark：
-    - 内部做多模型对比/网格搜索，并把“最佳模型”与 metrics 写到 MinIO
-    - 产物通常以 latest.txt 指向（model_key, metrics_key）
-    """
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     os.environ["FORECAST_LOOKBACK"]  = str(int(lookback))
@@ -124,11 +165,6 @@ def forecast_xai_op(
     hidden: int = 64,
     layers: int = 1,
 ) -> None:
-    """
-    只解释“最佳模型”：
-    - 组件内部通过 latest.txt（或 registry）读取上一节点挑选出的最佳模型
-    - 生成特征重要性/SHAP 报告并写入 MinIO
-    """
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     os.environ["FORECAST_LOOKBACK"] = str(int(lookback))
@@ -138,26 +174,33 @@ def forecast_xai_op(
     os.environ["FORECAST_LAYERS"]   = str(int(layers))
     subprocess.run(["python", "-m", "drst_forecasting.explain"], check=True)
 
-# ----------------------------
-# Pipeline
-# ----------------------------
+# ---------------------------- Pipeline ----------------------------
 @pipeline(
     name="drift-stream-v2",
-    description="Drift monitoring + dynamic retraining + online inference (v2) — Forecast GridSearch → XAI（只解释最佳）"
+    description="Drift monitoring + dynamic retraining + online inference + preprocessing (PCM/Perf)"
 )
 def drift_stream_v2_pipeline(
     kafka_topic: str = "latencyTopic",
     producer_interval_ms: int = 200,
     producer_stages: str = "",
-    monitor_max_wall_secs: int = 0,   # 0=不设上限（由 idle 控制）
+    monitor_max_wall_secs: int = 0,
     fc_lookback: int = 10,
     fc_horizon:  int = 5,
 ) -> None:
-    # 1) offline
+
+    # 0) 预处理（可并行）
+    pcm = pcm_pre_op().set_caching_options(False)
+    pcm.set_display_name("PCM-Pre-op")
+
+    perf = perf_pre_op().set_caching_options(False)
+    perf.set_display_name("Perf-Pre-op")
+
+    # 1) offline 仅依赖 Perf（使用 datasets/combined.csv + perf 产物）
     offline = offline_training_op().set_caching_options(False)
     offline.set_display_name("Offline-Training-op")
+    offline.after(perf)
 
-    # 2) producer
+    # 2) producer / monitor / retrain / infer 都依赖 offline
     producer = producer_op(
         kafka_topic=kafka_topic,
         interval_ms=producer_interval_ms,
@@ -166,17 +209,14 @@ def drift_stream_v2_pipeline(
     producer.after(offline)
     producer.set_display_name("Producer-op")
 
-    # 3) monitor
     monitor = monitor_op(max_wall_secs=monitor_max_wall_secs).set_caching_options(False)
     monitor.after(offline)
     monitor.set_display_name("Monitor-op")
 
-    # 4) retrain watcher
     retrain = retrain_op(watch=True, poll_interval_s=2).set_caching_options(False)
     retrain.after(offline)
     retrain.set_display_name("Retrain-op")
 
-    # 5) infer x3
     infer0 = infer_op(replica_id=0, kafka_topic=kafka_topic).set_caching_options(False)
     infer1 = infer_op(replica_id=1, kafka_topic=kafka_topic).set_caching_options(False)
     infer2 = infer_op(replica_id=2, kafka_topic=kafka_topic).set_caching_options(False)
@@ -185,11 +225,11 @@ def drift_stream_v2_pipeline(
     infer1.set_display_name("Infer-2-op")
     infer2.set_display_name("Infer-3-op")
 
-    # 6) forecasting：GridSearch → XAI（只解释最佳）
+    # 3) forecasting：仅依赖 PCM 预处理
     fc_grid = forecast_gridsearch_op(
         lookback=fc_lookback, horizon=fc_horizon
     ).set_caching_options(False)
-    fc_grid.after(offline)
+    fc_grid.after(pcm)
     fc_grid.set_display_name("Forecast-GridSearch-op")
 
     fc_xai = forecast_xai_op(
@@ -198,10 +238,11 @@ def drift_stream_v2_pipeline(
     fc_xai.after(fc_grid)
     fc_xai.set_display_name("Forecast-XAI-op")
 
-    # 7) plot 汇总（在所有可结束节点之后）
+    # 4) plot 汇总（在所有可结束节点之后）
     plot = plot_op().set_caching_options(False)
     plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_xai)
     plot.set_display_name("Plot-Report-op")
+
 
 if __name__ == "__main__":
     import kfp

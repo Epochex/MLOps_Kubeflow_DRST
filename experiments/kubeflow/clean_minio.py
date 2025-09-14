@@ -5,6 +5,11 @@
 清理 MinIO：删除 BUCKET 中除 KEEP_PREFIXES 下的对象外的所有对象。
 为绕过 MinIO 在 HTTP 网关下对 DeleteObjects(批量删除) 的 Content-MD5 强制要求，
 改为逐个 delete_object，稳定可靠。
+
+本脚本将保留以下“目录前缀”下的对象：
+- datasets/
+- raw/
+datasets_pcm
 """
 
 import sys
@@ -19,7 +24,9 @@ MINIO_S3_ENDPOINT = "http://s3.45.149.207.13.nip.io:30080"
 ACCESS_KEY = "minio"
 SECRET_KEY = "minio123"
 BUCKET     = "onvm-demo2"
-KEEP_PREFIXES = ["datasets/"]     # 需要保留的前缀（目录语义以 / 结尾）
+
+# 需要保留的前缀（目录语义以 / 结尾）。在这些前缀下的所有对象都会跳过删除。
+KEEP_PREFIXES = ["datasets/", "raw/", "datasets_pcm/"]
 # ============================================
 
 def check_health(endpoint: str) -> None:
@@ -47,11 +54,16 @@ def make_client():
     )
 
 def should_keep(key: str) -> bool:
+    """
+    只要对象键以任何一个 KEEP_PREFIXES 元素为前缀（常见为以 / 结尾的“目录”），就保留。
+    兼容不以 / 结尾的精确键或其“子路径”。
+    """
     for p in KEEP_PREFIXES:
         if p.endswith("/"):
             if key.startswith(p):
                 return True
         else:
+            # 既保留完全等于 p 的对象，也保留 p/ 下的对象
             if key == p or key.startswith(p + "/"):
                 return True
     return False

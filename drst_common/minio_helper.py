@@ -89,7 +89,7 @@ def load_csv(key: str) -> pd.DataFrame:
     for c in list(df.columns):
         if str(c).startswith("Unnamed:"):
             df = df.drop(columns=[c])
-    df = df.replace({"<not counted>": np.nan})
+df = df.replace({"<not counted>": np.nan})
     return df
 
 # ---- 小工具：调试信息（可选）----
