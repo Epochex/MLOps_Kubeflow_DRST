@@ -124,7 +124,7 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 
 #### Raw Bundles Sources
 
-| scenarios (zip) | explanation |
+| scenarios | explanation |
 |---|---|
 | `random_rates` | Source of Stage 1: multiple `exp-*` experiment folders containing `perf stat` counters for 5 VNFs (`firewall.csv`, `nf_router.csv`, `ndpi_stats.csv`, `payload_scan.csv`, `bridge.csv`) plus `tx_stats.csv`, `rx_stats.csv`, and `latency.csv`. Merged by **perf** preprocessing → `datasets/stage1_random_rates.csv`. |
 | `resource_stimulus` | Source of Stage 2: various CPU stress patterns. Preprocessed by **perf** → merged, then filtered to **A-B-C_modified** → `datasets/stage2_resource_stimulus_global_A-B-C_modified.csv`. |
