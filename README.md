@@ -101,11 +101,11 @@ This design separates the data plane (Kafka) from the artifact plane (MinIO), re
 ---
 
 ## 2. Software Overview
-**This repository is organized as follows.** 
+**The repository in software vision is organized as follows.** 
 
 ### 2.1 `datasets/`
 
-> This directory stores **CSV files directly consumable by the system** (either preprocessed/merged results, or 12-row excerpts from each CSV for integration testing).  
+> This directory applies to the linear topology only; DAG-1 and DAG-2 are analogous. Which stores **CSV files directly consumable by the system** (either preprocessed/merged results, or 12-row excerpts from each CSV for integration testing).  
 > Raw bundles are stored in MinIO under `raw/`. Processed artifacts live in `datasets/` (online inference branch, **perf**) and `datasets_pcm/` (forecast branch, **pcm**).
 
 ---
