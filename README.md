@@ -12,10 +12,11 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 ![Infra Overview](<docs/Overall_overview.png>)
 ## 1.1 Overview of Infra
 This work builds upon a dual-system infrastructure:  
-> NFV system: models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention.  
+
+- **NFV system** — models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention. 
 
 
-> MLOps system: relies on Kubernetes and its core features to orchestrate model training, serving, and adaptive updates, ensuring scalability and automation in the learning pipeline.  
+- **MLOps system** — relies on Kubernetes and its core features to orchestrate model training, serving, and adaptive updates, ensuring scalability and automation in the learning pipeline.  
 
 
 By integrating NFV-based performance modeling with a Kubernetes-based MLOps stack, the overall framework jointly captures system-level contention and provides a non-intrusive, learning-driven performance analysis.
@@ -260,7 +261,7 @@ Installs Kafka bootstrap via Bitnami Helm. Ensures Helm and target namespace, ad
 #### 2.8 `docker/`
 Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the in-cluster bootstrap address, and runs an idempotent smoke test, aligning with the repo’s default `KAFKA_SERVERS`. Includes helpers like `Auto_clear_pods.yaml` for basic cleanup/ops.
 
-![Pipeline Overview](<docs/pipeline_runtime3.png>)
+![Pipeline Overview](<docs/drst_pipeline_runtime.png>)
 
 ---
 
