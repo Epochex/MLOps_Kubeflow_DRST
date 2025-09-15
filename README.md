@@ -12,8 +12,12 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 ![Infra Overview](<docs/Overall_overview.png>)
 ## 1.1 Overview of Infra
 This work builds upon a dual-system infrastructure:  
-NFV system: models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention.
-MLOps system: relies on Kubernetes and its core features to orchestrate model training, serving, and adaptive updates, ensuring scalability and automation in the learning pipeline.
+> NFV system: models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention.  
+
+
+> MLOps system: relies on Kubernetes and its core features to orchestrate model training, serving, and adaptive updates, ensuring scalability and automation in the learning pipeline.  
+
+
 By integrating NFV-based performance modeling with a Kubernetes-based MLOps stack, the overall framework jointly captures system-level contention and provides a non-intrusive, learning-driven performance analysis.
 ### 1.1.0 Streaming & Online Compute Plane  
 *Kafka/KRaft partitions, consumer groups, and Kubernetes parallelism*  
