@@ -71,7 +71,6 @@ COPY drst_inference/offline ./drst_inference/offline
 CMD ["bash","-lc","python -V && echo retrain image ready"]
 
 ############################ forecast ############################
-# 训练/解释镜像（单独做是为了减少与基础镜像的耦合；也可改为 FROM base）
 FROM python:3.10-slim AS forecast
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl && rm -rf /var/lib/apt/lists/*
@@ -82,7 +81,9 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 COPY drst_common/ drst_common/
 COPY drst_forecasting/ drst_forecasting/
+COPY drst_model_selection/ drst_model_selection/
 CMD ["python", "-m", "drst_forecasting.train_benchmark"]
+
 
 ############################ forecast_api ############################
 FROM python:3.10-slim AS forecast_api
@@ -95,4 +96,4 @@ WORKDIR /app
 COPY drst_common/ drst_common/
 COPY drst_forecasting/ drst_forecasting/
 EXPOSE 8000
-ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5pp
+ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5

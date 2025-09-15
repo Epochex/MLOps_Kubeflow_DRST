@@ -70,6 +70,7 @@ def perf_pre_op():
     )
 
 
+
 # ---------------------------- 其余组件（与你现有保持一致） ----------------------------
 @component(base_image=IMG_OFFLINE)
 def offline_training_op() -> None:
@@ -174,6 +175,33 @@ def forecast_xai_op(
     os.environ["FORECAST_LAYERS"]   = str(int(layers))
     subprocess.run(["python", "-m", "drst_forecasting.explain"], check=True)
 
+@component(base_image=IMG_FORECAST)
+def pcm_model_selection_op(
+    lookback: int = 10, horizon: int = 5, take_last: int = 4000, topk: int = 3
+) -> None:
+    import os, subprocess
+    os.environ["PYTHONPATH"] = "/app"
+    os.environ["MS_LOOKBACK"]   = str(int(lookback))
+    os.environ["MS_HORIZON"]    = str(int(horizon))
+    os.environ["MS_TAKE_LAST"]  = str(int(take_last))
+    os.environ["MS_TOPK"]       = str(int(topk))
+    subprocess.run(["python", "-m", "drst_model_selection.cli", "--task=pcm"], check=True)
+
+@component(base_image=IMG_FORECAST)
+def perf_model_selection_op(
+    perf_key: str = "datasets/perf/stage1_random_rates.csv",
+    topk: int = 4,
+    include_svr: int = 0,
+    include_dt: int = 0,
+) -> None:
+    import os, subprocess
+    os.environ["PYTHONPATH"] = "/app"
+    os.environ["PERF_DATA_KEY"]   = perf_key
+    os.environ["MS_TOPK"]         = str(int(topk))
+    os.environ["INCLUDE_SVR"]     = str(int(include_svr))   # 设为 1 可把 SVR 放进候选（慢）
+    os.environ["INCLUDE_DT"]      = str(int(include_dt))    # 设为 1 可把 DecisionTree 放进候选
+    subprocess.run(["python", "-m", "drst_model_selection.cli", "--task=perf"], check=True)
+
 # ---------------------------- Pipeline ----------------------------
 @pipeline(
     name="drift-stream-v2",
@@ -195,10 +223,29 @@ def drift_stream_v2_pipeline(
     perf = perf_pre_op().set_caching_options(False)
     perf.set_display_name("Perf-Pre-op")
 
-    # 1) offline 仅依赖 Perf（使用 datasets/combined.csv + perf 产物）
+    # 0.5) Model Selection（插在两条线的预处理之后）
+    perf_sel = perf_model_selection_op(
+        perf_key="datasets/perf/stage1_random_rates.csv",
+        topk=4,
+        include_svr=0,
+        include_dt=0,
+    ).set_caching_options(False)
+    perf_sel.after(perf)
+    perf_sel.set_display_name("Perf-ModelSelection-op")
+
+    pcm_sel = pcm_model_selection_op(
+        lookback=fc_lookback,
+        horizon=fc_horizon,
+        take_last=4000,   # 如需全量可改为 0
+        topk=3,
+    ).set_caching_options(False)
+    pcm_sel.after(pcm)
+    pcm_sel.set_display_name("PCM-ModelSelection-op")
+
+    # 1) offline 仅依赖 Perf 的 Model Selection（而不是直接依赖 Perf-Pre）
     offline = offline_training_op().set_caching_options(False)
     offline.set_display_name("Offline-Training-op")
-    offline.after(perf)
+    offline.after(perf_sel)
 
     # 2) producer / monitor / retrain / infer 都依赖 offline
     producer = producer_op(
@@ -225,11 +272,12 @@ def drift_stream_v2_pipeline(
     infer1.set_display_name("Infer-2-op")
     infer2.set_display_name("Infer-3-op")
 
-    # 3) forecasting：仅依赖 PCM 预处理
+    # 3) forecasting：依赖 PCM 的 Model Selection（而不是直接依赖 PCM-Pre）
     fc_grid = forecast_gridsearch_op(
         lookback=fc_lookback, horizon=fc_horizon
+        # 如需抽样加速，可再传 take_last=4000
     ).set_caching_options(False)
-    fc_grid.after(pcm)
+    fc_grid.after(pcm_sel)
     fc_grid.set_display_name("Forecast-GridSearch-op")
 
     fc_xai = forecast_xai_op(
@@ -242,6 +290,7 @@ def drift_stream_v2_pipeline(
     plot = plot_op().set_caching_options(False)
     plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_xai)
     plot.set_display_name("Plot-Report-op")
+
 
 
 if __name__ == "__main__":

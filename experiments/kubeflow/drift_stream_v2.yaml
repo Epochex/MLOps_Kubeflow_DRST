@@ -109,8 +109,48 @@ components:
           parameterType: NUMBER_INTEGER
   comp-offline-training-op:
     executorLabel: exec-offline-training-op
+  comp-pcm-model-selection-op:
+    executorLabel: exec-pcm-model-selection-op
+    inputDefinitions:
+      parameters:
+        horizon:
+          defaultValue: 5.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 10.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        take_last:
+          defaultValue: 4000.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        topk:
+          defaultValue: 3.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
   comp-pcm-pre-op:
     executorLabel: exec-pcm-pre-op
+  comp-perf-model-selection-op:
+    executorLabel: exec-perf-model-selection-op
+    inputDefinitions:
+      parameters:
+        include_dt:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        include_svr:
+          defaultValue: 0.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        perf_key:
+          defaultValue: datasets/perf/stage1_random_rates.csv
+          isOptional: true
+          parameterType: STRING
+        topk:
+          defaultValue: 4.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
   comp-perf-pre-op:
     executorLabel: exec-perf-pre-op
   comp-plot-op:
@@ -381,6 +421,41 @@ deploymentSpec:
           \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    subprocess.run([\"python\"\
           , \"-m\", \"drst_inference.offline.train_offline\"], check=True)\n\n"
         image: hirschazer/offline:latest
+    exec-pcm-model-selection-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - pcm_model_selection_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef pcm_model_selection_op(\n    lookback: int = 10, horizon: int\
+          \ = 5, take_last: int = 4000, topk: int = 3\n) -> None:\n    import os,\
+          \ subprocess\n    os.environ[\"PYTHONPATH\"] = \"/app\"\n    os.environ[\"\
+          MS_LOOKBACK\"]   = str(int(lookback))\n    os.environ[\"MS_HORIZON\"]  \
+          \  = str(int(horizon))\n    os.environ[\"MS_TAKE_LAST\"]  = str(int(take_last))\n\
+          \    os.environ[\"MS_TOPK\"]       = str(int(topk))\n    subprocess.run([\"\
+          python\", \"-m\", \"drst_model_selection.cli\", \"--task=pcm\"], check=True)\n\
+          \n"
+        image: hirschazer/forecast:latest
     exec-pcm-pre-op:
       container:
         args:
@@ -397,6 +472,43 @@ deploymentSpec:
         - bash
         - -lc
         image: hirschazer/offline:latest
+    exec-perf-model-selection-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - perf_model_selection_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef perf_model_selection_op(\n    perf_key: str = \"datasets/perf/stage1_random_rates.csv\"\
+          ,\n    topk: int = 4,\n    include_svr: int = 0,\n    include_dt: int =\
+          \ 0,\n) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"PERF_DATA_KEY\"]   = perf_key\n    os.environ[\"\
+          MS_TOPK\"]         = str(int(topk))\n    os.environ[\"INCLUDE_SVR\"]   \
+          \  = str(int(include_svr))   # \u8BBE\u4E3A 1 \u53EF\u628A SVR \u653E\u8FDB\
+          \u5019\u9009\uFF08\u6162\uFF09\n    os.environ[\"INCLUDE_DT\"]      = str(int(include_dt))\
+          \    # \u8BBE\u4E3A 1 \u53EF\u628A DecisionTree \u653E\u8FDB\u5019\u9009\
+          \n    subprocess.run([\"python\", \"-m\", \"drst_model_selection.cli\",\
+          \ \"--task=perf\"], check=True)\n\n"
+        image: hirschazer/forecast:latest
     exec-perf-pre-op:
       container:
         args:
@@ -528,7 +640,7 @@ root:
         componentRef:
           name: comp-forecast-gridsearch-op
         dependentTasks:
-        - pcm-pre-op
+        - pcm-model-selection-op
         inputs:
           parameters:
             horizon:
@@ -613,15 +725,57 @@ root:
         componentRef:
           name: comp-offline-training-op
         dependentTasks:
-        - perf-pre-op
+        - perf-model-selection-op
         taskInfo:
           name: Offline-Training-op
+      pcm-model-selection-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-pcm-model-selection-op
+        dependentTasks:
+        - pcm-pre-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+            take_last:
+              runtimeValue:
+                constant: 4000.0
+            topk:
+              runtimeValue:
+                constant: 3.0
+        taskInfo:
+          name: PCM-ModelSelection-op
       pcm-pre-op:
         cachingOptions: {}
         componentRef:
           name: comp-pcm-pre-op
         taskInfo:
           name: PCM-Pre-op
+      perf-model-selection-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-perf-model-selection-op
+        dependentTasks:
+        - perf-pre-op
+        inputs:
+          parameters:
+            include_dt:
+              runtimeValue:
+                constant: 0.0
+            include_svr:
+              runtimeValue:
+                constant: 0.0
+            perf_key:
+              runtimeValue:
+                constant: datasets/perf/stage1_random_rates.csv
+            topk:
+              runtimeValue:
+                constant: 4.0
+        taskInfo:
+          name: Perf-ModelSelection-op
       perf-pre-op:
         cachingOptions: {}
         componentRef:
