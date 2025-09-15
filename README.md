@@ -8,10 +8,13 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 ---
 
 ## 📘 Overview
-
+## 1.0 Overall Overview
+![Infra Overview](<docs/structure_infra.png>)
 ## 1.1 Overview of Infra
-This system relies on the Kubernetes architecture and its primary related features as follows:
-
+This work builds upon a dual-system infrastructure:  
+NFV system: models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention.
+MLOps system: relies on Kubernetes and its core features to orchestrate model training, serving, and adaptive updates, ensuring scalability and automation in the learning pipeline.
+By integrating NFV-based performance modeling with a Kubernetes-based MLOps stack, the overall framework jointly captures system-level contention and provides a non-intrusive, learning-driven performance analysis.
 ### 1.1.0 Streaming & Online Compute Plane  
 *Kafka/KRaft partitions, consumer groups, and Kubernetes parallelism*  
 
@@ -258,9 +261,10 @@ Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the
 ---
 
 ## 📊 Current limitations
-- Current implementation is validated on **Kubernetes + Kubeflow** with **Intel Xeon (Cascade Lake)** servers.  
-- Extensions to AMD platforms and other MLOps stacks are left as future work.  
-- Lightweight online retraining is currently implemented for regression models; deep RL retraining logic will be released in future updates.  
+- Future work will extend the study to 100 Gbps NICs, where core saturation, NUMA effects, and PCIe contention become critical.  
+- Evaluating DRST on heterogeneous hardware architectures (e.g., AMD EPYC, ARM, programmable NICs) will test its portability across different cache and memory hierarchies.  
+- Validating DRST on a wider set of real-world traffic traces and extending inference beyond throughput and latency to additional QoS metrics such as packet loss, jitter, and energy efficiency, which are essential for full SLA compliance.  
+- Furthermore, coupling DRST with VNF scaling and resource orchestration mechanisms is a natural step in transitioning from passive inference to proactive performance management.  
 
 ---
 

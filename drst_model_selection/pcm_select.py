@@ -1,141 +1,189 @@
-# drst_model_selection/pcm.py
+# drst_model_selection/pcm_select.py
 from __future__ import annotations
-import io, json, time
-from typing import Dict, Any, List
+import io, json
+from typing import List, Dict, Any
+
 import numpy as np
 import pandas as pd
 
-from sklearn.multioutput import MultiOutputRegressor
+from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+# XGBoost 可选
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
 except Exception:
     _HAS_XGB = False
 
+# 轻量 Transformer（单输出）
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from drst_common.config import RESULT_DIR, MODEL_DIR
 from drst_common.minio_helper import save_bytes
+from drst_common.config import MODEL_DIR
 from drst_forecasting.dataset import build_sliding_window
-from drst_forecasting.models import TorchWrapper, TransformerLight as TFMLight
+from .common import evaluate, bench_latency, save_rank_csv
 
-def _ensure_2d(y):
-    y = np.asarray(y, dtype=float)
-    return y if y.ndim == 2 else y.reshape(-1, 1)
-
-def _rel_acc(y_true, y_pred, thr=0.05):
-    yt = np.asarray(y_true, dtype=float); yp = np.asarray(y_pred, dtype=float)
-    denom = np.maximum(np.abs(yt), 1e-8)
-    return float(np.mean(np.abs(yp - yt) / denom <= float(thr)))
-
-def _horizon_acc(y_true, y_pred, thr=0.05) -> List[float]:
-    yt = _ensure_2d(y_true); yp = _ensure_2d(y_pred)
-    return [ _rel_acc(yt[:,i], yp[:,i], thr) for i in range(yt.shape[1]) ]
-
-def _evaluate(y_true, y_pred, lat_ms: float) -> Dict[str, Any]:
-    yt = _ensure_2d(y_true); yp = _ensure_2d(y_pred)
-    mae = float(np.mean(np.abs(yp - yt)))
-    # 简化 r2：对第一步
-    from sklearn.metrics import r2_score
-    r2 = float(r2_score(yt[:,0], yp[:,0]))
-    return {"mae":mae, "r2":r2, "acc@5%":_rel_acc(yt, yp), "acc@t+k":_horizon_acc(yt, yp), "latency_ms":float(lat_ms)}
-
-def _bench_latency(fn, X):
-    t0 = time.perf_counter(); _ = fn(X); dt = time.perf_counter() - t0
-    return float(dt / len(X) * 1000.0)
-
-# ---- 轻量 TCN（CPU 友好）----
-class TCNBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, dil=1, dropout=0.1):
+# ---- 简易单输出 Transformer ----
+class TransformerLight1D(nn.Module):
+    def __init__(self, in_feat: int, d_model: int = 128, heads: int = 4, layers: int = 2, dropout: float = 0.1):
         super().__init__()
-        pad = (k-1) * dil
-        self.conv1 = nn.Conv1d(in_ch, out_ch, k, padding=pad, dilation=dil)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=pad, dilation=dil)
-        self.act = nn.ReLU()
-        self.drop = nn.Dropout(dropout)
-        self.res = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    def forward(self, x):     # (B,C,T)
-        y = self.conv1(x); y = self.act(y); y = self.drop(y)
-        y = self.conv2(y); y = self.act(y); y = self.drop(y)
-        return y + self.res(x)
+        self.proj = nn.Linear(in_feat, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=heads, batch_first=True, dropout=dropout, dim_feedforward=4 * d_model, activation="gelu"
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.head = nn.Linear(d_model, 1)
 
-class TCNLight(nn.Module):
-    def __init__(self, in_feat:int, horizon:int, ch:int=64, layers:int=3, dropout:float=0.1):
-        super().__init__()
-        blocks = []
-        C = in_feat
-        for i in range(layers):
-            blocks.append(TCNBlock(C, ch, k=3, dil=2**i, dropout=dropout))
-            C = ch
-        self.net = nn.Sequential(*blocks)
-        self.head = nn.Linear(ch, horizon)
-    def forward(self, x):                 # x: (B,L,F)
-        z = x.transpose(1,2)              # -> (B,F,L)
-        z = self.net(z)                   # -> (B,C,L)
-        last = z[:, :, -1]                # -> (B,C)
-        return self.head(last)            # -> (B,H)
+    def forward(self, x):  # x: (B, L, F)
+        z = self.proj(x)
+        z = self.encoder(z)
+        last = z[:, -1, :]
+        return self.head(last).squeeze(-1)
 
-def run_pcm_selection(lookback:int=10, horizon:int=5, take_last:int=4000, topk:int=3):
-    # 1) 滑窗
-    X, Y, feats = build_sliding_window(lookback, horizon, take_last_n=(None if int(take_last)<=0 else int(take_last)))
-    N = len(X); v = max(1, int(0.3*N))
+def _fit_torch_singleout(net: nn.Module, X: np.ndarray, y: np.ndarray, batch: int = 64, lr: float = 1e-3, epochs: int = 80, patience: int = 10):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    net = net.to(device)
+    ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).float().view(-1))
+    dl = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=False)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    lossf = nn.SmoothL1Loss()
+
+    best = None
+    best_val = float("inf")
+    bad = 0
+    # 简单留出末尾 10% 作为 val
+    n = len(X); v = max(1, int(0.1 * n))
+    Xtr, ytr = X[:-v], y[:-v]
+    Xva, yva = X[-v:], y[-v:]
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        for xb, yb in DataLoader(TensorDataset(torch.from_numpy(Xtr).float(), torch.from_numpy(ytr).float().view(-1)), batch_size=batch, shuffle=True):
+            xb = xb.to(device); yb = yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            pred = net(xb)
+            loss = lossf(pred, yb)
+            loss.backward(); opt.step()
+        net.eval()
+        with torch.no_grad():
+            pv = net(torch.from_numpy(Xva).float().to(device)).cpu().numpy()
+        val = float(np.mean(np.abs(pv - yva)))
+        if val + 1e-9 < best_val:
+            best_val = val; bad = 0
+            buf = io.BytesIO(); torch.save(net.to("cpu"), buf); net.to(device)
+            best = buf.getvalue()
+        else:
+            bad += 1
+            if bad > patience:
+                break
+    if best is not None:
+        net = torch.load(io.BytesIO(best), map_location=device)
+    net.eval()
+    return net
+
+def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 4000, topk: int = 3) -> None:
+    """
+    目标：单输出（预测 t+H 的值），和你的数据构造保持一致。
+    候选：Ridge / RandomForest / GradientBoosting / XGBoost / TransformerLight(单输出)
+    """
+    print(f"[pcm_select] lookback={lookback} horizon(H)={horizon} take_last={take_last}", flush=True)
+
+    # X: (N, L, F), y: (N,) —— build_sliding_window 只返回单值 y_{t+H}
+    X, y, feats = build_sliding_window(lookback, horizon, take_last_n=take_last)
+    N = len(X); assert N > 32, "not enough samples"
+    v = max(1, int(0.3 * N))
     Xtr, Xva = X[:-v], X[-v:]
-    Ytr, Yva = Y[:-v], Y[-v:]
+    ytr, yva = y[:-v], y[-v:]
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
 
-    # ---- 树模型（直接多步）：flatten + MultiOutput ----
-    Xtr_f, Xva_f = Xtr.reshape(len(Xtr), -1), Xva.reshape(len(Xva), -1)
+    # ---------- 传统模型（单输出） ----------
+    # Ridge
+    for a in [1e-3, 1e-2, 1e-1, 1.0, 10.0]:
+        mdl = Pipeline([("sc", StandardScaler(with_mean=False)), ("rg", Ridge(alpha=a))])
+        Xtr_f = Xtr.reshape(len(Xtr), -1); Xva_f = Xva.reshape(len(Xva), -1)
+        mdl.fit(Xtr_f, ytr)
+        yp = mdl.predict(Xva_f)
+        lat = bench_latency(lambda Z: mdl.predict(Z.reshape(len(Z), -1)), Xva, repeat=1)
+        ev = evaluate(yva, yp, lat); ev.update({"model": "Ridge", "alpha": a})
+        rows.append(ev)
 
-    rf = MultiOutputRegressor(RandomForestRegressor(n_estimators=300, max_depth=8, n_jobs=-1, random_state=0))
-    rf.fit(Xtr_f, Ytr)
-    lat = _bench_latency(lambda Z: rf.predict(Z.reshape(len(Z), -1)), Xva)
-    rows.append({"model":"RandomForest", **_evaluate(Yva, rf.predict(Xva_f), lat)})
+    # RandomForest
+    for n in [200, 400]:
+        rf = RandomForestRegressor(n_estimators=n, max_depth=8, min_samples_leaf=5, n_jobs=-1, random_state=0)
+        Xtr_f = Xtr.reshape(len(Xtr), -1); Xva_f = Xva.reshape(len(Xva), -1)
+        rf.fit(Xtr_f, ytr)
+        yp = rf.predict(Xva_f)
+        lat = bench_latency(lambda Z: rf.predict(Z.reshape(len(Z), -1)), Xva, repeat=1)
+        ev = evaluate(yva, yp, lat); ev.update({"model": "RandomForest", "n_estimators": n})
+        rows.append(ev)
 
-    gbr = MultiOutputRegressor(GradientBoostingRegressor(learning_rate=0.1, max_depth=3, n_estimators=200, random_state=0))
-    gbr.fit(Xtr_f, Ytr)
-    lat = _bench_latency(lambda Z: gbr.predict(Z.reshape(len(Z), -1)), Xva)
-    rows.append({"model":"GradientBoosting", **_evaluate(Yva, gbr.predict(Xva_f), lat)})
+    # GradientBoosting
+    for n in [200, 400]:
+        gb = GradientBoostingRegressor(n_estimators=n, learning_rate=0.05, max_depth=3, random_state=0)
+        Xtr_f = Xtr.reshape(len(Xtr), -1); Xva_f = Xva.reshape(len(Xva), -1)
+        gb.fit(Xtr_f, ytr)
+        yp = gb.predict(Xva_f)
+        lat = bench_latency(lambda Z: gb.predict(Z.reshape(len(Z), -1)), Xva, repeat=1)
+        ev = evaluate(yva, yp, lat); ev.update({"model": "GradientBoosting", "n_estimators": n})
+        rows.append(ev)
 
+    # XGBoost（可选）
     if _HAS_XGB:
-        xgb = MultiOutputRegressor(XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.1,
-                                                subsample=0.8, colsample_bytree=0.8, tree_method="hist",
-                                                reg_lambda=1.0, random_state=0))
-        xgb.fit(Xtr_f, Ytr)
-        lat = _bench_latency(lambda Z: xgb.predict(Z.reshape(len(Z), -1)), Xva)
-        rows.append({"model":"XGBoost", **_evaluate(Yva, xgb.predict(Xva_f), lat)})
+        for n in [200, 400]:
+            xgb = XGBRegressor(
+                n_estimators=n, max_depth=6, learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
+                reg_lambda=1.0, reg_alpha=0.0, objective="reg:squarederror", tree_method="hist", n_jobs=0
+            )
+            Xtr_f = Xtr.reshape(len(Xtr), -1); Xva_f = Xva.reshape(len(Xva), -1)
+            xgb.fit(Xtr_f, ytr)
+            yp = xgb.predict(Xva_f)
+            lat = bench_latency(lambda Z: xgb.predict(Z.reshape(len(Z), -1)), Xva, repeat=1)
+            ev = evaluate(yva, yp, lat); ev.update({"model": "XGBoost", "n_estimators": n})
+            rows.append(ev)
 
-    # ---- Transformer（轻量）----
-    tfm = TorchWrapper(
-        net=TFMLight(in_feat=X.shape[-1], d_model=128, heads=4, dropout=0.1, horizon=horizon),
-        lookback=lookback, horizon=horizon, features=feats,
-        params={"d_model":128,"heads":4,"dropout":0.1,"epochs":80},
-        lr=1e-3, batch=64, max_epoch=80, patience=10
-    ).fit(Xtr, Ytr)
-    lat = _bench_latency(lambda Z: tfm.predict(Z), Xva)
-    rows.append({"model":"TransformerLight", **_evaluate(Yva, tfm.predict(Xva), lat)})
+    # ---------- 轻量 Transformer（单输出） ----------
+    try:
+        net = TransformerLight1D(in_feat=X.shape[-1], d_model=128, heads=4, layers=2, dropout=0.1)
+        net = _fit_torch_singleout(net, Xtr, ytr, batch=64, lr=1e-3, epochs=80, patience=10)
+        # 预测 + 延迟
+        def _torch_pred(Z: np.ndarray) -> np.ndarray:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            net.eval()
+            out = []
+            with torch.no_grad():
+                for xb in DataLoader(torch.from_numpy(Z).float(), batch_size=128):
+                    out.append(net(xb.to(device)).cpu().numpy())
+            return np.concatenate(out, axis=0)
+        yp = _torch_pred(Xva)
+        lat = bench_latency(_torch_pred, Xva, repeat=1)
+        ev = evaluate(yva, yp, lat); ev.update({"model": "TransformerLight1D"})
+        rows.append(ev)
+    except Exception as e:
+        print(f"[pcm_select] transformer skipped: {e}", flush=True)
 
-    # ---- TCN（CPU 友好）----
-    tcn = TorchWrapper(
-        net=TCNLight(in_feat=X.shape[-1], horizon=horizon, ch=64, layers=3, dropout=0.1),
-        lookback=lookback, horizon=horizon, features=feats,
-        params={"channels":64,"layers":3,"dropout":0.1,"epochs":80},
-        lr=1e-3, batch=64, max_epoch=80, patience=10
-    ).fit(Xtr, Ytr)
-    lat = _bench_latency(lambda Z: tcn.predict(Z), Xva)
-    rows.append({"model":"TCNLight", **_evaluate(Yva, tcn.predict(Xva), lat)})
+    # ---------- 排序/保存 ----------
+    df = pd.DataFrame(rows).sort_values(["mae", "latency_ms"]).reset_index(drop=True)
+    csv_key = save_rank_csv("pcm_model_selection.csv", df)
+    print(f"[pcm_select] wrote rank -> s3://.../{csv_key}", flush=True)
 
-    # 2) 输出
-    df = pd.DataFrame(rows).sort_values(["mae","latency_ms"], ascending=[True, True])
-    save_bytes(f"{RESULT_DIR}/forecasting/pcm_model_rank.csv", df.to_csv(index=False).encode("utf-8"), "text/csv")
-
-    top = df.head(max(1, int(topk))).to_dict(orient="records")
-    save_bytes(f"{MODEL_DIR}/forecast/pcm_selection.json",
-               json.dumps({"lookback":lookback,"horizon":horizon,"top":top}, ensure_ascii=False, indent=2).encode("utf-8"),
+    # 只写一个轻量“建议”清单，供后续 GridSearch 参考（不覆盖 selected.json）
+    best = df.iloc[0].to_dict()
+    suggestion = {
+        "task": "pcm",
+        "lookback": lookback,
+        "horizon": horizon,
+        "features": feats,
+        "recommend_topk": json.loads(df.head(min(len(df), max(1, int(topk)))).to_json(orient="records")),
+        "winner": best.get("model"),
+        "note": "Single-output selection (predict y_{t+H}); grid-search can down-select using 'recommend_topk'."
+    }
+    save_bytes(f"{MODEL_DIR}/forecasting/pcm_select_suggestion.json",
+               json.dumps(suggestion, ensure_ascii=False, indent=2).encode("utf-8"),
                "application/json")
-    print("[pcm.model_selection] wrote:",
-          f"s3://.../{RESULT_DIR}/forecasting/pcm_model_rank.csv and s3://.../{MODEL_DIR}/forecast/pcm_selection.json",
-          flush=True)
+    print(f"[pcm_select] winner={best.get('model')} mae={best.get('mae'):.4f}", flush=True)
