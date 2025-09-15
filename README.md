@@ -9,7 +9,7 @@ It provides open-source infrastructure to study and reproduce the experiments pr
 
 ## 📘 Overview
 ## 1.0 Overall Overview
-![Infra Overview](<docs/structure_infra.png>)
+![Infra Overview](<docs/Overall_overview.png>)
 ## 1.1 Overview of Infra
 This work builds upon a dual-system infrastructure:  
 NFV system: models the software data plane and service function chains (SFCs), enabling the analysis of network-level performance characteristics such as throughput, latency, and contention.
