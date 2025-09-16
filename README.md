@@ -58,11 +58,11 @@ This framework performs unified **CPU and memory measurement** for the five stag
 - **CPU Semantics**  
   Resource measurement is based on an embedded lightweight probe within each Pod, which spawns a dedicated background thread to periodically sample process resource usage from the Linux `/proc` filesystem. For CPU, the probe recursively traverses the target process and all of its child processes, accumulating their **user time** and **system time**, then computing the delta against the previous sample to obtain the CPU time consumed in the sampling interval. This delta is divided by the interval length and normalized by the number of host logical cores, yielding the **equivalent cores (vcpu)**:  
 
-  $$
-  \mathrm{cpu\_cores}(t) \;=\; \frac{\Delta T_{\mathrm{proc}}(t)}{\Delta t \cdot N_{\mathrm{host}}}
-  $$
+$$
+\mathrm{cpu\_cores}(t) \;=\; \frac{\Delta T_{\mathrm{proc}}(t)}{\Delta t \cdot N_{\mathrm{host}}}
+$$
 
-  where $\Delta T_{\mathrm{proc}}(t)$ denotes the cumulative CPU time (in seconds) of the process and its children over $(t-\Delta t, t]$, $\Delta t$ is the sampling interval (in seconds), and $N_{\mathrm{host}}$ is the number of logical cores of the host. This definition avoids bias introduced by sampling frequency and naturally supports multi-core concurrency, so `cpu_percent` can exceed 100%, with the theoretical upper bound $100 \times N_{\mathrm{host}}\%$. Dividing `cpu_percent` by 100 yields the **equivalent cores**; for example, `235%` corresponds to $2.35$ cores. For cross-host comparability, the sampler also records the host’s $N_{\mathrm{host}}$.  
+-  where $\Delta T_{\mathrm{proc}}(t)$ denotes the cumulative CPU time (in seconds) of the process and its children over $(t-\Delta t, t]$, $\Delta t$ is the sampling interval (in seconds), and $N_{\mathrm{host}}$ is the number of logical cores of the host. This definition avoids bias introduced by sampling frequency and naturally supports multi-core concurrency, so `cpu_percent` can exceed 100%, with the theoretical upper bound $100 \times N_{\mathrm{host}}\%$. Dividing `cpu_percent` by 100 yields the **equivalent cores**; for example, `235%` corresponds to $2.35$ cores. For cross-host comparability, the sampler also records the host’s $N_{\mathrm{host}}$.  
 
 - **Memory Semantics**  
   Memory measurement is based on aggregation of RSS (Resident Set Size). The probe recursively traverses the target process and its child processes, reading the number of resident physical pages from `/proc/[pid]/statm` and summing them, thereby isolating interference from other components and services, and capturing only the true physical memory consumed by the current component:  
