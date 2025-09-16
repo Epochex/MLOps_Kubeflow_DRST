@@ -91,7 +91,8 @@ All components write artifacts to a local PersistentVolume mounted at `/mnt/pvc`
 ### 1.2.3 Model & Metrics Distribution (immutable + pointer)  
 Each release publishes immutable blobs `models/model_*.pt` and `models/metrics_*.json`. The **only mutable handle** is `models/latest.txt` with **two lines**: the object key of the active model and the object key of its metrics. Inference consumers **poll the pointer**, fetch on change, verify integrity (e.g., md5/size), and perform an **atomic in-process hot swap** only if the validated candidate beats the baseline by the configured margin.
 
-> [!NOTE] Pointer semantics
+> [!NOTE]
+> Pointer semantics
 >
 > The pointer file decouples producers (retrainers) from consumers (infer). It enables reproducible rollbacks by resetting `latest.txt` to a prior version, minimizes S3 list operations, and avoids partially-visible updates because the pointer write is a single small overwrite.
 
