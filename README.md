@@ -278,7 +278,35 @@ A background guard thread periodically reads the release pointer. A model swap i
 Termination is deterministic: the consumers exit cleanly once **all per-partition sentinels** have arrived or an extended idle timeout is reached. On exit, each consumer writes a compact time-series trace (timestamps, ground truth, baseline prediction, adaptive prediction) for downstream aggregation and plotting. This stitches the offline bridge and the online phases onto a single timeline, enabling full replay of the experiment and phase-level diagnosis.
 
 ### 2.4 `drst_forecasting/`
-Placeholder and baselines for short-term trend forecasting: `baseline_mean.py` provides a moving-average baseline to quickly validate whether latency/throughput evolves predictably over time; `lstm_placeholder.py` sketches a minimal LSTM regressor for future time-series modeling of online error or system state. This package is optional in the main pipeline and can be wired in as an auxiliary predictor in the inference stage or as a forward-error estimator in the monitor.
+Short-horizon performance forecasting that runs **in parallel** to online inference (no hard dependency). It provides train/evaluate scripts, a pluggable model registry, optional post-hoc explanations, and a lightweight online API.
+
+- **Data & IO**
+  - `dataset.py` loads sequenced CSVs from `datasets_pcm/` (PCM branch), applies look-back/stride slicing, and yields `(X, y)` tensors.
+  - Artifacts are written PVC-first under `/mnt/pvc` and then uploaded to MinIO: `results/forecast_*.{csv,png,md}` and `models/forecast_*.{pkl,pt,json}` (family-specific).
+
+- **Training & Registry**
+  - `train_benchmark.py` orchestrates training across registered families in `models.py` / `registry.py` (baselines + learned models).  
+  - Metrics are logged via `metrics.py`; explanations (if enabled) are produced by `explain.py` (e.g., SHAP summaries) and stored next to the run.
+
+> [!TIP]
+> Use `python -m drst_forecasting.train_benchmark --help` to list supported families, horizons, and logging switches. The training script respects the repository-wide error definitions (relative error and `accuracy@τ`) for comparability.
+
+- **Serving**
+  - `api_server.py` / `serve_forecaster.py` expose a FastAPI service; the container image is built as `drst/forecast-api` and surfaced via a Kubernetes `NodePort` (**30081** by default).
+  - Environment variables (see Dockerfile): `FORECAST_LOOKBACK`, `FORECAST_HORIZON`.
+  - Endpoints: `/` (health), `/docs` (OpenAPI), `/predict` (batch JSON). Example:
+    ```bash
+    curl -X POST "http://<node-ip>:30081/predict" \
+      -H "Content-Type: application/json" \
+      -d '{"inputs":[{"timestamp":"2024-01-01T00:00:00Z","features":{"x1":0.1,"x2":0.2}}]}'
+    ```
+
+> [!NOTE]
+> Forecast runs publish plots and a concise `forecast_summary.md` under `results/`, including horizon-wise error tables, quantiles, and (optionally) explanation thumbnails. These artifacts are consumed by the final report stage in the Kubeflow pipeline.
+
+> [!IMPORTANT]
+> The forecasting branch consumes PCM counters under stable schemas (`datasets_pcm/*`). It is isolated from the online inference plane; failures here do **not** impact the `producer|infer|monitor|retrain` loop.
+
 
 ### 2.5 `drst_drift/`
 #### 2.5.1 Monitor — continuous sensing & safe triggering
@@ -331,6 +359,21 @@ Installs Kafka bootstrap via Bitnami Helm. Ensures Helm and target namespace, ad
 Deploys Kafka via the official Bitnami chart in PLAINTEXT/KRaft mode, prints the in-cluster bootstrap address, and runs an idempotent smoke test, aligning with the repo’s default `KAFKA_SERVERS`. Includes helpers like `Auto_clear_pods.yaml` for basic cleanup/ops.
 
 ![Pipeline Overview](<docs/drst_pipeline_runtime.png>)
+
+
+### 2.9 `drst_model_selection/`
+Automates **feature/model/hyperparameter selection** for both **perf** (inference) and **pcm** (forecast) branches. It produces a compact **selection manifest** that downstream stages (offline training, retrain, serving) consume to stay consistent.
+
+- **Scope & Structure**
+  - `perf_select.py` focuses on the **perf** branch (e.g., 63-column VNF+traffic schema), yielding selected feature sets and model knobs aligned with `drst_inference/offline/{features.py,model.py}`.
+  - `pcm_select.py` targets the **pcm** branch (sequenced PCM counters), emitting look-back/stride hints and model family candidates compatible with `drst_forecasting`.
+
+- **Procedure (high level)**
+  - Loads the target dataset, performs leakage-aware splits (chronological by default), evaluates candidate configurations from a centralized grid, and scores them using the repo’s standard metrics (relative error `e`, `accuracy@τ`, error quantiles).
+  - Optionally bootstraps to estimate stability; ties are broken by simpler models / smaller feature sets.
+
+> [!WARNING]
+> Keep train/validation splits **chronological** for time-dependent data to avoid look-ahead bias. When bootstrapping, resample **windows**, not individual rows.
 
 ---
 
