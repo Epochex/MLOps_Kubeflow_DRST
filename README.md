@@ -45,6 +45,36 @@ An ExitHandler guarantees that reporting runs even if any upstream stage fails, 
 ### 1.1.5 Observability and Decoupling  
 All metrics are written locally under `/mnt/pvc` and asynchronously uploaded to object storage. This provides durable audit trails and consolidated observability across pods. By decoupling orchestration (pipeline scheduling), the data plane (datasets and streams), and the model plane (training and inference artifacts), the system ensures modularity, robustness under failure conditions, and clean separation of responsibilities.
 
+### 1.1.6 Resource Measurement & Reporting（CPU/Memory）  
+*per-component sampler → local CSV → S3 upload → run-level summary*  
+This framework performs unified **CPU and memory measurement** for the five stages **offline / producer / infer / retrain / monitor**, with sampling and aggregation following the specifications below:  
+
+- **Sampler and Placement**  
+  Each component embeds a lightweight sampler (`drst_common/resource_probe.py`), which launches an independent background thread sampling at a fixed period of 500 ms for stable process-level metrics, and an additional 100 ms fixed period for fine-grained peak process-level metrics. Results are locally written to `*_resources.csv`. Before component exit, all buffers are flushed; the CSV is then asynchronously uploaded to MinIO at the end of the pipeline (see §1.2).  
+
+- **Time and Naming**  
+  - Timestamps record both **monotonic relative time** (`t_rel_ms`) and **UTC ISO8601** (`time_iso`) to enable cross-node alignment and human auditing.  
+
+- **CPU Semantics**  
+  Resource measurement is based on an embedded lightweight probe within each Pod, which spawns a dedicated background thread to periodically sample process resource usage from the Linux `/proc` filesystem. For CPU, the probe recursively traverses the target process and all of its child processes, accumulating their **user time** and **system time**, then computing the delta against the previous sample to obtain the CPU time consumed in the sampling interval. This delta is divided by the interval length and normalized by the number of host logical cores, yielding the **equivalent cores (vcpu)**:  
+
+  $$
+  \mathrm{cpu\_cores}(t) \;=\; \frac{\Delta T_{\mathrm{proc}}(t)}{\Delta t \cdot N_{\mathrm{host}}}
+  $$  
+
+  where $\Delta T_{\mathrm{proc}}(t)$ denotes the cumulative CPU time (in seconds) of the process and its children over $(t-\Delta t, t]$, $\Delta t$ is the sampling interval (in seconds), and $N_{\mathrm{host}}$ is the number of logical cores of the host. This definition avoids bias introduced by sampling frequency and naturally supports multi-core concurrency, so `cpu_percent` can exceed 100%, with the theoretical upper bound $100 \times N_{\mathrm{host}}\%$. Dividing `cpu_percent` by 100 yields the **equivalent cores**; for example, `235%` corresponds to $2.35$ cores. For cross-host comparability, the sampler also records the host’s $N_{\mathrm{host}}$.  
+
+- **Memory Semantics**  
+  Memory measurement is based on aggregation of RSS (Resident Set Size). The probe recursively traverses the target process and its child processes, reading the number of resident physical pages from `/proc/[pid]/statm` and summing them, thereby isolating interference from other components and services, and capturing only the true physical memory consumed by the current component:  
+
+  $$
+  \mathrm{rss\_bytes}(t) \;=\; \sum_{p \in \{\mathrm{proc+children}\}} \mathrm{RSS}_p(t)
+  $$  
+
+  This is then converted into MiB: $\mathrm{rss\_mib} = \mathrm{rss\_bytes}/2^{20}$. The aggregated RSS is also expressed as a percentage of host physical memory (`mem_percent`), and the host’s total memory size $M_{\mathrm{host}}$ (GiB) is recorded for consistent normalization. This method ensures that the measurement faithfully reflects the component’s actual memory footprint, unaffected by unrelated processes or threads.
+
+
+
 
 
 ## 1.2. Data & Model Artifact Plane    

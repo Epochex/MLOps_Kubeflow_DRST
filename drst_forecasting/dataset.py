@@ -58,16 +58,21 @@ def _load_series() -> pd.DataFrame:
     df = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
     return df
 
-def build_sliding_window(lookback: int, horizon: int, take_last_n: int | None = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+def build_sliding_window(
+    lookback: int,
+    horizon: int,
+    take_last_n: int | None = None,
+    multi_output: bool = False
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     用 PCM 合并表构造滑窗数据：
       X shape: (N, lookback, F)
-      Y shape: (N, )
+      Y shape: 单输出时 (N,)，多输出时 (N, horizon)
     """
     feats = _load_selected_features()
     df = _load_series()
 
-    # 丢弃缺失的特征行；对剩余缺失值用 0 补（时序建模常见做法，你也可以改成前向填充）
+    # 丢弃缺失的特征行；对剩余缺失值用 0 补
     for c in feats:
         if c not in df.columns:
             df[c] = 0.0
@@ -86,13 +91,21 @@ def build_sliding_window(lookback: int, horizon: int, take_last_n: int | None = 
     end = L - lookback - horizon + 1
     for i in range(max(0, end)):
         X_list.append(values[i:i+lookback, :])
-        Y_list.append(target[i+lookback+horizon-1])
+        if multi_output:
+            # 预测未来 horizon 个点
+            Y_list.append(target[i+lookback : i+lookback+horizon])
+        else:
+            # 仅预测 y_{t+H}
+            Y_list.append(target[i+lookback+horizon-1])
 
     if not X_list:
         raise RuntimeError(f"not enough rows to build sliding windows: rows={L}, lookback={lookback}, horizon={horizon}")
 
     X = np.stack(X_list, axis=0)
-    Y = np.asarray(Y_list, dtype=float)
+    if multi_output:
+        Y = np.stack(Y_list, axis=0).astype(float)  # (N, H)
+    else:
+        Y = np.asarray(Y_list, dtype=float)         # (N,)
 
     if take_last_n and take_last_n > 0:
         X = X[-take_last_n:, :, :]

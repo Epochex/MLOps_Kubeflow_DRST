@@ -17,27 +17,58 @@ LOOKBACK  = int(os.getenv("FORECAST_LOOKBACK", "10"))
 HORIZON   = int(os.getenv("FORECAST_HORIZON",  "5"))
 EPOCHS    = int(os.getenv("FORECAST_EPOCHS",   "200"))
 PATIENCE  = int(os.getenv("FORECAST_PATIENCE", "10"))
-# 只取末尾 N 条样本窗口来加速；<=0 表示用全量（建议在管道里给个 3000~8000）
+# 只取末尾 N 条样本窗口来加速；<=0 表示用全量
 TAKE_LAST = int(os.getenv("FORECAST_TAKE_LAST", "0"))
+
+def _canon(name: str) -> str | None:
+    n = str(name).strip().lower()
+    if n in ("ridge",): return "ridge"
+    if n in ("xgboost","xgb","xgbregressor"): return "xgboost"
+    if n in ("transformerlight","transformer","transformerlight1d"): return "transformerlight"
+    # RF/GBDT 在本文件没有实现，映射到 xgboost
+    if n in ("randomforest","rf","gradientboosting","gbrt","gbdt"): return "xgboost"
+    return None
 
 def _load_candidates_for_pcm() -> List[str] | None:
     """
-    从 model_selection 写入的候选清单里裁剪模型集合：
-      s3://{BUCKET}/{MODEL_DIR}/forecast/model_candidates.json
-    格式:
-      {"task":"pcm", "topk":3, "candidates":["transformerlight","xgboost", ...]}
+    优先读： models/forecast/model_candidates.json
+    兼容旧： models/forecasting/pcm_select_suggestion.json
+    返回规范化模型名（子集于：ridge/xgboost/transformerlight）
     """
-    key = f"{MODEL_DIR}/forecast/model_candidates.json"
+    # 1) 新的裁剪文件
+    key1 = f"{MODEL_DIR}/forecast/model_candidates.json"
     try:
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        obj = s3.get_object(Bucket=BUCKET, Key=key1)
         data = json.loads(obj["Body"].read().decode("utf-8"))
         if str(data.get("task")) == "pcm" and data.get("candidates"):
-            # 去重保序
-            uniq = list(dict.fromkeys([str(x).lower() for x in data["candidates"]]))
-            print(f"[forecast.train] candidates from selection: {uniq}", flush=True)
-            return uniq
+            cand = []
+            for x in data["candidates"]:
+                c = _canon(x)
+                if c and c not in cand:
+                    cand.append(c)
+            if cand:
+                print(f"[forecast.train] candidates from selection: {cand}", flush=True)
+                return cand
     except Exception:
         pass
+
+    # 2) 兼容旧建议文件
+    key2 = f"{MODEL_DIR}/forecasting/pcm_select_suggestion.json"
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key2)
+        data = json.loads(obj["Body"].read().decode("utf-8"))
+        items = data.get("recommend_topk") or []
+        cand = []
+        for rec in items:
+            c = _canon(rec.get("model",""))
+            if c and c not in cand:
+                cand.append(c)
+        if cand:
+            print(f"[forecast.train] candidates from suggestion: {cand}", flush=True)
+            return cand
+    except Exception:
+        pass
+
     return None
 
 def _grid() -> Dict[str, List[Dict]]:
@@ -102,7 +133,6 @@ def _grid() -> Dict[str, List[Dict]]:
         keep = set(cand)
         full = {k: v for k, v in full.items() if k in keep}
         if not full:
-            # 容错：候选里若全是没实现的名字，退回一个最稳健集合
             full = {"transformerlight": full.get("transformerlight", [{"d_model":128,"heads":4,"dropout":0.1,"lr":1e-3,"batch":64,"epochs":EPOCHS,"patience":PATIENCE}])}
         print(f"[forecast.train] grid pruned by selection -> {list(full.keys())}", flush=True)
     return full
@@ -121,7 +151,8 @@ def main():
     try:
         X, Y, feats = build_sliding_window(
             LOOKBACK, HORIZON,
-            take_last_n=(None if TAKE_LAST <= 0 else TAKE_LAST)
+            take_last_n=(None if TAKE_LAST <= 0 else TAKE_LAST),
+            multi_output=True   # <<< 关键：与深度模型输出对齐
         )
     except Exception as e:
         msg = str(e)
