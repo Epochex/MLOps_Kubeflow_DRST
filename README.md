@@ -76,24 +76,62 @@ This framework performs unified **CPU and memory measurement** for the five stag
 
 
 
-
 ## 1.2. Data & Model Artifact Plane    
-*MinIO/S3 ↔ PVC/StorageClass ↔ pointer file*  
+*MinIO/S3 ↔ PVC/StorageClass ↔ immutable objects + mutable pointer*  
 
-### 1.2.1 MinIO as Source of Truth  
-MinIO serves as the single source of truth for datasets, evaluation outputs, and online results. Pods access it internally via `*.svc.cluster.local:9000`, while the Console/API can also be exposed through the Istio gateway (Console on 9001).
+### 1.2.1 MinIO as Source of Truth & Endpoints  
+MinIO is the single source of truth for datasets, intermediate results, and final reports. In-cluster access uses `minio-service.kubeflow.svc.cluster.local:9000` (S3 API). For browser/API access, the deployment exposes **NodePort** via Istio with VirtualServices like `minio.<node-ip>.nip.io:30080` (Console on **9001**) and `s3.<node-ip>.nip.io:30080` (S3). The MinIO Pod disables Istio sidecar injection to avoid proxy interference during large PUT/GET operations.
 
-### 1.2.2 Storage and Reliability  
-The default `local-path` StorageClass backs `/mnt/pvc` inside containers. All artifacts are first written locally and then uploaded asynchronously, ensuring read/write resilience against transient network issues.
+> [!IMPORTANT]
+> Traffic to MinIO uses **plaintext** within the cluster. A dedicated Istio `DestinationRule` explicitly **DISABLES TLS** toward `minio-service.kubeflow.svc.cluster.local`, and the ingress Lua filter **preserves the `Authorization` header for `s3.*.nip.io`** to avoid breaking S3-signed requests. Remove these relaxations for production and terminate TLS at the gateway or MinIO.
 
-### 1.2.3 Model Distribution  
-Models are distributed using immutable objects plus a mutable pointer: each release uploads timestamped `model_*.pt` and `metrics_*.json`, then overwrites `models/latest.txt` with two lines (model key and metrics key). Consumers read only this pointer, enabling pull-based hot reloads.
+### 1.2.2 Storage & Durability (PVC-first → async S3)  
+All components write artifacts to a local PersistentVolume mounted at `/mnt/pvc` (default `local-path` `StorageClass`). Uploads to MinIO are asynchronous, so transient network issues do not stall training/inference. This also provides deterministic local audit trails per Pod before consolidation in object storage.
 
-### 1.2.4 Traffic and Security  
-An Istio `DestinationRule` disables mTLS toward MinIO, preventing Envoy from enforcing TLS on a plaintext backend service.
+### 1.2.3 Model & Metrics Distribution (immutable + pointer)  
+Each release publishes immutable blobs `models/model_*.pt` and `models/metrics_*.json`. The **only mutable handle** is `models/latest.txt` with **two lines**: the object key of the active model and the object key of its metrics. Inference consumers **poll the pointer**, fetch on change, verify integrity (e.g., md5/size), and perform an **atomic in-process hot swap** only if the validated candidate beats the baseline by the configured margin.
 
-### 1.2.5 Object Organization  
-Data is structured with prefixes `datasets_old/`, `models/`, and `results/`, supporting lifecycle management, separation of concerns, and auditability.
+> [!NOTE] Pointer semantics
+>
+> The pointer file decouples producers (retrainers) from consumers (infer). It enables reproducible rollbacks by resetting `latest.txt` to a prior version, minimizes S3 list operations, and avoids partially-visible updates because the pointer write is a single small overwrite.
+
+### 1.2.4 Object Layout  
+Buckets/prefixes are minimal and reproducible:  
+- `datasets/`, `datasets_pcm/` – preprocessed CSVs for the **perf** and **pcm** branches.  
+- `models/` – `model_*.pt`, `metrics_*.json`, and `latest.txt` (two-line pointer).  
+- `results/` – run artifacts (e.g., `report.md`, `plot_final_*.png`, `resources_summary.{csv,md}`, and per-component `*_resources.csv`).  
+
+### 1.2.5 Security & Access Control Chain (K8s ↔ Istio ↔ Kubeflow ↔ Pods)  
+The dev/test configuration intentionally short-circuits parts of the production authN/authZ chain to simplify local bring-up and CI. The end-to-end request path and the relevant controls are:
+
+1) **External → Istio Ingress (NodePort 30080/30443).**  
+   Requests land on `istio-ingressgateway`. A **gateway-scoped EnvoyFilter (Lua)** injects a fixed user identity for Kubeflow UIs:
+   - `kubeflow-userid: user@example.com`  
+   - `x-auth-request-email: user@example.com`  
+   - `x-goog-authenticated-user-email: accounts.google.com:user@example.com`  
+   For **S3 hosts** (`s3.*.nip.io`), the filter **does not remove `Authorization`** to keep AWS S3–style signatures valid; for other hosts it strips `Authorization` in dev/test to bypass residual OIDC/JWT checks.
+
+2) **Host-based routing (VirtualService).**  
+   Istio routes `minio.*.nip.io` → MinIO Console (9001), `s3.*.nip.io` → MinIO S3 (9000), and `*` → Kubeflow WebApps / KFP UI / API. A **DestinationRule** disables mTLS **only** for the MinIO backend.
+
+3) **Kubeflow namespace policies.**  
+   In dev/test, a namespace-wide `AuthorizationPolicy` of **allow-all** is applied to `kubeflow`. WebApps set `APP_DISABLE_AUTH=True` and honor the injected user header (`USERID_HEADER=kubeflow-userid`). The **KFP backend** is configured with `KUBEFLOW_USERID_HEADER=kubeflow-userid` (empty prefix) to accept the same identity.  
+   Additionally, an **inbound EnvoyFilter on `ml-pipeline`** provides a fallback: if the headers are missing, it populates the same fixed identity so UI ↔ backend remain consistent.
+
+4) **Identity → Namespace mapping (Profiles).**  
+   A `Profile` for `user@example.com` creates/owns the user’s namespace `kubeflow-user-example-com`. This is the logical tenancy boundary for Pipelines runs and artifacts.
+
+5) **RBAC modes for KFP state syncing.**  
+   - **Mode A (dev quickstart):** bind `cluster-admin` to the fixed user.  
+   - **Mode B (default minimal):** a `ClusterRole` that grants `pipelines.kubeflow.org/workflows` with `verbs: ["*"]`, bound to the fixed user. This resolves the UI “**Pending** forever” symptom by allowing the **persistenceagent** to report real run states back to the DB.  
+   MySQL has Istio sidecar **disabled** to avoid proxying issues with the KFP backend.
+
+6) **Pod-level effects.**  
+   For WebApps and the KFP backend/UI, **Istio sidecars remain enabled** so the ingress EnvoyFilters take effect. For **MinIO**, sidecar injection is **disabled** (high-throughput data plane, no mTLS in dev). Network paths to other cluster services remain default-deny or chart defaults; add NetworkPolicies as needed.
+
+> [!IMPORTANT]
+> **Production hardening.** Re-enable standard authN/authZ: restore WebApp auth, remove the user-impersonation EnvoyFilters, enable **RequestAuthentication** + JWT validation at the gateway, replace the allow-all AuthorizationPolicy with least-privilege rules, re-enable **mTLS** and use TLS termination for S3/Console. Prefer OIDC via Dex/oauth2-proxy with real identities. Use per-bucket IAM/policies in MinIO, bind KFP ServiceAccounts via fine-grained Kubernetes RBAC, and keep MySQL behind standard sidecars if your mesh supports it.
+
 
 
 
