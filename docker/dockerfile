@@ -79,11 +79,12 @@ RUN pip install --no-cache-dir \
       fastapi uvicorn matplotlib shap xgboost \
       --extra-index-url https://download.pytorch.org/whl/cpu torch
 WORKDIR /app
-COPY drst_common/ drst_common/
-COPY drst_forecasting/ drst_forecasting/
+COPY drst_common/         drst_common/
+COPY drst_forecasting/    drst_forecasting/
 COPY drst_model_selection/ drst_model_selection/
+# >>> 新增：把 hpsearch 包也放进来（供 Perf/PCM HPsearch 两个 op 使用）
+COPY drst_hpsearch/       drst_hpsearch/
 CMD ["python", "-m", "drst_forecasting.train_benchmark"]
-
 
 ############################ forecast_api ############################
 FROM python:3.10-slim AS forecast_api
@@ -93,7 +94,9 @@ RUN pip install --no-cache-dir \
       fastapi uvicorn[standard] numpy pandas boto3 minio pyarrow openpyxl scikit-learn joblib xgboost shap \
       --extra-index-url https://download.pytorch.org/whl/cpu torch
 WORKDIR /app
-COPY drst_common/ drst_common/
-COPY drst_forecasting/ drst_forecasting/
+COPY drst_common/       drst_common/
+COPY drst_forecasting/  drst_forecasting/
+# >>> 可选：API 容器如果也需要读 hpsearch 产物/工具，顺手带上
+COPY drst_hpsearch/     drst_hpsearch/
 EXPOSE 8000
 ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5

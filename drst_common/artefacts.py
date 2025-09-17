@@ -1,112 +1,122 @@
-#!/usr/bin/env python3
-# drst_common/artefacts.py
+# -*- coding: utf-8 -*-
+"""
+通用工件读写（MinIO）
+
+功能：
+- write_latest(model_bytes, metrics, model_key?, metrics_key?)  →  写入模型/指标，并更新 models/latest.json
+- read_latest() → (model_key, metrics_key, ts)    兼容旧格式 latest.txt
+- load_model_by_key(key) → (torch_model, raw_bytes)  相对路径会自动加 MODEL_DIR/
+- load_scaler() / load_selected_feats()
+"""
+
 from __future__ import annotations
-import io, os, json, time
-from typing import List, Optional, Tuple, Dict
+import io
+import json
+import time
+from typing import Optional, Tuple, Dict, Any, List
 
 import joblib
-from botocore.exceptions import ClientError
+import numpy as np
+import torch
 
-from .config import BUCKET, MODEL_DIR, RESULT_DIR
 from .minio_helper import s3, save_bytes
+from .config import BUCKET, MODEL_DIR
 
-# 等待离线工件就绪（避免刚写入就去读的竞态）
-_WAIT_TOTAL_S   = int(os.getenv("OFFLINE_ARTIFACT_WAIT_S", "120"))
-_WAIT_INTERVALS = [1, 2, 3, 4, 5]  # 渐进回退，之后固定 5 秒
+# ------------- 基础 I/O -------------
+def _abs_key(key: str) -> str:
+    return key if ("/" in key) else f"{MODEL_DIR}/{key}"
 
-def _head_ok(key: str) -> bool:
+def _read_bytes(key: str) -> Optional[bytes]:
     try:
-        s3.head_object(Bucket=BUCKET, Key=key)
-        return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return False
-        raise
-    except Exception:
-        return False
-
-def _wait_keys(keys: List[str]) -> None:
-    if _WAIT_TOTAL_S <= 0:
-        return
-    deadline = time.time() + _WAIT_TOTAL_S
-    i = 0
-    missing = set(keys)
-    while missing and time.time() < deadline:
-        ok_now = []
-        for k in list(missing):
-            if _head_ok(k):
-                ok_now.append(k)
-        for k in ok_now:
-            missing.discard(k)
-        if not missing:
-            break
-        # sleep 渐进
-        slp = _WAIT_INTERVALS[min(i, len(_WAIT_INTERVALS)-1)]
-        i += 1
-        time.sleep(slp)
-    if missing:
-        raise FileNotFoundError(
-            f"[artefacts] offline artefacts not found after waiting {_WAIT_TOTAL_S}s: "
-            + ", ".join(missing)
-            + f".\n  HINT: ensure the offline step finished and wrote to s3://{BUCKET}/{MODEL_DIR}/"
-        )
-
-# ---------- 公开 API：名称保持不变，兼容旧代码 ----------
-
-def load_selected_feats() -> List[str]:
-    key = f"{MODEL_DIR}/selected_feats.json"
-    _wait_keys([key])
-    raw = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
-    feats = json.loads(raw.decode())
-    if not isinstance(feats, list) or not all(isinstance(x, str) for x in feats):
-        raise ValueError(f"[artefacts] bad format in {key}")
-    return feats
-
-def load_scaler():
-    key = f"{MODEL_DIR}/scaler.pkl"
-    _wait_keys([key])
-    raw = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
-    bio = io.BytesIO(raw)
-    return joblib.load(bio)
-
-def read_latest() -> Optional[Tuple[str, str, Optional[str]]]:
-    """
-    返回 (model_key, metrics_key, timestamp_str) 或 None
-    latest.txt 形如:
-      model_1699999999.pt
-      metrics_1699999999.json
-    """
-    key = f"{MODEL_DIR}/latest.txt"
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        txt = obj["Body"].read().decode().strip().splitlines()
-        if not txt:
-            return None
-        model_key   = txt[0].strip()
-        metrics_key = (txt[1].strip() if len(txt) >= 2 else "metrics_tmp.json")
-        ts = None
-        try:
-            tsobj = s3.head_object(Bucket=BUCKET, Key=model_key)
-            ts = tsobj.get("LastModified") and tsobj["LastModified"].isoformat()
-        except Exception:
-            pass
-        return (model_key, metrics_key, ts)
+        return s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     except Exception:
         return None
 
-def load_model_by_key(model_key: str):
-    import torch
-    raw = s3.get_object(Bucket=BUCKET, Key=f"{MODEL_DIR}/{model_key}" if "/" not in model_key else model_key)["Body"].read()
-    bio = io.BytesIO(raw)
-    mdl = torch.load(bio, map_location="cpu")
+def _read_json(key: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _read_bytes(key)
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+def _head_mtime(key: str) -> Optional[float]:
+    try:
+        return s3.head_object(Bucket=BUCKET, Key=key)["LastModified"].timestamp()
+    except Exception:
+        return None
+
+# ------------- latest 指针 -------------
+def write_latest(model_bytes: bytes,
+                 metrics: Dict[str, Any],
+                 model_key: Optional[str] = None,
+                 metrics_key: Optional[str] = None) -> Tuple[str, str]:
+    """
+    把模型+指标写入 MODEL_DIR 下，并更新 latest.json
+    返回：(model_key, metrics_key)
+    """
+    ts = int(time.time())
+    model_key = model_key or f"model_{ts}.pt"
+    metrics_key = metrics_key or f"metrics_{ts}.json"
+
+    mkey_abs = _abs_key(model_key)
+    with io.BytesIO(model_bytes) as bio:
+        save_bytes(mkey_abs, bio.read(), "application/octet-stream")
+    save_bytes(_abs_key(metrics_key), json.dumps(metrics, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
+
+    latest = {"model_key": model_key, "metrics_key": metrics_key, "ts": ts}
+    save_bytes(f"{MODEL_DIR}/latest.json", json.dumps(latest, ensure_ascii=False).encode("utf-8"), "application/json")
+    # 兼容性：也写一个简易 txt（两行），老代码可用
+    save_bytes(f"{MODEL_DIR}/latest.txt", f"{model_key}\n{metrics_key}\n".encode("utf-8"), "text/plain")
+    return model_key, metrics_key
+
+def read_latest() -> Optional[Tuple[str, str, int]]:
+    """
+    读取最新模型指针：
+    - 优先 latest.json：{"model_key": "...", "metrics_key": "...", "ts": 1700000000}
+    - 兼容 latest.txt：两行，第一行模型键、第二行指标键；ts 用对象的 mtime
+    """
+    js = _read_json(f"{MODEL_DIR}/latest.json")
+    if js and "model_key" in js and "metrics_key" in js:
+        ts = int(js.get("ts") or (_head_mtime(f"{MODEL_DIR}/{js['model_key']}") or 0))
+        return str(js["model_key"]), str(js["metrics_key"]), ts
+
+    # 兼容旧格式
+    raw = _read_bytes(f"{MODEL_DIR}/latest.txt")
+    if raw:
+        try:
+            s = raw.decode("utf-8").strip().splitlines()
+            mk = s[0].strip(); mk = mk if mk else "model.pt"
+            met = s[1].strip() if len(s) >= 2 else "metrics_tmp.json"
+            ts = int(_head_mtime(_abs_key(mk)) or 0)
+            return mk, met, ts
+        except Exception:
+            pass
+    return None
+
+# ------------- artefacts 加载 -------------
+def load_model_by_key(key: str):
+    """
+    从 MinIO 读取并反序列化 torch 模型。
+    key 可为绝对键（包含 /）或相对键（自动拼 MODEL_DIR/）。
+    """
+    k = _abs_key(key)
+    raw = _read_bytes(k)
+    if raw is None:
+        raise FileNotFoundError(f"s3://{BUCKET}/{k} not found")
+    mdl = torch.load(io.BytesIO(raw), map_location="cpu").eval()
     return mdl, raw
 
-def write_latest(model_bytes: bytes, metrics: Dict, model_key: str, metrics_key: str) -> None:
-    # 写模型
-    save_bytes(f"{MODEL_DIR}/{model_key}", model_bytes, "application/octet-stream")
-    # 写指标
-    save_bytes(f"{MODEL_DIR}/{metrics_key}", json.dumps(metrics, ensure_ascii=False, indent=2).encode(), "application/json")
-    # 指针
-    latest = f"{model_key}\n{metrics_key}\n"
-    save_bytes(f"{MODEL_DIR}/latest.txt", latest.encode(), "text/plain")
+def load_scaler():
+    raw = _read_bytes(f"{MODEL_DIR}/scaler.pkl")
+    if raw is None:
+        raise FileNotFoundError(f"s3://{BUCKET}/{MODEL_DIR}/scaler.pkl not found")
+    bio = io.BytesIO(raw)
+    return joblib.load(bio)
+
+def load_selected_feats() -> List[str]:
+    js = _read_json(f"{MODEL_DIR}/selected_feats.json")
+    if not js or not isinstance(js, list):
+        raise FileNotFoundError(f"s3://{BUCKET}/{MODEL_DIR}/selected_feats.json not found or invalid")
+    return [str(c) for c in js]

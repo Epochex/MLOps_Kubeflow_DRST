@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# drst_forecasting/train_benchmark.py
+# /data/mlops/DRST-SoftwarizedNetworks/drst_hpsearch/pcm_hpsearch.py
 from __future__ import annotations
 import io, os, json, time
 from typing import Dict, List, Tuple
@@ -9,8 +9,8 @@ import pandas as pd
 
 from drst_common.minio_helper import save_bytes, s3, BUCKET
 from drst_common.config import MODEL_DIR, RESULT_DIR
-from .dataset import build_sliding_window
-from .models import build_model, evaluate_metrics, benchmark_latency, publish_best_selection
+from drst_forecasting.dataset import build_sliding_window
+from drst_forecasting.models import build_model, evaluate_metrics, benchmark_latency, publish_best_selection
 
 # ---- 全局配置（可被环境变量覆盖）----
 LOOKBACK  = int(os.getenv("FORECAST_LOOKBACK", "10"))
@@ -25,7 +25,6 @@ def _canon(name: str) -> str | None:
     if n in ("ridge",): return "ridge"
     if n in ("xgboost","xgb","xgbregressor"): return "xgboost"
     if n in ("transformerlight","transformer","transformerlight1d"): return "transformerlight"
-    # RF/GBDT 在本文件没有实现，映射到 xgboost
     if n in ("randomforest","rf","gradientboosting","gbrt","gbdt"): return "xgboost"
     return None
 
@@ -35,7 +34,6 @@ def _load_candidates_for_pcm() -> List[str] | None:
     兼容旧： models/forecasting/pcm_select_suggestion.json
     返回规范化模型名（子集于：ridge/xgboost/transformerlight）
     """
-    # 1) 新的裁剪文件
     key1 = f"{MODEL_DIR}/forecast/model_candidates.json"
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=key1)
@@ -47,12 +45,11 @@ def _load_candidates_for_pcm() -> List[str] | None:
                 if c and c not in cand:
                     cand.append(c)
             if cand:
-                print(f"[forecast.train] candidates from selection: {cand}", flush=True)
+                print(f"[pcm.hpsearch] candidates from selection: {cand}", flush=True)
                 return cand
     except Exception:
         pass
 
-    # 2) 兼容旧建议文件
     key2 = f"{MODEL_DIR}/forecasting/pcm_select_suggestion.json"
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=key2)
@@ -64,7 +61,7 @@ def _load_candidates_for_pcm() -> List[str] | None:
             if c and c not in cand:
                 cand.append(c)
         if cand:
-            print(f"[forecast.train] candidates from suggestion: {cand}", flush=True)
+            print(f"[pcm.hpsearch] candidates from suggestion: {cand}", flush=True)
             return cand
     except Exception:
         pass
@@ -134,7 +131,7 @@ def _grid() -> Dict[str, List[Dict]]:
         full = {k: v for k, v in full.items() if k in keep}
         if not full:
             full = {"transformerlight": full.get("transformerlight", [{"d_model":128,"heads":4,"dropout":0.1,"lr":1e-3,"batch":64,"epochs":EPOCHS,"patience":PATIENCE}])}
-        print(f"[forecast.train] grid pruned by selection -> {list(full.keys())}", flush=True)
+        print(f"[pcm.hpsearch] grid pruned by selection -> {list(full.keys())}", flush=True)
     return full
 
 def _train_val_split(X: np.ndarray, Y: np.ndarray, val_frac: float = 0.2) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -146,25 +143,25 @@ def _save_csv(key: str, df: pd.DataFrame):
     save_bytes(key, bio.getvalue(), "text/csv")
 
 def main():
-    print(f"[forecast.train] start lookback={LOOKBACK} horizon={HORIZON} take_last={TAKE_LAST}", flush=True)
+    print(f"[pcm.hpsearch] start lookback={LOOKBACK} horizon={HORIZON} take_last={TAKE_LAST}", flush=True)
 
     try:
         X, Y, feats = build_sliding_window(
             LOOKBACK, HORIZON,
             take_last_n=(None if TAKE_LAST <= 0 else TAKE_LAST),
-            multi_output=True   # <<< 关键：与深度模型输出对齐
+            multi_output=True   # 与深度模型输出对齐
         )
     except Exception as e:
         msg = str(e)
         if "不足以构成任何一个滑动窗口" in msg or "not enough" in msg.lower():
             save_bytes(f"{RESULT_DIR}/forecast_train_skipped.flag", b"not_enough_data\n", "text/plain")
-            print("[forecast.train] not enough data; SKIP.", flush=True)
+            print("[pcm.hpsearch] not enough data; SKIP.", flush=True)
             return
         raise
 
     if X is None or len(X) < 32:
         save_bytes(f"{RESULT_DIR}/forecast_train_skipped.flag", b"too_few_samples\n", "text/plain")
-        print("[forecast.train] too few samples; SKIP.", flush=True)
+        print("[pcm.hpsearch] too few samples; SKIP.", flush=True)
         return
 
     Xtr, Xva, Ytr, Yva = _train_val_split(X, Y, 0.2)
@@ -174,7 +171,7 @@ def main():
     prefix = f"{MODEL_DIR}/forecast"
 
     for kind, plist in grids.items():
-        print(f"[forecast.train] model={kind} | candidates={len(plist)}", flush=True)
+        print(f"[pcm.hpsearch] model={kind} | candidates={len(plist)}", flush=True)
         for i, p in enumerate(plist, 1):
             try:
                 mdl = build_model(kind, LOOKBACK, HORIZON, feats, p)
@@ -217,7 +214,7 @@ def main():
 
     df = pd.DataFrame(rows)
     _save_csv(f"{prefix}/grid_results.csv", df)
-    print(f"[forecast.train] grid done — {len(df)} trials", flush=True)
+    print(f"[pcm.hpsearch] grid done — {len(df)} trials", flush=True)
 
     assert best is not None, "no model successfully trained"
     _, _, (best_kind, best_params, best_mdl, best_rec) = best
@@ -234,7 +231,7 @@ def main():
         "features": best_mdl.cfg.features if hasattr(best_mdl, "cfg") else [],
     }
     publish_best_selection(prefix, selection)
-    print("[forecast.train] BEST:", json.dumps(selection, ensure_ascii=False), flush=True)
+    print("[pcm.hpsearch] BEST:", json.dumps(selection, ensure_ascii=False), flush=True)
 
 if __name__ == "__main__":
     main()
