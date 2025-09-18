@@ -99,13 +99,38 @@ def read_latest() -> Optional[Tuple[str, str, int]]:
 def load_model_by_key(key: str):
     """
     从 MinIO 读取并反序列化 torch 模型。
+    兼容 PyTorch 2.6+（weights_only 默认 True）。
     key 可为绝对键（包含 /）或相对键（自动拼 MODEL_DIR/）。
     """
     k = _abs_key(key)
     raw = _read_bytes(k)
     if raw is None:
         raise FileNotFoundError(f"s3://{BUCKET}/{k} not found")
-    mdl = torch.load(io.BytesIO(raw), map_location="cpu").eval()
+
+    bio = io.BytesIO(raw)
+    # 1) 直接 weights_only=False（仅在信任来源时）
+    try:
+        mdl = torch.load(bio, map_location="cpu", weights_only=False)
+    except TypeError:
+        # 旧版本 torch 没有 weights_only 参数
+        bio.seek(0)
+        mdl = torch.load(bio, map_location="cpu")
+    except Exception as e1:
+        # 2) 允许特定类（如果你的模型是 torch.save(model) 保存的自定义类）
+        try:
+            from drst_inference.offline.model import MLPRegressor  # 若项目中存在该类
+            try:
+                from torch.serialization import add_safe_globals
+                add_safe_globals([MLPRegressor])
+            except Exception:
+                pass
+            bio.seek(0)
+            mdl = torch.load(bio, map_location="cpu", weights_only=False)
+        except Exception as e2:
+            raise RuntimeError(f"load_model_by_key failed: {e1} | allowlist fallback: {e2}")
+
+    if hasattr(mdl, "eval"):
+        mdl = mdl.eval()
     return mdl, raw
 
 def load_scaler():

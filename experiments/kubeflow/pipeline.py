@@ -147,7 +147,7 @@ def forecast_publish_op() -> None:
 
 # ------------ XAI（跟随 retrain / latest 指针）------------
 @component(base_image=IMG_FORECAST)
-def forecast_xai_op(lookback: int = 10, horizon: int = 5, shap_n: int = 256, hidden: int = 64, layers: int = 1, watch: bool = True, poll_interval_s: int = 2) -> None:
+def xai_latest_op(lookback: int = 10, horizon: int = 5, shap_n: int = 256, hidden: int = 64, layers: int = 1, watch: bool = True, poll_interval_s: int = 2) -> None:
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     os.environ["FORECAST_LOOKBACK"] = str(int(lookback))
@@ -158,6 +158,7 @@ def forecast_xai_op(lookback: int = 10, horizon: int = 5, shap_n: int = 256, hid
     os.environ["FORECAST_XAI_WATCH"]= "1" if watch else "0"
     os.environ["POLL_INTERVAL_S"]   = str(int(poll_interval_s))
     subprocess.run(["python","-m","drst_forecasting.explain"], check=True)
+
 
 # ------------ Pipeline ------------
 @pipeline(name="drift-stream-v2", description="Drift monitoring + dynamic retraining + online inference + PCM/Perf preprocess + HP search + Forecast publish")
@@ -218,12 +219,12 @@ def drift_stream_v2_pipeline(
     fc_pub = forecast_publish_op().set_caching_options(False).set_display_name("Forecast-Publish-op").after(pcm_hp, offline)
 
     # XAI：依赖 offline（内部 watch retrain/latest）
-    fc_xai = forecast_xai_op(lookback=fc_lookback, horizon=fc_horizon, watch=True, poll_interval_s=2
-    ).set_caching_options(False).set_display_name("Forecast-XAI-op").after(offline)
+    xai = xai_latest_op(lookback=fc_lookback, horizon=fc_horizon, watch=True, poll_interval_s=2
+    ).set_caching_options(False).set_display_name("XAI-Latest-op").after(offline)
 
     # Plot 收口
     plot = plot_op().set_caching_options(False).set_display_name("Plot-Report-op")
-    plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_pub, fc_xai)
+    plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_pub, xai)
 
 if __name__ == "__main__":
     import kfp

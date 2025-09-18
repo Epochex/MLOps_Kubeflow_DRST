@@ -14,38 +14,6 @@
 components:
   comp-forecast-publish-op:
     executorLabel: exec-forecast-publish-op
-  comp-forecast-xai-op:
-    executorLabel: exec-forecast-xai-op
-    inputDefinitions:
-      parameters:
-        hidden:
-          defaultValue: 64.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        horizon:
-          defaultValue: 5.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        layers:
-          defaultValue: 1.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        lookback:
-          defaultValue: 10.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        poll_interval_s:
-          defaultValue: 2.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        shap_n:
-          defaultValue: 256.0
-          isOptional: true
-          parameterType: NUMBER_INTEGER
-        watch:
-          defaultValue: true
-          isOptional: true
-          parameterType: BOOLEAN
   comp-infer-op:
     executorLabel: exec-infer-op
     inputDefinitions:
@@ -200,6 +168,38 @@ components:
           defaultValue: true
           isOptional: true
           parameterType: BOOLEAN
+  comp-xai-latest-op:
+    executorLabel: exec-xai-latest-op
+    inputDefinitions:
+      parameters:
+        hidden:
+          defaultValue: 64.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        horizon:
+          defaultValue: 5.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        layers:
+          defaultValue: 1.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        lookback:
+          defaultValue: 10.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        poll_interval_s:
+          defaultValue: 2.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        shap_n:
+          defaultValue: 256.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+        watch:
+          defaultValue: true
+          isOptional: true
+          parameterType: BOOLEAN
 deploymentSpec:
   executors:
     exec-forecast-publish-op:
@@ -231,43 +231,6 @@ deploymentSpec:
           \ *\n\ndef forecast_publish_op() -> None:\n    import os, subprocess\n \
           \   os.environ[\"PYTHONPATH\"] = \"/app\"\n    subprocess.run([\"python\"\
           ,\"-m\",\"drst_forecasting.publish_forecast\"], check=True)\n\n"
-        image: hirschazer/forecast:latest
-    exec-forecast-xai-op:
-      container:
-        args:
-        - --executor_input
-        - '{{$}}'
-        - --function_to_execute
-        - forecast_xai_op
-        command:
-        - sh
-        - -c
-        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
-          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
-          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
-          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
-          $0\" \"$@\"\n"
-        - sh
-        - -ec
-        - 'program_path=$(mktemp -d)
-
-
-          printf "%s" "$0" > "$program_path/ephemeral_component.py"
-
-          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
-
-          '
-        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
-          \ *\n\ndef forecast_xai_op(lookback: int = 10, horizon: int = 5, shap_n:\
-          \ int = 256, hidden: int = 64, layers: int = 1, watch: bool = True, poll_interval_s:\
-          \ int = 2) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
-          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
-          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    os.environ[\"\
-          FORECAST_SHAP_N\"]   = str(int(shap_n))\n    os.environ[\"FORECAST_HIDDEN\"\
-          ]   = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]   = str(int(layers))\n\
-          \    os.environ[\"FORECAST_XAI_WATCH\"]= \"1\" if watch else \"0\"\n   \
-          \ os.environ[\"POLL_INTERVAL_S\"]   = str(int(poll_interval_s))\n    subprocess.run([\"\
-          python\",\"-m\",\"drst_forecasting.explain\"], check=True)\n\n"
         image: hirschazer/forecast:latest
     exec-infer-op:
       container:
@@ -686,6 +649,43 @@ deploymentSpec:
           POLL_INTERVAL_S\"] = str(int(poll_interval_s))\n    subprocess.run([\"python\"\
           ,\"-m\",\"drst_drift.dynamic_retrain\"], check=True)\n\n"
         image: hirschazer/retrain:latest
+    exec-xai-latest-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - xai_latest_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef xai_latest_op(lookback: int = 10, horizon: int = 5, shap_n: int\
+          \ = 256, hidden: int = 64, layers: int = 1, watch: bool = True, poll_interval_s:\
+          \ int = 2) -> None:\n    import os, subprocess\n    os.environ[\"PYTHONPATH\"\
+          ] = \"/app\"\n    os.environ[\"FORECAST_LOOKBACK\"] = str(int(lookback))\n\
+          \    os.environ[\"FORECAST_HORIZON\"]  = str(int(horizon))\n    os.environ[\"\
+          FORECAST_SHAP_N\"]   = str(int(shap_n))\n    os.environ[\"FORECAST_HIDDEN\"\
+          ]   = str(int(hidden))\n    os.environ[\"FORECAST_LAYERS\"]   = str(int(layers))\n\
+          \    os.environ[\"FORECAST_XAI_WATCH\"]= \"1\" if watch else \"0\"\n   \
+          \ os.environ[\"POLL_INTERVAL_S\"]   = str(int(poll_interval_s))\n    subprocess.run([\"\
+          python\",\"-m\",\"drst_forecasting.explain\"], check=True)\n\n"
+        image: hirschazer/forecast:latest
 pipelineInfo:
   description: Drift monitoring + dynamic retraining + online inference + PCM/Perf
     preprocess + HP search + Forecast publish
@@ -702,26 +702,6 @@ root:
         - pcm-hpsearch-op
         taskInfo:
           name: Forecast-Publish-op
-      forecast-xai-op:
-        cachingOptions: {}
-        componentRef:
-          name: comp-forecast-xai-op
-        dependentTasks:
-        - offline-training-op
-        inputs:
-          parameters:
-            horizon:
-              componentInputParameter: fc_horizon
-            lookback:
-              componentInputParameter: fc_lookback
-            poll_interval_s:
-              runtimeValue:
-                constant: 2.0
-            watch:
-              runtimeValue:
-                constant: true
-        taskInfo:
-          name: Forecast-XAI-op
       infer-op:
         cachingOptions: {}
         componentRef:
@@ -883,13 +863,13 @@ root:
           name: comp-plot-op
         dependentTasks:
         - forecast-publish-op
-        - forecast-xai-op
         - infer-op
         - infer-op-2
         - infer-op-3
         - monitor-op
         - producer-op
         - retrain-op
+        - xai-latest-op
         taskInfo:
           name: Plot-Report-op
       producer-op:
@@ -924,6 +904,26 @@ root:
                 constant: true
         taskInfo:
           name: Retrain-op
+      xai-latest-op:
+        cachingOptions: {}
+        componentRef:
+          name: comp-xai-latest-op
+        dependentTasks:
+        - offline-training-op
+        inputs:
+          parameters:
+            horizon:
+              componentInputParameter: fc_horizon
+            lookback:
+              componentInputParameter: fc_lookback
+            poll_interval_s:
+              runtimeValue:
+                constant: 2.0
+            watch:
+              runtimeValue:
+                constant: true
+        taskInfo:
+          name: XAI-Latest-op
   inputDefinitions:
     parameters:
       fc_horizon:
