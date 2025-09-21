@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-清理 MinIO：删除 BUCKET 中除 KEEP_PREFIXES 下的对象外的所有对象。
-为绕过 MinIO 在 HTTP 网关下对 DeleteObjects(批量删除) 的 Content-MD5 强制要求，
-改为逐个 delete_object，稳定可靠。
+Clean up MinIO: delete all objects in BUCKET except those under KEEP_PREFIXES.
+To avoid the Content-MD5 requirement that MinIO enforces for DeleteObjects
+(batch delete) when accessed via an HTTP gateway, we delete objects one by one
+with delete_object, which is stable and reliable.
 
-本脚本将保留以下“目录前缀”下的对象：
+This script preserves objects under these “directory prefixes”:
 - datasets/
 - raw/
-datasets_pcm
+- datasets_pcm
 """
 
 import sys
@@ -19,24 +20,26 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-# ======== 与上传脚本保持一致的显式配置 ========
+# ======== Explicit config kept consistent with the upload script ========
 MINIO_S3_ENDPOINT = "http://s3.45.149.207.13.nip.io:30080"
 ACCESS_KEY = "minio"
 SECRET_KEY = "minio123"
 BUCKET     = "onvm-demo2"
 
-# 需要保留的前缀（目录语义以 / 结尾）。在这些前缀下的所有对象都会跳过删除。
+# Prefixes to keep (directory semantics end with /). Any object whose key starts
+# with one of these prefixes will be skipped. Non-slash-terminated entries are
+# treated as exact keys and as parent prefixes for “key/...” children.
 KEEP_PREFIXES = ["datasets/", "raw/", "datasets_pcm/"]
-# ============================================
+# =======================================================================
 
 def check_health(endpoint: str) -> None:
     url = endpoint.rstrip("/") + "/minio/health/ready"
     try:
         r = requests.get(url, timeout=3)
         if r.status_code != 200:
-            print(f"[WARN] 健康检查 {url} 返回 {r.status_code}，继续尝试连接 S3 ...")
+            print(f"[WARN] Health check {url} returned {r.status_code}; continuing to try S3 ...")
     except Exception as e:
-        print(f"[WARN] 健康检查失败：{e}，继续尝试连接 S3 ...")
+        print(f"[WARN] Health check failed: {e}; continuing to try S3 ...")
 
 def make_client():
     return boto3.client(
@@ -55,32 +58,32 @@ def make_client():
 
 def should_keep(key: str) -> bool:
     """
-    只要对象键以任何一个 KEEP_PREFIXES 元素为前缀（常见为以 / 结尾的“目录”），就保留。
-    兼容不以 / 结尾的精确键或其“子路径”。
+    Keep the object if its key starts with any element in KEEP_PREFIXES
+    (common case: “directory” ending with /). For entries without a trailing /,
+    keep both the exact key and anything under “key/”.
     """
     for p in KEEP_PREFIXES:
         if p.endswith("/"):
             if key.startswith(p):
                 return True
         else:
-            # 既保留完全等于 p 的对象，也保留 p/ 下的对象
             if key == p or key.startswith(p + "/"):
                 return True
     return False
 
 def main():
-    print(f"[INFO] 连接 MinIO：{MINIO_S3_ENDPOINT}")
+    print(f"[INFO] Connecting to MinIO: {MINIO_S3_ENDPOINT}")
     check_health(MINIO_S3_ENDPOINT)
 
     try:
         s3 = make_client()
 
-        # 桶存在性检查
+        # Check bucket existence
         try:
             s3.head_bucket(Bucket=BUCKET)
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
-            print(f"[ERR] head_bucket 失败（桶不存在或无权访问）：{code}")
+            print(f"[ERR] head_bucket failed (bucket missing or not authorized): {code}")
             return 3
 
         kept = deleted = scanned = 0
@@ -103,12 +106,12 @@ def main():
                 if should_keep(key):
                     kept += 1
                     continue
-                # 单个删除，避免 DeleteObjects 的 Content-MD5 限制
+                # Delete individually to avoid DeleteObjects Content-MD5 constraint
                 try:
                     s3.delete_object(Bucket=BUCKET, Key=key)
                     deleted += 1
                 except ClientError as e:
-                    print(f"[WARN] 删除失败 {key}: {e}")
+                    print(f"[WARN] Delete failed {key}: {e}")
 
                 if deleted and deleted % 200 == 0:
                     dt = time.time() - t0
@@ -122,10 +125,10 @@ def main():
         return 0
 
     except EndpointConnectionError as e:
-        print(f"[连接失败] 无法访问 MinIO S3 端点：{MINIO_S3_ENDPOINT}\n{e}")
+        print(f"[CONNECT FAIL] Cannot reach MinIO S3 endpoint: {MINIO_S3_ENDPOINT}\n{e}")
         return 2
     except Exception as e:
-        print(f"[ERR] 未处理异常：{e}")
+        print(f"[ERR] Unhandled exception: {e}")
         return 1
 
 if __name__ == "__main__":
