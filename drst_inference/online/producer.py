@@ -18,15 +18,15 @@ from drst_common.minio_helper import load_csv, s3
 from drst_common.kafka_io import create_producer, broadcast_sentinel, partitions_for_topic
 from drst_common.resource_probe import start as start_probe
 
-# ------- 基本参数 -------
+# ------- Core parameters -------
 TOPIC  = os.getenv("KAFKA_TOPIC", "latencyTopic")
 RUN_ID = os.getenv("RUN_ID") or time.strftime("%Y%m%d%H%M%S", time.gmtime())
 
-# 白名单（默认使用 config 里定义的顺序与名称）
-# 例如：PRODUCER_STAGES="stage0,stage1,stage2,stage3"
+# Whitelist (defaults to the order and names defined in config)
+# Example: PRODUCER_STAGES="stage0,stage1,stage2,stage3"
 STAGE_WHITELIST = {s.strip().lower() for s in os.getenv("PRODUCER_STAGES", "").split(",") if s.strip()}
 
-# ------- 发送节流 -------
+# ------- Rate limiting -------
 def _per_msg_sleep_s() -> float:
     tps_env = os.getenv("PRODUCER_TPS")
     if tps_env is not None and tps_env.strip():
@@ -57,7 +57,7 @@ def _sleep_for_rate(base_s: float):
     else:
         time.sleep(base_s)
 
-# ------- 等待并读取特征列 -------
+# ------- Wait for and load feature columns -------
 def _load_feature_cols() -> List[str]:
     key = f"{MODEL_DIR}/feature_cols.json"
     deadline = time.time() + int(WAIT_FEATURES_SECS)
@@ -73,7 +73,7 @@ def _load_feature_cols() -> List[str]:
         time.sleep(2)
     raise RuntimeError(f"wait feature_cols.json timeout: {last_err}")
 
-# ------- 数据裁剪/对齐 -------
+# ------- Trim/align data -------
 def _align(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
     for c in feature_cols:
         if c not in df.columns:
@@ -96,7 +96,7 @@ def _select_rows(df: pd.DataFrame, how: str, n: int) -> pd.DataFrame:
         return df.tail(n)
     return df.head(n)
 
-# ------- 阶段定义 -------
+# ------- Stage definitions -------
 @dataclass
 class StageDef:
     name: str
@@ -131,7 +131,7 @@ def _load_stage_frames(feat_cols: List[str]) -> List[Tuple[StageDef, pd.DataFram
         pairs.append((sd, df))
     return pairs
 
-# ------- 主流程 -------
+# ------- Main workflow -------
 def main():
     stop_probe = start_probe("producer")
     try:

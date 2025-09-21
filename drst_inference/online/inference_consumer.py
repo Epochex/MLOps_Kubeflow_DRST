@@ -29,7 +29,7 @@ from drst_common.resource_probe import start as start_probe
 RUN_TAG  = os.getenv("KFP_RUN_ID") or os.getenv("PIPELINE_RUN_ID") or "drst"
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "cg-infer")
 
-# —— 固定友好组件名：infer1 / infer2 / infer3 —— #
+# —— infer1 / infer2 / infer3 —— #
 _replica_env = os.getenv("INFER_REPLICA_ID", None)
 try:
     _rep_id = int(_replica_env) if _replica_env is not None else 0
@@ -151,7 +151,6 @@ def _reload_daemon():
         _maybe_reload_model()
 threading.Thread(target=_reload_daemon, daemon=True).start()
 
-# —— 读取 monitor 广播的“当前 JS”（做 1s 缓存，避免高频拉 S3） —— #
 _last_js_val: Optional[float] = None
 _last_js_fetch_ts: float = 0.0
 def _read_js_current(max_age_s: float = 1.0) -> Optional[float]:
@@ -220,18 +219,16 @@ def _process_batch(rows: List[dict]):
 
     denom = np.maximum(np.abs(labels), 1e-8)
     err_c = np.abs(pc - labels) / denom
-    batch_correct = int((err_c <= float(ACC_THR)).sum())  # 累计阈值
+    batch_correct = int((err_c <= float(ACC_THR)).sum())  # Cumulative Threshold
     batch_total   = len(rows)
     cum_correct  += batch_correct
     cum_total    += batch_total
     cum_acc = (cum_correct / max(1, cum_total))
 
-    # 批内命中（按 INFER_HIT_THR）
     hit_thr = float(INFER_HIT_THR)
     hits = int((err_c <= hit_thr).sum())
     hit_rate = (hits / max(1, batch_total))
 
-    # 写指标（最简）
     log_metric(
         component="infer", event="batch_metrics",
         batch_size=batch_total, latency_ms=round(wall_ms, 3),
@@ -274,7 +271,6 @@ def _pause_flag_exists() -> bool:
 
 try:
     while True:
-        # —— 可选暂停（重训时）——
         if INFER_RESPECT_PAUSE_FLAG and _pause_flag_exists():
             if not paused:
                 if not consumer.assignment():
@@ -299,7 +295,6 @@ try:
 
         for _, records in polled.items():
             for msg in records:
-                # 记录“本分区”已收到 sentinel
                 if _is_sentinel_msg(msg):
                     seen_parts.add(getattr(msg, "partition", -1))
                     ap = _assigned_parts_now()
@@ -315,12 +310,10 @@ try:
                               f"{len(seen_parts & ap)}/{len(ap)} (assigned)", flush=True)
                         continue
                 except Exception:
-                    # 如果不是 JSON，按普通数据处理（兼容）
                     pass
 
                 got_data = True
                 last_data_ts = time.time()
-                # 业务数据
                 try:
                     v = json.loads(msg.value)
                 except Exception:
@@ -329,18 +322,14 @@ try:
                 if len(batch_buf) >= BATCH:
                     _process_batch(batch_buf); batch_buf.clear()
 
-        # —— 若没新数据，先 flush 缓冲 —— 
         if not got_data and batch_buf:
             _process_batch(batch_buf); batch_buf.clear()
 
-        # —— 新：按“本消费者 assignment”判定 sentinel 是否齐备 —— 
         ap = _assigned_parts_now()
         if ap and ap.issubset(seen_parts):
-            # 安全退出前 flush（上面已 flush，无数据亦可）
             print(f"[{COMPONENT_NAME}] all assigned-partition sentinels received; exiting loop", flush=True)
             break
 
-        # —— 闲置超时（兜底）——
         if not got_data:
             if (time.time() - last_data_ts) > IDLE_S:
                 print(f"[{COMPONENT_NAME}] idle > {IDLE_S}s; exiting loop", flush=True)
