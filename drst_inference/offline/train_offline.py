@@ -25,7 +25,7 @@ from drst_inference.offline.model import MLPRegressor
 from drst_inference.offline.features import load_and_prepare
 
 # =========================
-# 参数（可被 env 覆盖）
+# Parameters (overridable via env)
 # =========================
 OFFLINE_KEY  = os.getenv("TRAIN_MINIO_KEY", os.getenv("OFFLINE_TRAIN_KEY", "datasets/combined.csv"))
 RAND_KEY     = "datasets/random_rates.csv"
@@ -33,7 +33,7 @@ BRIDGE_N     = int(os.getenv("BRIDGE_N", "500"))
 RAND_N       = int(os.getenv("RAND_N", "500"))
 TOPK         = int(os.getenv("OFFLINE_TOPK", "10"))
 
-# 重要：默认从 config 取值，环境变量仅覆盖
+# Important: defaults come from config; environment variables only override them
 TRAIN_TRIGGER = int(os.getenv("TRAIN_TRIGGER", str(CFG_TRAIN_TRIGGER)))
 
 LR           = float(os.getenv("OFFLINE_LR", "1e-2"))
@@ -45,8 +45,8 @@ MIN_LR       = float(os.getenv("OFFLINE_MIN_LR", "1e-5"))
 VAL_FRAC     = float(os.getenv("OFFLINE_VAL_FRAC", "0.3"))
 SEED_SPLIT   = int(os.getenv("OFFLINE_SPLIT_SEED", "0"))
 
-ACC_THR_MAIN = float(os.getenv("ACC_THR_MAIN", "0.25"))  # 用于 combined 尾部桥接评估
-ACC_THR_RAND = float(os.getenv("ACC_THR_RAND", "0.15"))  # 用于 random_rates 头部评估
+ACC_THR_MAIN = float(os.getenv("ACC_THR_MAIN", "0.25"))  # used for combined-tail (bridge) evaluation
+ACC_THR_RAND = float(os.getenv("ACC_THR_RAND", "0.15"))  # used for random_rates head evaluation
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 TMP_DIR = "/tmp/offline_models"
@@ -61,7 +61,7 @@ def _save_as_baseline_and_model(model: nn.Module) -> None:
                        (local_model, f"{MODEL_DIR}/model.pt")]:
         with open(local, "rb") as f:
             save_bytes(key, f.read(), "application/octet-stream")
-    # latest 指针（兼容 online 热加载）
+    # latest pointer (for online hot reload)
     save_bytes(f"{MODEL_DIR}/latest.txt", b"model.pt\nmetrics_tmp.json", "text/plain")
     meta = {"timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     save_bytes(f"{MODEL_DIR}/metrics_tmp.json", json.dumps(meta).encode(), "application/json")
@@ -77,7 +77,7 @@ def _bridge_eval_and_dump(model: nn.Module, X_all: np.ndarray, y_all: np.ndarray
     X_tail = X_all[-n:]; y_tail = y_all[-n:]
     y_pred = _predict(model, X_tail)
     acc = calculate_accuracy_within_threshold(y_tail, y_pred, thr)
-    # 桥接产物（给后续画图/联动）
+    # Bridge artifacts (for plotting/automation downstream)
     for name, arr in [("bridge_true.npy", y_tail), ("bridge_pred.npy", y_pred)]:
         bio = io.BytesIO(); np.save(bio, arr); bio.seek(0)
         save_bytes(f"{RESULT_DIR}/{name}", bio.read(), "application/npy")
@@ -89,7 +89,7 @@ def _rand_head_eval(model: nn.Module, scaler, selected: List[str]) -> float:
     except Exception:
         print(f"[offline] WARN: cannot load {RAND_KEY}, skip rand-head eval.")
         return 0.0
-    # 预处理与对齐
+    # Preprocess and align with selected feature set
     df = df.replace({"<not counted>": np.nan, r"^\s*$": np.nan}, regex=True)
     df = df.dropna(how="any").reset_index(drop=True)
     df = df.drop(columns=[c for c in ["Unnamed: 0","input_rate","latency"] if c in df.columns], errors="ignore")
@@ -120,15 +120,15 @@ def main():
     t0 = time.time()
     print(f"[offline] start — dataset={OFFLINE_KEY} TRAIN_TRIGGER={TRAIN_TRIGGER}", flush=True)
 
-    # 1) 读全集 + 特征选择（Top-10）+ 标准化（对全集 fit）
+    # 1) Read full dataset + select top-10 features + standardize (fit on the full set)
     df_all, selected, scaler = load_and_prepare(OFFLINE_KEY, k=TOPK)
     X_all = scaler.transform(df_all[selected].astype(np.float32).values)
     y_all = df_all[TARGET_COL].astype(np.float32).values
 
-    # 2) 划分 7:3（固定种子）
+    # 2) Split 70/30 (fixed seed)
     Xtr, Xva, Ytr, Yva = train_test_split(X_all, y_all, test_size=VAL_FRAC, random_state=SEED_SPLIT)
 
-    # 3) 模型与训练流程
+    # 3) Model and training loop
     model = MLPRegressor(in_dim=Xtr.shape[1], hidden=(64, 32), act="relu").to(device)
     opt   = Adam(model.parameters(), lr=LR)
     lossf = nn.SmoothL1Loss()
@@ -138,7 +138,7 @@ def main():
 
     best_val = float("inf"); best_state: bytes | None = None; no_imp = 0
 
-    # 4) 训练开关（含 baseline 缺失的自动兜底）
+    # 4) Training switch (auto-fallback if baseline is missing)
     do_train = (TRAIN_TRIGGER != 0)
     baseline_bytes: bytes | None = None
     if not do_train:
@@ -156,7 +156,7 @@ def main():
                 xb = xb.float().to(device); yb = yb.float().to(device).view(-1,1)
                 opt.zero_grad(set_to_none=True)
                 loss = lossf(model(xb), yb); loss.backward(); opt.step()
-            # 验证
+            # Validation
             with torch.no_grad():
                 vpred = model(torch.from_numpy(Xva).float().to(device)).cpu().numpy().ravel()
                 val = float(np.mean((vpred - Yva) ** 2))
@@ -176,11 +176,11 @@ def main():
             model = torch.load(io.BytesIO(best_state), map_location=device)
         _save_as_baseline_and_model(model)
     else:
-        # 不训练且 baseline 存在
+        # No training and baseline exists
         model = torch.load(io.BytesIO(baseline_bytes), map_location=device).eval().to(device)
         print("[offline] TRAIN_TRIGGER=0 → use existing baseline_model.pt", flush=True)
 
-    # 5) 评估：combined 尾部（桥接） & random_rates 头部（acc@0.15）
+    # 5) Evaluate: combined tail (bridge) & random_rates head (acc@0.15)
     acc_bridge = _bridge_eval_and_dump(model, X_all, y_all, thr=ACC_THR_MAIN)
     print(f"[offline] [combined_tail{BRIDGE_N}] acc@{ACC_THR_MAIN:.2f} = {acc_bridge:.2f}%", flush=True)
     log_metric(component="offline", event="bridge_eval",
@@ -191,7 +191,7 @@ def main():
     log_metric(component="offline", event="random_rates_eval",
                n=RAND_N, **{f"acc@{ACC_THR_RAND:.2f}".rstrip('0').rstrip('.'): round(acc_rand, 2)})
 
-    # 6) 结束与耗时
+    # 6) Finish and wall time
     wall_s = round(time.time() - t0, 3)
     log_metric(component="offline", event="train_done", wall_s=wall_s,
                mode=("TRAIN" if do_train else "SKIP"))
