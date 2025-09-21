@@ -80,7 +80,6 @@ class SkModelCfg:
 
 class SkWrapper:
     def __init__(self, base, lookback:int, horizon:int, features:List[str], params:Dict[str,Any]):
-        # horizon>1 用 MultiOutput 包一层
         if horizon > 1:
             self.model = MultiOutputRegressor(base.__class__(**params))
         else:
@@ -124,7 +123,7 @@ class SkWrapper:
         return obj
 
 # ======================
-# 深度模型：LSTM / DirectLSTM / TransformerLight
+# deep model：LSTM / DirectLSTM / TransformerLight
 # ======================
 class LSTMHead(nn.Module):
     def __init__(self, in_feat:int, hidden:int, layers:int, dropout:float, horizon:int):
@@ -177,7 +176,6 @@ class TorchWrapper:
         opt = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         lossf = nn.SmoothL1Loss()
         best = None; bad=0; best_val=float("inf")
-        # 简单留出法：用最后 10% 当 val
         n = len(ds); val_n=max(1,int(n*0.1))
         Xtr, Ytr = X[:-val_n], Y2[:-val_n]
         Xva, Yva = X[-val_n:], Y2[-val_n:]
@@ -236,16 +234,13 @@ class TorchWrapper:
         obj.net = net.to(obj.device)
         return obj
 
-# ======================
-# 工厂 & 统一入口
-# ======================
 def build_model(kind:str, lookback:int, horizon:int, features:List[str], params:Dict[str,Any]) -> Union[SkWrapper, TorchWrapper]:
     k = kind.lower()
     if k == "ridge":
         return SkWrapper(Ridge(alpha=float(params.get("alpha", 1.0))), lookback, horizon, features, params)
     if k == "xgboost":
         if not _HAS_XGB:
-            raise RuntimeError("xgboost 未安装，训练镜像需要包含 xgboost 包")
+            raise RuntimeError("xgboost uninsatll")
         base = XGBRegressor(
             objective="reg:squarederror",
             n_estimators=int(params.get("n_estimators", 400)),
@@ -277,7 +272,6 @@ def build_model(kind:str, lookback:int, horizon:int, features:List[str], params:
     raise ValueError(f"unknown model kind: {kind}")
 
 def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    # 统一用第一步（t+1）评价；如果是多步输出，取第 0 列
     y_true = _ensure_2d_y(y_true); y_pred = _ensure_2d_y(y_pred)
     if y_true.shape[1] > 1:
         yt = y_true[:, 0]
@@ -287,7 +281,6 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]
         yp = y_pred.ravel()
     r2 = float(r2_score(yt, yp))
     mae = float(mean_absolute_error(yt, yp))
-    # 短期可靠性 Acc@0.15：相对误差 <= 0.15
     denom = np.maximum(np.abs(yt), 1e-8)
     acc = float(np.mean(np.abs(yp - yt) / denom <= 0.15))
     return {"r2": r2, "mae": mae, "acc@0.15": acc}
@@ -300,9 +293,5 @@ def benchmark_latency(predict_fn, X: np.ndarray, repeat:int=1) -> float:
     return float(dt / len(X))  # per-sample seconds
 
 def publish_best_selection(prefix:str, info:Dict[str,Any]) -> None:
-    """
-    在 S3 写入： models/forecast/best_meta.json + models/forecast/selected.json
-    API 会读取 selected.json 定位 meta，再取模型。
-    """
     sel_key = f"{prefix}/selected.json"
     save_bytes(sel_key, json.dumps(info, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")

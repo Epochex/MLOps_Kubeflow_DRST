@@ -21,7 +21,7 @@ class PredictOut(BaseModel):
     horizon: int
     y_hat: List[float]
 
-# 缓存
+# cache
 _state: Dict[str, Any] = {}
 
 def _load_selection():
@@ -68,7 +68,6 @@ def predict(inp: PredictIn):
     feats = _state["features"]; L = _state["lookback"]; H = _state["horizon"]
     if not isinstance(seq, list) or len(seq) < L:
         raise HTTPException(status_code=400, detail=f"sequence length must be >= lookback={L}")
-    # 取最后 L 步（单条）
     tail = seq[-L:]
     x = np.zeros((1, L, len(feats)), dtype=np.float32)
     for t, row in enumerate(tail):
@@ -78,7 +77,6 @@ def predict(inp: PredictIn):
     if hasattr(wrapper, "net"):  # torch
         y = wrapper.predict(x)[0]
     else:
-        # 传统模型 expects 2D（flatten）
         y = wrapper.predict(x)[0]
     y = y.squeeze().tolist()
     if isinstance(y, float):

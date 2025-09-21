@@ -31,7 +31,7 @@ def _save_csv(key: str, df: pd.DataFrame):
 
 def main():
     wrapper, L, H, sel = _load_selection()
-    # 只取最后 1 个滑窗，multi_output=True 方便深度/传统统一
+    # Use only the last sliding window; multi_output=True keeps deep and classical models consistent
     X, _Y, _feats = build_sliding_window(L, H, take_last_n=1, multi_output=True)
     yhat = wrapper.predict(X)[0].tolist()
     yhat = yhat[:H]

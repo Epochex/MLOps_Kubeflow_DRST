@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-drst_forecasting/explain.py  —— 单次运行版
-
-用途：
-- 由 pipeline 在 retrain 结束后直接触发本脚本；
-- 读取 MODEL_DIR/latest.json 指向的最新模型与指标；
-- 选用 results/latest_batch.npy（若有）或 datasets/combined.csv + models/selected_feats.json 作为解释数据；
-- 计算简易置换重要性并写入 results/xai/ 下的报告；
-- 完成后立即退出（不再 watch）。
-
-兼容性修复：
-- 统一对 model/metrics key 做相对键补全（不带斜杠时自动加 "models/" 前缀），避免 NoSuchKey；
-- 兼容 PyTorch 2.6+（weights_only 默认 True）导致的 torch.load 失败：先试 weights_only=False，再允许特定类，最后兼容旧版本。
-"""
 
 from __future__ import annotations
 import io
@@ -30,11 +16,11 @@ from drst_common.artefacts import read_latest, load_model_by_key, load_scaler, l
 
 
 # -----------------------
-# 工具：路径与 S3 I/O
+# Utilities: paths and S3 I/O
 # -----------------------
 
 def _abs_key(key: str) -> str:
-    """相对键自动补上 models/ 前缀。"""
+    """Automatically add the models/ prefix for relative keys."""
     k = str(key)
     return k if ("/" in k) else f"{MODEL_DIR}/{k}"
 
@@ -63,11 +49,11 @@ def _simple_report(title: str, lines: Dict[str, Any]) -> str:
 
 
 # -----------------------
-# 数据加载
+# Data loading
 # -----------------------
 
 def _load_latest_batch() -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
-    """优先使用监控侧产物：latest_batch.npy + latest_batch.columns.json。"""
+    """Prefer monitor outputs: latest_batch.npy + latest_batch.columns.json."""
     arr_key = f"{RESULT_DIR}/latest_batch.npy"
     col_key = f"{RESULT_DIR}/latest_batch.columns.json"
     try:
@@ -86,7 +72,7 @@ def _load_latest_batch() -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
     return None
 
 def _load_combined_selected() -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """回退：datasets/combined.csv + models/selected_feats.json。"""
+    """Fallback: datasets/combined.csv + models/selected_feats.json."""
     key = f"{DATA_DIR}/combined.csv"
     obj = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     df = pd.read_csv(io.BytesIO(obj))
@@ -107,13 +93,13 @@ def _load_combined_selected() -> Tuple[np.ndarray, np.ndarray, List[str]]:
 
 
 # -----------------------
-# 模型加载（兼容 torch 2.6+）
+# Model loading (PyTorch 2.6+ compatible)
 # -----------------------
 
 def _safe_torch_load_from_s3(model_key: str):
     """
-    兼容 PyTorch 2.6+：优先 weights_only=False；若失败再 allowlist；最后兼容旧 torch。
-    仅在你信任权重来源时使用。
+    PyTorch 2.6+ compatibility: try weights_only=False first; if that fails, fallback with allowlist;
+    finally try legacy torch load. Only use if the source of weights is trusted.
     """
     import io as _io
     import torch as _torch
@@ -129,7 +115,7 @@ def _safe_torch_load_from_s3(model_key: str):
         pass
 
     try:
-        from drst_inference.offline.model import MLPRegressor  # 若项目中存在该类
+        from drst_inference.offline.model import MLPRegressor
         try:
             from torch.serialization import add_safe_globals
             add_safe_globals([MLPRegressor])
@@ -145,10 +131,6 @@ def _safe_torch_load_from_s3(model_key: str):
         bio.seek(0)
         return _torch.load(bio, map_location="cpu")
 
-
-# -----------------------
-# 置换重要性（简易）
-# -----------------------
 
 def _mae(y, p) -> float:
     y = np.asarray(y, np.float32); p = np.asarray(p, np.float32)
@@ -176,7 +158,7 @@ def _perm_importance(mdl, X: np.ndarray, y: np.ndarray, feat_names: List[str], r
 
 
 # -----------------------
-# 主逻辑（单次运行）
+# Main logic (single run)
 # -----------------------
 
 def _align_to_model_dim(X: np.ndarray, in_dim: int) -> np.ndarray:
@@ -189,7 +171,7 @@ def _align_to_model_dim(X: np.ndarray, in_dim: int) -> np.ndarray:
     return np.concatenate([X, pad], axis=1)
 
 def main():
-    # 1) 读取最新指针
+    # 1) Read latest model pointer
     latest = read_latest()
     if not latest:
         _write_md("xai_latest_skipped.md", _simple_report("XAI Latest (Skipped)", {"reason": "no latest model"}))
@@ -200,7 +182,7 @@ def main():
     mkey = _abs_key(model_key)
     metkey = _abs_key(metrics_key)
 
-    # 2) 加载模型（先通用接口，失败则安全加载）
+    # 2) Load model (try general interface, fallback to safe torch load)
     try:
         mdl, _raw = load_model_by_key(mkey)
     except Exception as e1:
@@ -220,28 +202,28 @@ def main():
             print(f"[xai] fallback load error: {e2}", flush=True)
             return
 
-    # 3) 取解释用数据
+    # 3) Load data for explanation
     batch = _load_latest_batch()
     if batch is not None:
         Xraw, y, feat_cols = batch
     else:
         Xraw, y, feat_cols = _load_combined_selected()
 
-    # 4) 标准化、维度对齐
+    # 4) Standardize and align dimensions
     sc = load_scaler()
     Xs = sc.transform(Xraw.astype(np.float32))
     in_dim = getattr(getattr(mdl, "net", [None])[0], "in_features", Xs.shape[1])
     in_dim = int(in_dim) if isinstance(in_dim, (int, np.integer)) else Xs.shape[1]
     Xs = _align_to_model_dim(Xs, in_dim)
 
-    # 5) 置换重要性（失败不终止，只写 warning）
+    # 5) Permutation importance (non-fatal; write warning on failure)
     try:
         df_imp = _perm_importance(mdl, Xs, y, feat_cols, repeat=3)
     except Exception as e:
         df_imp = pd.DataFrame([{"feature": "N/A", "mae_increase": np.nan}])
         _write_md("xai_warn_perm.md", _simple_report("XAI Latest (Warning)", {"perm_importance": f"failed: {e}"}))
 
-    # 6) 汇总指标并写报告
+    # 6) Summarize metrics and write report
     mets = _read_json(metkey) or {}
     base = float(mets.get("baseline_mae", np.nan))
     newm = float(mets.get("mae", np.nan))

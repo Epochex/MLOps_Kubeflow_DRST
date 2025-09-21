@@ -12,17 +12,16 @@ import pandas as pd
 from drst_common.minio_helper import s3, BUCKET, load_csv, save_bytes
 from drst_common.config import MODEL_DIR
 
-# ---- 可配置（也可用环境变量覆盖）----
 PCM_FULL_KEY      = os.getenv("PCM_FULL_KEY", "datasets/pcm/pcm_global.csv")
 SELECTED_FEATS_KEY = f"{MODEL_DIR}/selected_feats.json"
-TARGET_COL        = os.getenv("FORECAST_TARGET", "latency")   # 默认用 latency 做时序预测目标
+TARGET_COL        = os.getenv("FORECAST_TARGET", "latency")   # default target column for forecasting
 
 def _save_selected_features(feats: List[str]) -> None:
     buf = json.dumps(feats).encode("utf-8")
     save_bytes(SELECTED_FEATS_KEY, buf, "application/json")
 
 def _load_selected_features() -> List[str]:
-    """优先读 models/selected_feats.json；若不存在，就从 PCM 全量表自动推断并保存。"""
+    """Load models/selected_feats.json if available; otherwise infer from the full PCM table and save."""
     try:
         raw = s3.get_object(Bucket=BUCKET, Key=SELECTED_FEATS_KEY)["Body"].read()
         feats = json.loads(raw.decode("utf-8"))
@@ -31,28 +30,28 @@ def _load_selected_features() -> List[str]:
     except Exception:
         pass
 
-    # 回退：从 PCM 合并集推断
+    # Fallback: infer from the merged PCM dataset
     df = load_csv(PCM_FULL_KEY)
-    # 选全部数值列，去掉目标列
+    # Select numeric columns, excluding the target
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     feats = [c for c in num_cols if c != TARGET_COL]
     if not feats:
         raise RuntimeError(f"fallback feature discovery failed: no numeric columns (key=s3://{BUCKET}/{PCM_FULL_KEY})")
 
-    # 保存供下次使用
+    # Save for future use
     _save_selected_features(feats)
     return feats
 
 def _load_series() -> pd.DataFrame:
-    """载入 PCM 合并表；对关键列做基本清洗。"""
+    """Load the merged PCM dataset and perform basic cleaning on key columns."""
     df = load_csv(PCM_FULL_KEY)
-    # 强制数值化（容错）
+    # Force numeric conversion (tolerant mode)
     for c in df.columns:
         if c == TARGET_COL:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         elif pd.api.types.is_object_dtype(df[c]):
             df[c] = pd.to_numeric(df[c], errors="ignore")
-    # 去掉目标缺失的行
+    # Drop rows where the target is missing
     if TARGET_COL not in df.columns:
         raise RuntimeError(f"target column '{TARGET_COL}' not found in PCM dataset (key={PCM_FULL_KEY})")
     df = df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
@@ -64,15 +63,11 @@ def build_sliding_window(
     take_last_n: int | None = None,
     multi_output: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """
-    用 PCM 合并表构造滑窗数据：
-      X shape: (N, lookback, F)
-      Y shape: 单输出时 (N,)，多输出时 (N, horizon)
-    """
+
     feats = _load_selected_features()
     df = _load_series()
 
-    # 丢弃缺失的特征行；对剩余缺失值用 0 补
+    # Drop rows with missing feature values; fill remaining NaNs with 0
     for c in feats:
         if c not in df.columns:
             df[c] = 0.0
@@ -87,15 +82,15 @@ def build_sliding_window(
     target = sub[TARGET_COL].values
     L = len(sub)
 
-    # 生成窗口
+    # Generate sliding windows
     end = L - lookback - horizon + 1
     for i in range(max(0, end)):
         X_list.append(values[i:i+lookback, :])
         if multi_output:
-            # 预测未来 horizon 个点
+            # Predict the next `horizon` points
             Y_list.append(target[i+lookback : i+lookback+horizon])
         else:
-            # 仅预测 y_{t+H}
+            # Predict only y_{t+H}
             Y_list.append(target[i+lookback+horizon-1])
 
     if not X_list:
