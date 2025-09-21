@@ -11,7 +11,7 @@ def main():
 
     # PCM params (sequence)
     p.add_argument("--lookback", type=int, default=10)
-    p.add_argument("--horizon", type=int, default=5)   # 用于窗口位置，但仍预测单步 t+H
+    p.add_argument("--horizon", type=int, default=5)   
     p.add_argument("--take_last", type=int, default=4000)
     p.add_argument("--topk", type=int, default=3)
 

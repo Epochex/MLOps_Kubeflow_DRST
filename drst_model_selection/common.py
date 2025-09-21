@@ -19,7 +19,6 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, per_sample_ms: float) -> Di
     yt = np.asarray(y_true, dtype=np.float32).ravel()
     yp = np.asarray(y_pred, dtype=np.float32).ravel()
     mae = float(np.mean(np.abs(yp - yt)))
-    # R²：避免除零
     ss_res = float(np.sum((yp - yt) ** 2))
     ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2))
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else float("nan")

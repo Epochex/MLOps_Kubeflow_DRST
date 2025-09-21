@@ -14,7 +14,6 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.svm import SVR
 
-# XGBoost 可选
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
@@ -36,11 +35,7 @@ def run_perf_selection(
     include_svr: bool = False,
     include_dt: bool = False,
 ) -> None:
-    """
-    Perf：表格回归，单输出（output_rate）。
-    候选默认：Linear / Ridge / RandomForest / GradientBoosting / XGBoost（可选）
-    可选：SVR / DecisionTree
-    """
+
     print(f"[perf_select] input=s3://.../{perf_key}", flush=True)
     df = load_csv(perf_key)
     df = _safe_num_df(df).dropna(axis=0, how="any").reset_index(drop=True)
@@ -62,7 +57,6 @@ def run_perf_selection(
     ev = evaluate(yva, yp, lat); ev.update({"model": "Linear"})
     rows.append(ev)
 
-    # --- Ridge ---
     for a in [1e-3, 1e-2, 1e-1, 1.0, 10.0]:
         rg = Pipeline([("sc", StandardScaler(with_mean=False)), ("rg", Ridge(alpha=a))])
         rg.fit(Xtr, ytr)
@@ -71,7 +65,6 @@ def run_perf_selection(
         ev = evaluate(yva, yp, lat); ev.update({"model": "Ridge", "alpha": a})
         rows.append(ev)
 
-    # --- RandomForest ---
     for n in [200, 400]:
         rf = RandomForestRegressor(n_estimators=n, max_depth=8, min_samples_leaf=5, random_state=0, n_jobs=-1)
         rf.fit(Xtr, ytr)
@@ -80,7 +73,6 @@ def run_perf_selection(
         ev = evaluate(yva, yp, lat); ev.update({"model": "RandomForest", "n_estimators": n})
         rows.append(ev)
 
-    # --- GradientBoosting ---
     for n in [200, 400]:
         gb = GradientBoostingRegressor(n_estimators=n, learning_rate=0.05, max_depth=3, random_state=0)
         gb.fit(Xtr, ytr)
@@ -89,7 +81,6 @@ def run_perf_selection(
         ev = evaluate(yva, yp, lat); ev.update({"model": "GradientBoosting", "n_estimators": n})
         rows.append(ev)
 
-    # --- XGBoost（可选） ---
     if _HAS_XGB:
         for n in [200, 400]:
             xgb = XGBRegressor(
@@ -103,7 +94,6 @@ def run_perf_selection(
             ev = evaluate(yva, yp, lat); ev.update({"model": "XGBoost", "n_estimators": n})
             rows.append(ev)
 
-    # --- 可选补充 ---
     if include_dt:
         dt = DecisionTreeRegressor(max_depth=6, min_samples_leaf=10, random_state=0)
         dt.fit(Xtr, ytr)
@@ -120,12 +110,10 @@ def run_perf_selection(
         ev = evaluate(yva, yp, lat); ev.update({"model": "SVR"})
         rows.append(ev)
 
-    # 排序/保存
     df_rank = pd.DataFrame(rows).sort_values(["mae", "latency_ms"]).reset_index(drop=True)
     csv_key = save_rank_csv("perf_model_selection.csv", df_rank)
     print(f"[perf_select] wrote rank -> s3://.../{csv_key}", flush=True)
 
-    # 建议清单（不覆盖 selected.json）
     best = df_rank.iloc[0].to_dict()
     suggestion = {
         "task": "perf",

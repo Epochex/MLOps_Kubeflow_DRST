@@ -11,14 +11,12 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
-# XGBoost 可选
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
 except Exception:
     _HAS_XGB = False
 
-# 轻量 Transformer（单输出）
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -48,12 +46,10 @@ def _canon_name(name: str) -> str | None:
     if n in ("transformerlight1d", "transformerlight", "transformer"):
         return "transformerlight"
     if n in ("randomforest", "random_forest", "rf", "gradientboosting", "gbrt", "gbdt"):
-        # 训练阶段没有 RF/GBDT 的实现，用 XGB 近似替代
         return "xgboost"
     return None
 
 
-# ---- 简易单输出 Transformer ----
 class TransformerLight1D(nn.Module):
     def __init__(self, in_feat: int, d_model: int = 128, heads: int = 4, layers: int = 2, dropout: float = 0.1):
         super().__init__()
@@ -81,7 +77,6 @@ def _fit_torch_singleout(
     lossf = nn.SmoothL1Loss()
     opt = torch.optim.Adam(net.parameters(), lr=lr)
 
-    # 简单留出末尾 10% 作为 val
     n = len(X)
     v = max(1, int(0.1 * n))
     Xtr, ytr = X[:-v], y[:-v]
@@ -133,19 +128,14 @@ def _fit_torch_singleout(
     return net
 
 
-# ---------- 主流程 ----------
 def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 4000, topk: int = 3) -> None:
-    """
-    单输出选择（预测 y_{t+H}）。
-    候选：Ridge / RandomForest / GradientBoosting / XGBoost / TransformerLight(单输出)
-    """
+
     _seed_everything(42)
 
     print(f"[pcm_select] === START ===", flush=True)
     print(f"[pcm_select] params: lookback={lookback} horizon(H)={horizon} take_last={take_last} topk={topk}", flush=True)
 
     t0 = time.perf_counter()
-    # X: (N, L, F), y: (N,) —— build_sliding_window 默认即单步 y_{t+H}
     X, y, feats = build_sliding_window(lookback, horizon, take_last_n=take_last)
     print(f"[pcm_select] data: X.shape={X.shape} y.shape={y.shape} | #features={len(feats)}", flush=True)
     N = len(X)
@@ -158,7 +148,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
     rows: List[Dict[str, Any]] = []
     best_key = None  # (mae, latency_ms)
 
-    # ---------- 传统模型（单输出） ----------
     # Ridge
     for a in [1e-3, 1e-2, 1e-1, 1.0, 10.0]:
         print(f"[pcm_select][Ridge] alpha={a} ...", flush=True)
@@ -175,7 +164,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
         rows.append(ev)
         print(f"[pcm_select][Ridge] r2={ev['r2']:.4f} mae={ev['mae']:.4f} lat_ms={ev['latency_ms']:.3f} fit_s={fit_s:.2f}", flush=True)
 
-    # RandomForest
     for n in [200, 400]:
         print(f"[pcm_select][RandomForest] n_estimators={n} ...", flush=True)
         rf = RandomForestRegressor(n_estimators=n, max_depth=8, min_samples_leaf=5, n_jobs=-1, random_state=0)
@@ -191,7 +179,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
         rows.append(ev)
         print(f"[pcm_select][RandomForest] r2={ev['r2']:.4f} mae={ev['mae']:.4f} lat_ms={ev['latency_ms']:.3f} fit_s={fit_s:.2f}", flush=True)
 
-    # GradientBoosting
     for n in [200, 400]:
         print(f"[pcm_select][GBDT] n_estimators={n} ...", flush=True)
         gb = GradientBoostingRegressor(n_estimators=n, learning_rate=0.05, max_depth=3, random_state=0)
@@ -207,7 +194,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
         rows.append(ev)
         print(f"[pcm_select][GBDT] r2={ev['r2']:.4f} mae={ev['mae']:.4f} lat_ms={ev['latency_ms']:.3f} fit_s={fit_s:.2f}", flush=True)
 
-    # XGBoost（可选）
     if _HAS_XGB:
         for n in [200, 400]:
             print(f"[pcm_select][XGBoost] n_estimators={n} ...", flush=True)
@@ -229,7 +215,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
     else:
         print("[pcm_select][XGBoost] package not available in image — skipped.", flush=True)
 
-    # ---------- 轻量 Transformer（单输出） ----------
     try:
         print("[pcm_select][Transformer] training ...", flush=True)
         net = TransformerLight1D(in_feat=X.shape[-1], d_model=128, heads=4, layers=2, dropout=0.1)
@@ -255,7 +240,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
     except Exception as e:
         print(f"[pcm_select][Transformer] skipped due to error: {e}", flush=True)
 
-    # ---------- 排序/保存 ----------
     df = pd.DataFrame(rows).sort_values(["mae", "latency_ms"]).reset_index(drop=True)
     csv_key = save_rank_csv("pcm_model_selection.csv", df)
     print(f"[pcm_select] wrote rank CSV -> models in s3://.../{csv_key}", flush=True)
@@ -264,7 +248,6 @@ def run_pcm_selection(lookback: int = 10, horizon: int = 5, take_last: int = 400
     best = df.iloc[0].to_dict()
     print(f"[pcm_select] WINNER model={best.get('model')} mae={best.get('mae'):.6f} r2={best.get('r2'):.6f} lat_ms={best.get('latency_ms'):.3f}", flush=True)
 
-    # 生成供 gridsearch 使用的候选（去重保序，裁剪 topk）
     ordered = [str(m) for m in df["model"].tolist()]
     mapped = []
     for m in ordered:
