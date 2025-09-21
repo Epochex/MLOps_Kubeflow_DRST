@@ -5,7 +5,6 @@
 FROM python:3.10-slim AS deps
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-# 基础系统依赖（编译 & 常用native依赖）
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc g++ build-essential curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
@@ -15,7 +14,6 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/src
-# 建议把所有通用依赖都写进 requirements.txt（务必包含 pandas、numpy、boto3、pyarrow/openpyxl、minio 等）
 COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && pip install -r requirements.txt
@@ -27,11 +25,8 @@ ENV APP_DIR=/app PYTHONPATH=/app
 COPY --from=deps /opt/venv /opt/venv
 WORKDIR /app
 
-# 公共代码（MinIO 工具、配置等）
 COPY drst_common ./drst_common
-# 预处理代码（Perf/PCM 两个目录都会被用到）
 COPY drst_preprocess ./drst_preprocess
-# 如需在运行时参考（不是必须）
 COPY requirements.txt ./requirements.txt
 
 ############################ offline ############################
@@ -82,7 +77,6 @@ WORKDIR /app
 COPY drst_common/         drst_common/
 COPY drst_forecasting/    drst_forecasting/
 COPY drst_model_selection/ drst_model_selection/
-# >>> 新增：把 hpsearch 包也放进来（供 Perf/PCM HPsearch 两个 op 使用）
 COPY drst_hpsearch/       drst_hpsearch/
 CMD ["python", "-m", "drst_forecasting.train_benchmark"]
 
@@ -96,7 +90,6 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 COPY drst_common/       drst_common/
 COPY drst_forecasting/  drst_forecasting/
-# >>> 可选：API 容器如果也需要读 hpsearch 产物/工具，顺手带上
 COPY drst_hpsearch/     drst_hpsearch/
 EXPOSE 8000
 ENV FORECAST_LOOKBACK=10 FORECAST_HORIZON=5
