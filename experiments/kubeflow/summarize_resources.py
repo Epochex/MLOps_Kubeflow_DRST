@@ -9,7 +9,7 @@ import pandas as pd
 from drst_common.minio_helper import s3, save_bytes
 from drst_common.config import BUCKET, RESULT_DIR
 
-BIN_SEC = 0.5  # 聚合对齐到 500ms 桶（probe 也为 500ms）
+BIN_SEC = 0.5  
 
 # ---------- S3 helpers ----------
 def _list(prefix: str) -> List[Dict]:

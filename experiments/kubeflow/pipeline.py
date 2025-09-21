@@ -15,7 +15,7 @@ IMG_FORECAST = os.getenv("IMAGE_FORECAST", "hirschazer/forecast:latest")
 IMG_HPSEARCH = os.getenv("IMAGE_HPSEARCH", IMG_FORECAST)
 IMG_PREPROC  = os.getenv("IMAGE_PREPROC",  IMG_OFFLINE)
 
-# ------------ 预处理 ------------
+# ------------ preprocess ------------
 @dsl.container_component
 def pcm_pre_op():
     return dsl.ContainerSpec(
@@ -138,14 +138,14 @@ def pcm_hpsearch_op(lookback: int = 10, horizon: int = 5, take_last: int = 4000,
     os.environ["FORECAST_TAKE_LAST"]= str(int(take_last))
     subprocess.run(["python","-m","drst_hpsearch.pcm_hpsearch"], check=True)
 
-# ------------ Forecast（发布，非搜索）------------
+# ------------ Forecast------------
 @component(base_image=IMG_FORECAST)
 def forecast_publish_op() -> None:
     import os, subprocess
     os.environ["PYTHONPATH"] = "/app"
     subprocess.run(["python","-m","drst_forecasting.publish_forecast"], check=True)
 
-# ------------ XAI（跟随 retrain / latest 指针）------------
+# ------------ XAI------------
 @component(base_image=IMG_FORECAST)
 def xai_latest_op(lookback: int = 10, horizon: int = 5, shap_n: int = 256, hidden: int = 64, layers: int = 1, watch: bool = True, poll_interval_s: int = 2) -> None:
     import os, subprocess
@@ -174,7 +174,7 @@ def drift_stream_v2_pipeline(
     hp_torch_threads: int = 1,
 ) -> None:
 
-    # 预处理
+    # preprocessing
     pcm = pcm_pre_op().set_caching_options(False).set_display_name("PCM-Pre-op")
     perf = perf_pre_op().set_caching_options(False).set_display_name("Perf-Pre-op")
 
@@ -215,14 +215,14 @@ def drift_stream_v2_pipeline(
     infer1 = infer_op(replica_id=1, kafka_topic=kafka_topic).set_caching_options(False).set_display_name("Infer-2-op").after(offline)
     infer2 = infer_op(replica_id=2, kafka_topic=kafka_topic).set_caching_options(False).set_display_name("Infer-3-op").after(offline)
 
-    # Forecast 发布：仅依赖 PCM-HPsearch + Offline（确保模型已选好、基础线起完）
+    # Forecast Release: Rely solely on PCM-HPsearch + Offline (Ensure the model is selected and the baseline is established)
     fc_pub = forecast_publish_op().set_caching_options(False).set_display_name("Forecast-Publish-op").after(pcm_hp, offline)
 
-    # XAI：依赖 offline（内部 watch retrain/latest）
+    # XAI: Depends on offline (internal monitoring for retraining/latest updates)
     xai = xai_latest_op(lookback=fc_lookback, horizon=fc_horizon, watch=True, poll_interval_s=2
     ).set_caching_options(False).set_display_name("XAI-Latest-op").after(offline)
 
-    # Plot 收口
+    # Plot 
     plot = plot_op().set_caching_options(False).set_display_name("Plot-Report-op")
     plot.after(producer, monitor, retrain, infer0, infer1, infer2, fc_pub, xai)
 

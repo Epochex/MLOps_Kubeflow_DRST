@@ -28,15 +28,15 @@ def _pick_pipeline_func(mod: types.ModuleType):
         fn = getattr(mod, name, None)
         if fn:
             return fn
-    raise RuntimeError("找不到 pipeline 函数（期待 drift_stream_v2_pipeline 或 drift_stream）。")
+    raise RuntimeError("Could not find pipeline function (expected drift_stream_v2_pipeline or drift_stream).")
 
-# 1) 编译为 YAML
+# 1) Compile to YAML
 mod = _load_module(PIPELINE_FILE)
-fn  = _pick_pipeline_func(mod)
+fn = _pick_pipeline_func(mod)
 compiler.Compiler().compile(pipeline_func=fn, package_path=PKG)
-print(f" compiled -> {PKG}")
+print(f"compiled -> {PKG}")
 
-# 2) 提交 YAML（v1 客户端 run_pipeline），不传 params，全部走 config.py 默认
+# 2) Submit YAML (v1 client run_pipeline), without passing params, using all defaults from config.py
 client = Client(host=KFP_HOST) if KFP_HOST else Client()
 exp = client.create_experiment(name=EXPN, namespace=NS)
 exp_id = getattr(exp, "experiment_id", None) or getattr(exp, "id", None)
