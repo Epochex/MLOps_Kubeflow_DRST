@@ -16,14 +16,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 try:
     from . import config as _cfg
 except Exception:
-    _cfg = None  # 允许完全无 config.py 的极端情况
+    _cfg = None 
 
 def _get(name: str, *alts, env: Optional[str] = None, default=None):
-    # 先从 config.py 取（按顺序尝试），再取同名环境变量，最后 default
     for key in (name,) + tuple(alts):
         if _cfg is not None and hasattr(_cfg, key):
             return getattr(_cfg, key)
-    if env:  # 显式 env 名称
+    if env:  
         v = os.getenv(env)
         if v is not None:
             return v
@@ -43,7 +42,6 @@ BUCKET = str(MINIO_BUCKET)
 
 _endpoint_url = os.getenv("MINIO_ENDPOINT_URL") or f"{MINIO_SCHEME}://{MINIO_ENDPOINT}".rstrip("/")
 
-# ---- boto3 S3 客户端 ----
 s3 = boto3.client(
     "s3",
     endpoint_url=_endpoint_url,
@@ -53,7 +51,6 @@ s3 = boto3.client(
     config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
 )
 
-# ---- 便捷 I/O（带轻量重试）----
 def _retry(fn, *, tries: int = 3, delay: float = 0.5):
     last = None
     for _ in range(max(1, tries)):
@@ -93,7 +90,6 @@ def load_csv(key: str) -> pd.DataFrame:
     df = df.replace({"<not counted>": np.nan})
     return df
 
-# ---- 小工具：调试信息（可选）----
 def _debug_dump_config() -> dict:
     return {
         "endpoint_url": _endpoint_url,

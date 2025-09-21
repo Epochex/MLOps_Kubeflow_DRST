@@ -8,7 +8,6 @@ from typing import Dict, List, Any, Optional
 from .minio_helper import s3, save_bytes
 from .config import RESULT_DIR, BUCKET
 
-# 可控行为（环境变量）：
 _METRICS_STREAM_STDOUT   = os.getenv("METRICS_STREAM_STDOUT", "0").strip().lower() in ("1","true","yes","on")
 _METRICS_FLUSH_EVERY     = int(os.getenv("METRICS_FLUSH_EVERY", "0"))
 _METRICS_FLUSH_INTERVALS = int(os.getenv("METRICS_FLUSH_INTERVAL_S", "0"))

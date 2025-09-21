@@ -19,11 +19,6 @@ def calculate_accuracy_within_threshold(
     mode: str = "relative",
     eps: float = 1e-6,
 ) -> float:
-    """
-    返回百分比 (0~100)。
-    mode="relative": |pred - true| / max(|true|, eps) <= thr
-    自动屏蔽 nan/inf；避免 true≈0 时相对误差被放大。
-    """
     yt = _to_numpy(y_true).astype(np.float64)
     yp = _to_numpy(y_pred).astype(np.float64)
 

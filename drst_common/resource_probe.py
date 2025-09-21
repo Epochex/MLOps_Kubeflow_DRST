@@ -14,38 +14,31 @@ import psutil
 from .config import RESULT_DIR
 from .minio_helper import save_bytes
 
-# ========================
-# 全局可变状态（线程安全）
-# ========================
+# Global Mutable State (Thread-Safe)
 
 _LOCK = threading.RLock()
-_EXTRA: Dict[str, float] = {}              # 例如 {"js": 0.123}
-_HOST_THREAD_STARTED = False               # 仅启动一次主机采样线程
-_HOST_THREAD = None                        # 保存 host 线程句柄，便于 atexit 停
-_THREADS: Dict[str, "ProbeHandle"] = {}    # 每个组件一个采样线程
+_EXTRA: Dict[str, float] = {}             
+_HOST_THREAD_STARTED = False               
+_HOST_THREAD = None                        
+_THREADS: Dict[str, "ProbeHandle"] = {}    
 _ATEXIT_REGISTERED = False
 
-# 采样/落盘（默认 500ms，用于过程观察/检测；如需更细改环境变量）
-SAMPLING_MS = int(os.getenv("RESOURCE_SAMPLING_MS", "500") or 500)     # 采样周期 (ms)
-FLUSH_EVERY = int(os.getenv("RESOURCE_FLUSH_EVERY", "200") or 100)     # 每多少行上传一次
+
+SAMPLING_MS = int(os.getenv("RESOURCE_SAMPLING_MS", "500") or 500)    
+FLUSH_EVERY = int(os.getenv("RESOURCE_FLUSH_EVERY", "200") or 100)     
 ROUND_CPU = 6
 ROUND_MEM = 3
 
-# 是否统计子进程（建议开）
+# Should subprocesses be counted? (Recommended: Enabled)
 PROBE_CHILDREN = os.getenv("PROBE_CHILDREN", "1").lower() in ("1", "true", "yes")
 
-# 固定列顺序（与下游保持一致）
 COLUMNS = ["ts", "cpu_pct", "vcpu", "rss_mb", "host_cpus", "js"]
 
-# ========================
-# 工具函数
-# ========================
 
 def _now_ts() -> float:
     return time.time()
 
 def update_extra(**kwargs) -> None:
-    """更新将随下一条样本写入的“额外字段”（如 js）。"""
     with _LOCK:
         for k, v in kwargs.items():
             if v is None:
@@ -57,20 +50,13 @@ def update_extra(**kwargs) -> None:
                     pass
 
 class _CsvBuffer:
-    """
-    采样“增量写本地文件 + 全量覆盖上传 S3”的缓冲：
-      - 每次 append 一行，立即以 CSV 追加写本地 /tmp/<name>.csv
-      - 当累计到 FLUSH_EVERY 行，读取本地**完整文件**并 save_bytes() 覆盖到 S3
-      - stop()/flush() 时也会做一次全量上传
-    这样 S3 上的对象任何时刻都包含“到目前为止的**全部**样本”，不会丢历史批次。
-    """
+
     def __init__(self, s3_key: str):
         self.s3_key = s3_key
         base = os.path.basename(s3_key)
         self.local_path = os.path.join("/tmp", base)
         self._wrote_header = False
         self._rows_since_upload = 0
-        # 清理旧临时文件
         try:
             if os.path.exists(self.local_path):
                 os.remove(self.local_path)
@@ -79,7 +65,7 @@ class _CsvBuffer:
 
     def _open_and_write(self, line: str, header_if_needed: bool = False):
         os.makedirs(os.path.dirname(self.local_path), exist_ok=True)
-        mode = "a"  # 追加
+        mode = "a" 
         with open(self.local_path, mode, encoding="utf-8") as f:
             if header_if_needed and not self._wrote_header:
                 f.write(",".join(COLUMNS) + "\n")
@@ -113,18 +99,10 @@ class _CsvBuffer:
             pass
 
     def flush(self):
-        # 最后一次把“完整本地文件”上传
         self._upload_all()
 
-# ========================
-# 进程(+子进程) 采样（CPU 时间差分法）
-# ========================
 
 def _proc_cpu_mem_totals(proc: psutil.Process, include_children: bool) -> Tuple[float, int]:
-    """
-    返回 (total_cpu_seconds, total_rss_bytes)
-    total_cpu_seconds = user+system（进程 + 递归子进程）
-    """
     total_cpu = 0.0
     total_rss = 0
     try:
@@ -155,7 +133,6 @@ def _proc_cpu_mem_totals(proc: psutil.Process, include_children: bool) -> Tuple[
     return total_cpu, total_rss
 
 class ProbeHandle:
-    """采样线程的句柄：支持停止与设置额外字段"""
     def __init__(self, component: str, pid: Optional[int] = None):
         self.component = component
         self.pid = pid or os.getpid()
@@ -164,12 +141,11 @@ class ProbeHandle:
         self.buf = _CsvBuffer(f"{RESULT_DIR}/{component}_resources.csv")
         self.thread = threading.Thread(target=self._run, name=f"probe-{component}", daemon=True)
 
-        # 差分基线
+        # Differential Baseline
         self._last_ts: Optional[float] = None
         self._last_cpu_s: Optional[float] = None
 
     def _prime(self):
-        # 建立差分基线（不依赖 cpu_percent 的内部窗口）
         cpu_s, _ = _proc_cpu_mem_totals(self.proc, include_children=PROBE_CHILDREN)
         self._last_cpu_s = cpu_s
         self._last_ts = _now_ts()
@@ -191,8 +167,8 @@ class ProbeHandle:
         if dt <= 0.0:
             return None
 
-        vcpu = d_cpu / dt                  # 等效核数
-        cpu_pct = vcpu * 100.0             # 所有核上的百分比
+        vcpu = d_cpu / dt                  
+        cpu_pct = vcpu * 100.0             
         rss_mb = rss_bytes / (1024.0 * 1024.0)
         ncpu = max(1, psutil.cpu_count(logical=True) or 1)
 
@@ -224,7 +200,6 @@ class ProbeHandle:
                 continue
         self.buf.flush()
 
-    # === 对外方法 ===
     def start(self):
         self.thread.start()
         return self
@@ -241,7 +216,6 @@ class ProbeHandle:
         update_extra(**kwargs)
 
 def _ensure_host_thread():
-    """启动一次 host 级别采样（整机总体资源），输出到 host_resources.csv。"""
     global _HOST_THREAD_STARTED, _HOST_THREAD
     if _HOST_THREAD_STARTED:
         return
@@ -253,7 +227,6 @@ def _ensure_host_thread():
             self.buf = _CsvBuffer(f"{RESULT_DIR}/host_resources.csv")
 
         def run(self):
-            # prime 一下，避免第一次 0.0
             try:
                 psutil.cpu_percent(None)
             except Exception:
@@ -265,7 +238,6 @@ def _ensure_host_thread():
                 time.sleep(period_s)
                 ts = _now_ts()
                 try:
-                    # 系统级用 cpu_percent(None) 即“自上一次调用以来”的利用率
                     cpu_pct = float(psutil.cpu_percent(None))
                     vm = psutil.virtual_memory()
                     rss_mb = float(vm.used) / (1024.0 * 1024.0)
@@ -292,7 +264,6 @@ def _ensure_host_thread():
     _HOST_THREAD_STARTED = True
 
 def _stop_all():
-    """进程退出前统一停止所有 probe 并最终 flush。"""
     global _HOST_THREAD
     with _LOCK:
         threads = list(_THREADS.items())
@@ -308,21 +279,9 @@ def _stop_all():
         except Exception:
             pass
 
-# ========================
-# 对外主入口
-# ========================
 
 def start(component: str):
-    """
-    启动【当前进程(+子进程)】的资源采样后台线程：
-      - 本地 /tmp/<component>_resources.csv 追加写
-      - S3 上 results/<component>_resources.csv 始终是“到目前为止的完整数据”
-      - host 级别采样全程仅一份线程
-    返回一个“停止函数”：
-        stop = start("producer"); ...; stop()
-    也兼容：
-        h = start("monitor"); h.set_extra(js=0.12); h.stop()
-    """
+
     global _ATEXIT_REGISTERED
     if not component or not isinstance(component, str):
         component = "proc"
