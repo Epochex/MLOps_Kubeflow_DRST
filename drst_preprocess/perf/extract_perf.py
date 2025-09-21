@@ -1,21 +1,5 @@
 # drst_preprocess/perf/extract_perf.py
 # -*- coding: utf-8 -*-
-"""
-把 datasets/perf/ 下的 per-exp CSV（由 preprocess_perf.py 生成）合并为场景总表，
-并生成你需要的 stage 别名文件。
-
-输入（MinIO）：
-- datasets/perf/random_rates_exp-*.csv
-- datasets/perf/resource_stimulus_exp-*.csv
-- datasets/perf/intervention_exp-*.csv
-
-输出（MinIO）：
-- datasets/perf/stage1_random_rates.csv
-- datasets/perf/resource_stimulus_global.csv
-- datasets/perf/stage2_resource_stimulus_global_A-B-C_modified.csv  # 与上同内容，重命名别名
-- datasets/perf/intervention_global.csv
-- datasets/perf/stage3_intervention_global.csv                       # 与上同内容，重命名别名
-"""
 
 from __future__ import annotations
 import io

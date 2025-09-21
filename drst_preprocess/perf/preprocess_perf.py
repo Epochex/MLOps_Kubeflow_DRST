@@ -1,21 +1,5 @@
 # drst_preprocess/perf/preprocess_perf.py
 # -*- coding: utf-8 -*-
-"""
-读取 MinIO 上的原始 perf 目录，预处理为特征 CSV（63 列，顺序与“标准答案”一致），
-并写回 MinIO 到 datasets/perf/ 下。
-
-输入（MinIO 路径，仅作为 key 前缀，非本地路径）：
-- raw/random_rates/exp-*/{tx_stats.csv, rx_stats.csv, latency*.csv, firewall.csv, nf_router.csv, ndpi_stats.csv, payload_scan.csv, bridge.csv}
-- raw/resource_stimulus/exp-*/...
-- raw/intervention/exp-*/...
-
-输出（MinIO）：
-- datasets/perf/random_rates_exp-*.csv
-- datasets/perf/resource_stimulus_exp-*.csv
-- datasets/perf/intervention_exp-*.csv
-
-并行：默认 8 个 worker。可通过命令行参数或环境变量 N_WORKERS 覆盖。
-"""
 
 from __future__ import annotations
 import io
@@ -29,10 +13,10 @@ import numpy as np
 import pandas as pd
 from multiprocessing import Pool, cpu_count
 
-# 直接复用你的 MinIO 小工具（每个进程都会各自 import，得到独立的 boto3 client）
+# Reuse the MinIO helpers directly (each process will import independently and get its own boto3 client)
 from drst_common.minio_helper import s3, BUCKET
 
-# ------------ 常量：标准列顺序（与“标准答案”一致）------------
+# ------------ Constants: canonical column order (kept consistent with the “golden answer”) ------------
 VNF_ORDER = ["firewall", "nf_router", "ndpi_stats", "payload_scan", "bridge"]
 PERF_FEATURES = [
     "instructions", "branches", "branch-misses", "branch-load-misses",
@@ -45,15 +29,15 @@ STANDARD_COLS = (
     + [f"{vnf}_{feat}" for feat in PERF_FEATURES for vnf in VNF_ORDER]
 )
 
-# S3 路径前缀
+# S3 prefixes
 RAW_PREFIX = "raw"
 OUT_PREFIX = "datasets/perf"
 
 NUM_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-# ------------ S3 基础 ------------
+# ------------ S3 basics ------------
 def _s3_list(prefix: str) -> List[str]:
-    """列出某个前缀下的全部对象 key。"""
+    """List all object keys under a prefix."""
     keys: List[str] = []
     token = None
     while True:
@@ -88,7 +72,7 @@ def _s3_write_csv_df(key: str, df: pd.DataFrame) -> None:
     df.to_csv(buf, index=False)
     s3.put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue().encode("utf-8"), ContentType="text/csv")
 
-# ------------ 解析小工具 ------------
+# ------------ Parsing helpers ------------
 def _safe_float(x) -> Optional[float]:
     try:
         v = float(x)
@@ -121,27 +105,27 @@ def _numbers_in_tokens(tokens: Iterable[str]) -> List[float]:
     return vals
 
 def _read_tx_rx_series(key: str, prefer_cols=("Mbit", "PacketRate"), fallback_index=5) -> List[float]:
-    """优先读表头列；否则退回逐行取某列或正则提数。"""
-    # 1) DataFrame 尝试
+    """Prefer named header columns; otherwise fall back to a positional column or regex number extraction."""
+    # 1) Try DataFrame path
     try:
         df = _s3_read_csv_df(key)
         for c in prefer_cols:
             if c in df.columns:
                 col = pd.to_numeric(df[c], errors="coerce").tolist()
                 return [float(v) if v == v else math.nan for v in col]
-        # 任取一个像样的数值列
+        # Pick any reasonable numeric column
         for c in df.columns:
             col = pd.to_numeric(df[c], errors="coerce").tolist()
             if np.isfinite(np.nanmean(col)):
                 return [float(v) if v == v else math.nan for v in col]
     except Exception:
         pass
-    # 2) 逐行兜底
+    # 2) Line-by-line fallback
     vals: List[float] = []
     lines = _s3_read_text(key)
     if not lines:
         return vals
-    # 跳过表头
+    # Skip header line
     for ln in lines[1:]:
         parts = [p.strip() for p in ln.split(",")]
         if len(parts) > fallback_index:
@@ -154,7 +138,7 @@ def _read_tx_rx_series(key: str, prefer_cols=("Mbit", "PacketRate"), fallback_in
     return vals
 
 def _read_latency_series(key: str, unit: str = "auto", is_fixed: bool = False) -> List[float]:
-    """默认按 µs→ms（/1000）；fixed_rate 常见前几行非数据跳过。"""
+    """Default conversion µs→ms (/1000); for fixed-rate files, the first few lines often contain non-data and are skipped."""
     lines = _s3_read_text(key)
     if is_fixed and len(lines) >= 4:
         lines = lines[4:]
@@ -174,8 +158,9 @@ def _read_latency_series(key: str, unit: str = "auto", is_fixed: bool = False) -
 
 def _parse_perf_stat_linewise(key: str, feature: str) -> List[float]:
     """
-    稳健解析：一行里“任一列”匹配事件名（大小写不敏感），
-    再在该行所有数字里选“幅值最大”的那个作为计数（避开 scale≈1.x）。
+    Robust parsing: match the event name in any column (case-insensitive),
+    then choose the largest-magnitude number on that line as the count
+    (helps avoid scale≈1.x columns).
     """
     vals: List[float] = []
     feat_lower = feature.lower()
@@ -193,29 +178,29 @@ def _parse_perf_stat_linewise(key: str, feature: str) -> List[float]:
         vals.append(v)
     return vals
 
-# ------------ 实验扫描与构建 ------------
+# ------------ Experiment discovery and table construction ------------
 @dataclass
 class Exp:
     scenario: str       # "random_rates" / "resource_stimulus" / "intervention"
     name: str           # exp-1 / exp-2 / ...
-    base: str           # S3 目录前缀，如 raw/random_rates/exp-1/
+    base: str           # S3 directory prefix, e.g., raw/random_rates/exp-1/
 
 def _find_experiments() -> List[Exp]:
     exps: List[Exp] = []
     for scenario in ("random_rates", "resource_stimulus", "intervention"):
         pref = f"{RAW_PREFIX}/{scenario}/"
         keys = _s3_list(pref)
-        # 从 key 推断出 exp-* 目录
+        # Infer exp-* directories from keys
         seen = set()
         for k in keys:
-            # 形如 raw/<scenario>/exp-7/foo.csv
+            # raw/<scenario>/exp-7/foo.csv
             parts = k.split("/")
             if len(parts) >= 3 and parts[-1].endswith(".csv"):
                 exp = parts[-2]
                 if exp.startswith("exp-") and (scenario, exp) not in seen:
                     seen.add((scenario, exp))
                     exps.append(Exp(scenario=scenario, name=exp, base=f"{pref}{exp}/"))
-    # 自然排序：按数字
+    # Natural sort by the number in the exp name
     def natkey(e: Exp):
         m = re.search(r"(\d+)", e.name)
         return (e.scenario, int(m.group(1)) if m else 1_000_000)
@@ -223,12 +208,12 @@ def _find_experiments() -> List[Exp]:
     return exps
 
 def _build_one_df(exp: Exp) -> pd.DataFrame:
-    # 必备文件
+    # Required files
     vnf_files = {v: f"{exp.base}{v}.csv" for v in VNF_ORDER}
     tx_key = f"{exp.base}tx_stats.csv"
     rx_key = f"{exp.base}rx_stats.csv"
 
-    # latency 可能叫 latency.csv / latency_old.csv
+    # Latency may be named latency.csv / latency_old.csv
     lat_key = None
     for cand in ("latency.csv", "latency_old.csv", "latency-old.csv"):
         k = f"{exp.base}{cand}"
@@ -239,19 +224,19 @@ def _build_one_df(exp: Exp) -> pd.DataFrame:
         except Exception:
             continue
 
-    # 读 KPI
+    # Read KPIs
     tx = _read_tx_rx_series(tx_key)
     rx = _read_tx_rx_series(rx_key)
     lat = _read_latency_series(lat_key, unit="auto", is_fixed=False) if lat_key else []
 
-    # 用 firewall_instructions 决定序列长度
+    # Determine sequence length using firewall_instructions
     fw_instr = _parse_perf_stat_linewise(vnf_files["firewall"], "instructions")
     cands = [arr for arr in (fw_instr, tx, rx, lat) if arr]
     seq_len = min([len(a) for a in cands]) if cands else 0
     if seq_len <= 0 and tx and rx:
         seq_len = min(len(tx), len(rx))
     if seq_len <= 0:
-        raise RuntimeError(f"{exp.base}: 无有效数据列，无法构建序列")
+        raise RuntimeError(f"{exp.base}: no valid data columns; cannot build time series")
 
     dic: Dict[str, List[float]] = {}
 
@@ -263,20 +248,20 @@ def _build_one_df(exp: Exp) -> pd.DataFrame:
                 arr = list(arr) + [math.nan] * (seq_len - len(arr))
             dic[f"{vnf}_{feat}"] = arr[:seq_len]
 
-    # KPI
+    # KPIs
     dic["input_rate"]  = tx[:seq_len] if tx else [math.nan] * seq_len
     dic["output_rate"] = rx[:seq_len] if rx else [math.nan] * seq_len
     dic["latency"]     = lat[:seq_len] if lat else [math.nan] * seq_len
 
     df = pd.DataFrame(dic)
 
-    # 列顺序：标准在前，其它在后
+    # Column order: standard columns first, then any extras
     std_set = set(STANDARD_COLS)
     cols = [c for c in STANDARD_COLS if c in df.columns] + [c for c in df.columns if c not in std_set]
     df = df[cols]
     return df
 
-# ------------ 并行 worker ------------
+# ------------ Parallel worker ------------
 def _process_one(exp: Exp) -> Dict:
     try:
         df = _build_one_df(exp)
@@ -301,7 +286,7 @@ def _process_one(exp: Exp) -> Dict:
         return {"ok": 0, "err": 1, "exp": asdict(exp), "error": str(ex)}
 
 def _choose_workers(cli_arg: Optional[str]) -> int:
-    # 优先级：命令行参数 > 环境变量 N_WORKERS > 默认 8 > 不超过 cpu_count()
+    # Priority: CLI arg > env N_WORKERS > default 8 > capped by cpu_count()
     n = None
     if cli_arg:
         try:
@@ -319,28 +304,28 @@ def _choose_workers(cli_arg: Optional[str]) -> int:
         n = 8
     return max(1, min(n, cpu_count()))
 
-# ------------ 主入口 ------------
+# ------------ Main entry point ------------
 def main():
     print("=" * 88, flush=True)
     print(f"[START] Perf preprocess (MinIO, parallel) — bucket={BUCKET} raw_prefix={RAW_PREFIX} out_prefix={OUT_PREFIX}", flush=True)
 
     exps = _find_experiments()
     if not exps:
-        print("[INFO] 未发现实验目录，直接退出。", flush=True)
+        print("[INFO] No experiments found. Exiting.", flush=True)
         print("=" * 88, flush=True)
         return
 
-    print(f"[INFO] 发现 {len(exps)} 个实验：", flush=True)
+    print(f"[INFO] Found {len(exps)} experiments:", flush=True)
     for e in exps:
         print(f"   - {e.scenario} :: {e.name} -> {e.base}", flush=True)
 
-    # 选择并行度
+    # Choose parallelism
     import sys
     n_workers = _choose_workers(sys.argv[1] if len(sys.argv) > 1 else None)
-    print(f"[INFO] 并行进程数：{n_workers}（系统可用：{cpu_count()}）", flush=True)
+    print(f"[INFO] Worker processes: {n_workers} (available: {cpu_count()})", flush=True)
 
     ok = err = 0
-    # 进程池：以“每个实验”为任务单元
+    # Process pool: each experiment is a work unit
     with Pool(processes=n_workers) as pool:
         for res in pool.imap_unordered(_process_one, exps, chunksize=1):
             if res.get("ok"):
@@ -350,14 +335,14 @@ def main():
                       f"(rows={res['rows']}, cols={res['cols']})", flush=True)
                 if res.get("warn"):
                     w = res["warn"]
-                    print(f"[WARN] 列数 {w['cols']} != 期望 {w['expected']} "
-                          f"缺失={w['missing_n']} 多余={w['extra_n']}", flush=True)
+                    print(f"[WARN] column count {w['cols']} != expected {w['expected']} "
+                          f"missing={w['missing_n']} extra={w['extra_n']}", flush=True)
             else:
                 err += 1
                 exp = res.get("exp", {})
                 print(f"[ERR] {exp.get('scenario','?')}::{exp.get('name','?')} -> {res.get('error')}", flush=True)
 
-    print(f"[DONE] 成功 {ok} 个，失败 {err} 个。", flush=True)
+    print(f"[DONE] success {ok}, failed {err}.", flush=True)
     print("=" * 88, flush=True)
 
 if __name__ == "__main__":
