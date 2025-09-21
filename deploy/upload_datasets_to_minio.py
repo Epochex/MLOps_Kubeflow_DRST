@@ -9,27 +9,19 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-# ======== 可修改的配置（尽量写死，避免环境注入）========
-# # 方案A：本机直连 NodePort（推荐，最省事）
-# MINIO_S3_ENDPOINT = "http://127.0.0.1:30900"   # 或 "http://45.149.207.13:30900"
-
-# 如需经 Istio 域名（你之后想换回域名），把上面一行改成：
 MINIO_S3_ENDPOINT = "http://s3.45.149.207.13.nip.io:30080"
 
 ACCESS_KEY = "minio"
 SECRET_KEY = "minio123"
 BUCKET     = "onvm-demo2"
-# 上传到 bucket 下的前缀
 PREFIX     = "datasets/"
 
-# 要上传的本地文件 => 目标对象键
 FILES = {
     "datasets/combined.csv":                          PREFIX + "combined.csv",
     "datasets/random_rates.csv":                      PREFIX + "random_rates.csv",
     "datasets/resource_stimulus_global_A-B-C_modified.csv": PREFIX + "resource_stimulus_global_A-B-C_modified.csv",
     "datasets/intervention_global.csv":               PREFIX + "intervention_global.csv",
 }
-# =====================================================
 
 def check_health(endpoint: str) -> None:
     url = endpoint.rstrip("/") + "/minio/health/ready"
@@ -77,11 +69,10 @@ def main():
 
     try:
         s3 = make_client()
-        # 简单探活：列 bucket（MinIO 可能返回 403/500，此处只要能连通即可继续）
+        # Simple Probe: List buckets (MinIO may return 403/500 errors; connectivity here suffices to proceed)
         try:
             s3.list_buckets()
         except ClientError as e:
-            # 某些老版本偶发 500，这里不阻断后续流程
             print(f"[WARN] list_buckets 返回异常但端口可达：{e}")
 
         ensure_bucket(s3, BUCKET)
@@ -91,16 +82,15 @@ def main():
             if upload_one(s3, src, key):
                 ok_cnt += 1
 
-        print(f"\n✅ 完成：上传 {ok_cnt}/{len(FILES)} 个文件到 s3://{BUCKET}/{PREFIX}")
-        print("   读取路径保持与旧项目一致，例如：")
+        print(f"\nDone：uploaded {ok_cnt}/{len(FILES)} files to s3://{BUCKET}/{PREFIX}")
         for src, key in FILES.items():
             print(f"   - s3://{BUCKET}/{key}")
 
     except EndpointConnectionError as e:
-        print(f"\n[连接失败] 无法访问 MinIO S3 端点： {MINIO_S3_ENDPOINT}\n{e}")
+        print(f"\n[Connection Failed] Unable to access the MinIO S3 endpoint.： {MINIO_S3_ENDPOINT}\n{e}")
         sys.exit(2)
     except Exception as e:
-        print(f"\n[ERR] 未处理异常：{e}")
+        print(f"\n[ERR] Unexcited exception:{e}")
         sys.exit(1)
 
 if __name__ == "__main__":

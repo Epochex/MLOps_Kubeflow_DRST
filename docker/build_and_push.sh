@@ -22,7 +22,6 @@ build_one () {
     .
 }
 
-# 你现有的
 build_one offline  "${REPO}/offline"
 build_one monitor  "${REPO}/monitor"
 build_one producer "${REPO}/producer"
@@ -30,7 +29,6 @@ build_one infer    "${REPO}/infer"
 build_one plot     "${REPO}/plot"
 build_one retrain  "${REPO}/retrain"
 
-# 新增
 build_one forecast      "${REPO}/forecast"
 build_one forecast_api  "${REPO}/forecast-api"
 

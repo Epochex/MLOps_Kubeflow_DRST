@@ -18,5 +18,5 @@ roleRef:
   name: kfp-workflows-report
 subjects:
 - kind: User
-  name: user@example.com   # 和你网关/后端使用的用户完全一致
+  name: user@example.com   # Exactly the same as the users used by the gateway/backend
 
