@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-通用工件读写（MinIO）
-
-功能：
-- write_latest(model_bytes, metrics, model_key?, metrics_key?)  →  写入模型/指标，并更新 models/latest.json
-- read_latest() → (model_key, metrics_key, ts)    兼容旧格式 latest.txt
-- load_model_by_key(key) → (torch_model, raw_bytes)  相对路径会自动加 MODEL_DIR/
-- load_scaler() / load_selected_feats()
-"""
-
 from __future__ import annotations
 import io
 import json
@@ -22,7 +12,6 @@ import torch
 from .minio_helper import s3, save_bytes
 from .config import BUCKET, MODEL_DIR
 
-# ------------- 基础 I/O -------------
 def _abs_key(key: str) -> str:
     return key if ("/" in key) else f"{MODEL_DIR}/{key}"
 
@@ -47,15 +36,11 @@ def _head_mtime(key: str) -> Optional[float]:
     except Exception:
         return None
 
-# ------------- latest 指针 -------------
+# ------------- latest probe -------------
 def write_latest(model_bytes: bytes,
                  metrics: Dict[str, Any],
                  model_key: Optional[str] = None,
                  metrics_key: Optional[str] = None) -> Tuple[str, str]:
-    """
-    把模型+指标写入 MODEL_DIR 下，并更新 latest.json
-    返回：(model_key, metrics_key)
-    """
     ts = int(time.time())
     model_key = model_key or f"model_{ts}.pt"
     metrics_key = metrics_key or f"metrics_{ts}.json"
@@ -72,17 +57,12 @@ def write_latest(model_bytes: bytes,
     return model_key, metrics_key
 
 def read_latest() -> Optional[Tuple[str, str, int]]:
-    """
-    读取最新模型指针：
-    - 优先 latest.json：{"model_key": "...", "metrics_key": "...", "ts": 1700000000}
-    - 兼容 latest.txt：两行，第一行模型键、第二行指标键；ts 用对象的 mtime
-    """
+
     js = _read_json(f"{MODEL_DIR}/latest.json")
     if js and "model_key" in js and "metrics_key" in js:
         ts = int(js.get("ts") or (_head_mtime(f"{MODEL_DIR}/{js['model_key']}") or 0))
         return str(js["model_key"]), str(js["metrics_key"]), ts
 
-    # 兼容旧格式
     raw = _read_bytes(f"{MODEL_DIR}/latest.txt")
     if raw:
         try:
@@ -97,28 +77,21 @@ def read_latest() -> Optional[Tuple[str, str, int]]:
 
 # ------------- artefacts 加载 -------------
 def load_model_by_key(key: str):
-    """
-    从 MinIO 读取并反序列化 torch 模型。
-    兼容 PyTorch 2.6+（weights_only 默认 True）。
-    key 可为绝对键（包含 /）或相对键（自动拼 MODEL_DIR/）。
-    """
+
     k = _abs_key(key)
     raw = _read_bytes(k)
     if raw is None:
         raise FileNotFoundError(f"s3://{BUCKET}/{k} not found")
 
     bio = io.BytesIO(raw)
-    # 1) 直接 weights_only=False（仅在信任来源时）
     try:
         mdl = torch.load(bio, map_location="cpu", weights_only=False)
     except TypeError:
-        # 旧版本 torch 没有 weights_only 参数
         bio.seek(0)
         mdl = torch.load(bio, map_location="cpu")
     except Exception as e1:
-        # 2) 允许特定类（如果你的模型是 torch.save(model) 保存的自定义类）
         try:
-            from drst_inference.offline.model import MLPRegressor  # 若项目中存在该类
+            from drst_inference.offline.model import MLPRegressor  
             try:
                 from torch.serialization import add_safe_globals
                 add_safe_globals([MLPRegressor])
