@@ -5,7 +5,6 @@ import os
 import io
 import numpy as np
 
-# 显式使用 Agg 后端，避免容器内无 DISPLAY 报错
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -16,7 +15,6 @@ from drst_common.minio_helper import s3, save_bytes
 from drst_common.config import BUCKET, RESULT_DIR
 
 def _list_trace_keys() -> List[str]:
-    """列出 results/ 下所有 *_inference_trace.npz（来自 infer1/2/3）。"""
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"{RESULT_DIR}/")
     items = resp.get("Contents", []) or []
     return sorted([o["Key"] for o in items if o["Key"].endswith("_inference_trace.npz")])
@@ -37,7 +35,6 @@ def main():
         print("[plot_final] no inference trace npz found in results/")
         return
 
-    # 汇总所有副本的 trace
     all_ts, all_true, all_pred_orig, all_pred_adj = [], [], [], []
     for k in keys:
         try:
@@ -58,7 +55,6 @@ def main():
     pred_orig = np.concatenate(all_pred_orig)
     pred_adj  = np.concatenate(all_pred_adj)
 
-    # 1) Time-series comparison（合并后整体画一张）
     plt.figure(figsize=(10, 4.5))
     plt.plot(ts, y_true,    label="truth")
     plt.plot(ts, pred_orig, label="baseline")

@@ -178,7 +178,6 @@ print(f"[{COMPONENT_NAME}] topic «{KAFKA_TOPIC}» partitions = {num_parts}")
 save_bytes(f"{RESULT_DIR}/consumer_ready_{COMPONENT_NAME}.flag", b"", "text/plain")
 producer = create_producer()
 
-# --- 新：记录“已收到 sentinel 的分区集合”（按本消费者 assignment 判定是否齐备） ---
 seen_parts: Set[int] = set()
 
 def _assigned_parts_now() -> Set[int]:
