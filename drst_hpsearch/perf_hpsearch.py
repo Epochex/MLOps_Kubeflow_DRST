@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Tabular Perf — Hyperparameter Search
 
-- 读取 MinIO 上的 perf 数据集（默认 datasets/combined.csv）
-- 目标列：output_rate（若 config.TARGET_COL 指定了别名则以其为准）
-- 候选模型：Ridge / RandomForest / GradientBoosting / XGBoost(可选)
-- 指标：MAE / R^2 / acc@5% / 每样本推理延时
-- 产物：
-  - models/forecasting/perf_hpsearch_results.csv        （全量结果）
-  - models/forecasting/perf_hpsearch_best.json          （最优配置建议）
-
-注意：
-- 这是“表格回归”的 HP 搜索，和 PCM 的时序 HP 搜索相互独立。
-- 仅写入建议与结果清单，不会改动 latest 指针（由 retrain 决定）。
-"""
 
 from __future__ import annotations
 import io

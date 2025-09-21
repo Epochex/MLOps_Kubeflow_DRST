@@ -12,12 +12,12 @@ from drst_common.config import MODEL_DIR, RESULT_DIR
 from drst_forecasting.dataset import build_sliding_window
 from drst_forecasting.models import build_model, evaluate_metrics, benchmark_latency, publish_best_selection
 
-# ---- 全局配置（可被环境变量覆盖）----
+# ---- Global defaults (overridable via environment variables) ----
 LOOKBACK  = int(os.getenv("FORECAST_LOOKBACK", "10"))
 HORIZON   = int(os.getenv("FORECAST_HORIZON",  "5"))
 EPOCHS    = int(os.getenv("FORECAST_EPOCHS",   "200"))
 PATIENCE  = int(os.getenv("FORECAST_PATIENCE", "10"))
-# 只取末尾 N 条样本窗口来加速；<=0 表示用全量
+# Use only the last N sliding windows to speed up; <=0 means use the entire dataset
 TAKE_LAST = int(os.getenv("FORECAST_TAKE_LAST", "0"))
 
 def _canon(name: str) -> str | None:
@@ -30,9 +30,9 @@ def _canon(name: str) -> str | None:
 
 def _load_candidates_for_pcm() -> List[str] | None:
     """
-    优先读： models/forecast/model_candidates.json
-    兼容旧： models/forecasting/pcm_select_suggestion.json
-    返回规范化模型名（子集于：ridge/xgboost/transformerlight）
+    Preferred source: models/forecast/model_candidates.json
+    Backward compatible: models/forecasting/pcm_select_suggestion.json
+    Returns canonicalized model names (subset of: ridge/xgboost/transformerlight)
     """
     key1 = f"{MODEL_DIR}/forecast/model_candidates.json"
     try:
@@ -70,7 +70,7 @@ def _load_candidates_for_pcm() -> List[str] | None:
 
 def _grid() -> Dict[str, List[Dict]]:
     """
-    全量网格（若上游已跑过 pcm 的 model_selection，会按候选集合裁剪）
+    Full search grid (will be pruned to the candidate set if upstream PCM model selection has already run)
     """
     full = {
         "ridge": [
@@ -149,7 +149,7 @@ def main():
         X, Y, feats = build_sliding_window(
             LOOKBACK, HORIZON,
             take_last_n=(None if TAKE_LAST <= 0 else TAKE_LAST),
-            multi_output=True   # 与深度模型输出对齐
+            multi_output=True   # align output format with deep models
         )
     except Exception as e:
         msg = str(e)
@@ -194,7 +194,7 @@ def main():
                 }
                 rows.append(rec)
 
-                # 选型：先比 MAE，平手比 latency
+                # Selection policy: compare MAE first; if tied, prefer lower latency
                 key = (rec["mae"], rec["latency_per_sample_s"])
                 if (best is None) or (key < (best[0], best[1])):
                     best = (rec["mae"], rec["latency_per_sample_s"], (kind, p, mdl, rec))
@@ -219,12 +219,12 @@ def main():
     assert best is not None, "no model successfully trained"
     _, _, (best_kind, best_params, best_mdl, best_rec) = best
 
-    info = best_mdl.save_to_s3(prefix)  # 写 best_model + best_meta.json
+    info = best_mdl.save_to_s3(prefix)  # writes best_model and best_meta.json
     selection = {
         "selected_kind": best_kind,
         "selected_params": best_params,
         "metrics": best_rec,
-        "meta_key": info["meta_key"],      # API 会先读 selected.json → meta_key → artifact
+        "meta_key": info["meta_key"],      # API reads selected.json → meta_key → artifact
         "artifact": info["model_key"],
         "lookback": LOOKBACK,
         "horizon": HORIZON,
