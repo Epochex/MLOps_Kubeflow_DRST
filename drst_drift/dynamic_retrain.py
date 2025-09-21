@@ -31,7 +31,6 @@ pod_name = os.getenv("HOSTNAME", "retrain")
 
 LOCK_KEY = f"{RESULT_DIR}/retrain_lock.flag"
 DONE_KEY = f"{RESULT_DIR}/retrain_done.flag"
-# 新增：跟随 monitor 的退出标志
 MON_DONE_KEY = f"{RESULT_DIR}/monitor_done.flag"
 
 WATCH    = os.getenv("RETRAIN_WATCH", "0") in ("1", "true", "True")
@@ -344,7 +343,6 @@ def main():
             return (max_secs <= 0) or ((time.time() - start_ts) < max_secs)
 
         while _still_in_window():
-            # ——“跟随 monitor”逻辑：如果 monitor 已退出且没有新的重训锁，立即退出 —— #
             mon_done = _obj_mtime(MON_DONE_KEY)
             if mon_done:
                 has_lock = _exists(LOCK_KEY)
@@ -360,7 +358,6 @@ def main():
                 print(f"[retrain] lock detected (ts={lock_ts}); start one retrain...", flush=True)
                 _ = _run_once()
 
-                # 等待 monitor 写入 DONE（最多 10s）
                 for _wait in range(20):
                     new_done = _obj_mtime(DONE_KEY) or last_done_ts
                     if new_done > last_done_ts:

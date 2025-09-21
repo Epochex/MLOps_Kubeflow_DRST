@@ -28,7 +28,6 @@ BATCH_KEY = f"{RESULT_DIR}/latest_batch.npy"
 BATCH_COL = f"{RESULT_DIR}/latest_batch.columns.json"
 DONE_KEY  = f"{RESULT_DIR}/retrain_done.flag"
 
-# 新增：monitor 退出标志（供 retrain 跟随）
 MON_DONE_KEY = f"{RESULT_DIR}/monitor_done.flag"
 
 RETRAIN_COOLDOWN_S = int(os.getenv("RETRAIN_COOLDOWN_S", "10") or 10)
@@ -121,7 +120,6 @@ def main():
 
     stop_probe = start_probe("monitor")
 
-    # —— 封装统一“优雅退出”，写 monitor_done.flag —— #
     def _finish(reason: str):
         try:
             payload = {
@@ -303,7 +301,7 @@ def main():
 
                     log_metric(component="monitor", event="js_tick", js=round(js, 6))
 
-    # 正常落幕（理论上不会到这里，防御性）
+    # Defensive Programming
     _finish("normal_exit")
 
 if __name__ == "__main__":
